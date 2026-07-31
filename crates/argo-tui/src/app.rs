@@ -127,6 +127,8 @@ pub struct App {
     pub should_quit: bool,
     /// Transcript scrollback offset from the bottom.
     pub scroll_back: usize,
+    /// Width-aware maximum rendered-row scroll, refreshed by the renderer.
+    scroll_limit: std::cell::Cell<usize>,
     /// Recent inputs, newest last.
     history: Vec<String>,
     /// Position while browsing history.
@@ -171,6 +173,11 @@ pub struct App {
     pub tick: usize,
     /// What the agent is currently doing, for the activity indicator.
     pub activity: Activity,
+    /// Event-derived detail for the live activity row, such as the active tool.
+    ///
+    /// This is never guessed reasoning: emitted thinking remains in transcript
+    /// `Thinking` lines, while this field describes only observable stream state.
+    activity_detail: Option<String>,
 }
 
 /// Message printed after the TUI closes, naming the session and how to return.
@@ -244,6 +251,7 @@ impl App {
             status: "Type a message, or /help for commands".to_string(),
             should_quit: false,
             scroll_back: 0,
+            scroll_limit: std::cell::Cell::new(0),
             history: Vec::new(),
             history_cursor: None,
             streaming: String::new(),
@@ -262,6 +270,7 @@ impl App {
             active_error_retryable: false,
             tick: 0,
             activity: Activity::Idle,
+            activity_detail: None,
         }
     }
 
@@ -335,11 +344,24 @@ impl App {
     }
 
     /// Animated status text, or `None` when nothing is running.
+    ///
+    /// Labels describe only observable stream state. Actual reasoning text is
+    /// rendered separately from `ThinkingDelta` events when a CLI emits it.
     pub fn activity_indicator(&self) -> Option<String> {
         if self.activity == Activity::Idle {
             return None;
         }
-        let base = format!("{} {}", self.spinner(), self.activity.label());
+        let detail = self
+            .activity_detail
+            .as_deref()
+            .unwrap_or(match self.activity {
+                Activity::Idle => "",
+                Activity::Starting => "waiting for CLI output",
+                Activity::Thinking => "receiving CLI-emitted reasoning",
+                Activity::Responding => "streaming response",
+                Activity::Working => "tool running",
+            });
+        let base = format!("{} {} · {detail}", self.spinner(), self.activity.label());
         match self.queue_depth() {
             0 => Some(base),
             1 => Some(format!("{base} · 1 queued")),
@@ -617,6 +639,7 @@ impl App {
             );
         }
         self.activity = Activity::Starting;
+        self.activity_detail = None;
         self.tick = 0;
         self.set_status(format!("{agent} · Esc to cancel"));
     }
@@ -630,6 +653,7 @@ impl App {
                 }
                 self.thinking_streaming.clear();
                 self.activity = Activity::Responding;
+                self.activity_detail = None;
                 self.streaming.push_str(&text);
                 self.rewrite_streaming_line();
             }
@@ -639,11 +663,13 @@ impl App {
                 }
                 self.streaming.clear();
                 self.activity = Activity::Thinking;
+                self.activity_detail = None;
                 self.thinking_streaming.push_str(&text);
                 self.rewrite_thinking_line();
             }
             RunEventKind::ToolStarted { id, name, input } => {
                 self.activity = Activity::Working;
+                self.activity_detail = Some(format!("running {name}"));
                 self.active_tools.insert(id, name.clone());
                 let detail = input
                     .as_deref()
@@ -661,6 +687,13 @@ impl App {
                     .active_tools
                     .remove(&id)
                     .unwrap_or_else(|| "tool".to_string());
+                self.activity_detail = Some(
+                    self.active_tools
+                        .values()
+                        .next()
+                        .map(|name| format!("running {name}"))
+                        .unwrap_or_else(|| "processing tool result".into()),
+                );
                 let mark = if ok { "✓" } else { "✗" };
                 let detail = output
                     .as_deref()
@@ -682,6 +715,8 @@ impl App {
                 child_agent_id,
                 task,
             } => {
+                self.activity = Activity::Working;
+                self.activity_detail = Some(format!("subagent {child_agent_id}"));
                 self.push(
                     LineKind::Activity,
                     format!(
@@ -706,6 +741,8 @@ impl App {
                 self.thinking_streaming.clear();
             }
             RunEventKind::PlanUpdated { steps } => {
+                self.activity = Activity::Working;
+                self.activity_detail = Some("updating plan".into());
                 self.push(LineKind::Activity, "· plan updated");
                 for step in steps {
                     self.push(LineKind::Activity, format!("  {step}"));
@@ -754,6 +791,7 @@ impl App {
                 self.active_error_retryable = false;
                 self.active_run = None;
                 self.activity = Activity::Idle;
+                self.activity_detail = None;
                 self.streaming.clear();
                 self.thinking_streaming.clear();
                 self.active_tools.clear();
@@ -965,15 +1003,27 @@ impl App {
 
     // --- transcript scrolling ---
 
-    /// Scrolls the transcript back by `amount` lines.
-    pub fn scroll_up(&mut self, amount: usize) {
-        let max = self.lines.len();
-        self.scroll_back = (self.scroll_back + amount).min(max);
+    /// Updates the viewport's width-aware rendered-row scroll limit.
+    pub(crate) fn set_scroll_limit(&self, limit: usize) {
+        self.scroll_limit.set(limit);
     }
 
-    /// Scrolls the transcript forward by `amount` lines.
+    /// Scrolls the transcript back by `amount` rendered rows.
+    pub fn scroll_up(&mut self, amount: usize) {
+        let limit = self.scroll_limit.get();
+        self.scroll_back = self
+            .scroll_back
+            .min(limit)
+            .saturating_add(amount)
+            .min(limit);
+    }
+
+    /// Scrolls the transcript forward by `amount` rendered rows.
     pub fn scroll_down(&mut self, amount: usize) {
-        self.scroll_back = self.scroll_back.saturating_sub(amount);
+        self.scroll_back = self
+            .scroll_back
+            .min(self.scroll_limit.get())
+            .saturating_sub(amount);
     }
 
     /// Re-estimates how much context this conversation would replay.
@@ -2180,13 +2230,16 @@ mod tests {
     }
 
     #[test]
-    fn transcript_scrollback_is_bounded_by_content() {
+    fn transcript_scrollback_tracks_rendered_rows_without_logical_line_clamping() {
         let mut app = new_app();
+        // A single logical response may wrap to far more than five rows. App state
+        // records requested row movement; the width-aware renderer clamps it.
         for i in 0..5 {
             app.push(LineKind::Assistant, format!("line {i}"));
         }
+        app.set_scroll_limit(100);
         app.scroll_up(100);
-        assert_eq!(app.scroll_back, 5);
+        assert_eq!(app.scroll_back, 100);
         app.scroll_down(100);
         assert_eq!(app.scroll_back, 0);
     }

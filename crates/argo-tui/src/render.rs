@@ -4,7 +4,7 @@
 //! transcript (or an overlay), a composer, and a status line. Layout is computed
 //! from the terminal size each frame so a resize needs no special handling.
 
-use crate::app::{App, LineKind, Overlay};
+use crate::app::{Activity, App, LineKind, Overlay};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -175,6 +175,22 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rendered.extend(render_line(line, inner_width));
     }
 
+    // Keep a truthful, animated activity row beside the live transcript. Actual
+    // thinking text is rendered above from ThinkingDelta events; this row only
+    // labels observable stream state and disappears when the run finishes.
+    if let Some(indicator) = app.activity_indicator() {
+        let marker = match app.activity {
+            Activity::Starting | Activity::Thinking => "◌ ",
+            Activity::Responding => "│ ",
+            Activity::Working => "↳ ",
+            Activity::Idle => "  ",
+        };
+        rendered.push(TextLine::from(vec![
+            Span::styled(marker, Style::default().fg(ACCENT)),
+            Span::styled(indicator, Style::default().fg(MUTED)),
+        ]));
+    }
+
     if rendered.is_empty() {
         // An empty conversation is the only place Argo can explain itself.
         let agents: Vec<String> = app
@@ -204,19 +220,25 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // count disagree with what is drawn, and any under-count scrolls the newest
     // text — normally the agent's reply — off the bottom of the pane.
     let total = rendered.len();
-    let offset = total
-        .saturating_sub(height)
-        .saturating_sub(app.scroll_back)
-        .min(total);
+    let max_scroll = total.saturating_sub(height);
+    app.set_scroll_limit(max_scroll);
+    let scroll_back = app.scroll_back.min(max_scroll);
+    let offset = max_scroll.saturating_sub(scroll_back);
 
-    let title = if app.scroll_back > 0 {
-        format!(" conversation — scrolled back {} ", app.scroll_back)
+    let title = if scroll_back > 0 {
+        format!(" conversation — scrolled back {scroll_back} rows · PgDn/End ")
     } else {
-        " conversation ".to_string()
+        " conversation — PgUp to scroll ".to_string()
     };
-    let paragraph = Paragraph::new(rendered)
-        .block(panel(title, false))
-        .scroll((offset as u16, 0));
+    // Slice to the visible rows instead of passing a potentially overflowing
+    // usize through Paragraph's u16 scroll offset. This also avoids asking the
+    // widget to walk a huge off-screen transcript on every animation frame.
+    let visible = rendered
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(visible).block(panel(title, false));
     frame.render_widget(paragraph, area);
 }
 
@@ -1049,8 +1071,52 @@ mod tests {
         for i in 0..40 {
             app.push(LineKind::Assistant, format!("line {i}"));
         }
+        // Initial draw establishes the width-aware rendered-row limit used by
+        // subsequent keyboard navigation.
+        let _ = render(&app, 70, 14);
         app.scroll_up(5);
         assert!(render(&app, 70, 14).contains("scrolled back 5"));
+    }
+
+    #[test]
+    fn wrapped_single_response_can_scroll_to_its_beginning() {
+        let mut app = App::new("/repo");
+        app.push(
+            LineKind::Assistant,
+            format!("FIRST_MARKER {} LAST_MARKER", "wrapped content ".repeat(80)),
+        );
+        let bottom = render(&app, 36, 12);
+        assert!(bottom.contains("LAST_MARKER"), "{bottom}");
+        assert!(!bottom.contains("FIRST_MARKER"), "{bottom}");
+
+        app.scroll_up(10_000);
+        let top = render(&app, 36, 12);
+        assert!(top.contains("FIRST_MARKER"), "{top}");
+        assert!(top.contains("scrolled back"), "{top}");
+    }
+
+    #[test]
+    fn live_activity_is_animated_without_inventing_thinking() {
+        let mut app = App::new("/repo");
+        app.begin_run(
+            argo_core::ids::RunId::new("r1"),
+            "kiro",
+            Some("gpt-5.6"),
+            false,
+        );
+        let starting = render(&app, 70, 14);
+        assert!(starting.contains("waiting for CLI output"), "{starting}");
+        assert!(!starting.contains("CLI-emitted reasoning"), "{starting}");
+
+        app.apply_event(argo_core::event::RunEventKind::ThinkingDelta {
+            text: "checking the repository".into(),
+        });
+        let thinking = render(&app, 70, 14);
+        assert!(thinking.contains("checking the repository"), "{thinking}");
+        assert!(
+            thinking.contains("receiving CLI-emitted reasoning"),
+            "{thinking}"
+        );
     }
 
     #[test]

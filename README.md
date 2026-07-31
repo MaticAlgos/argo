@@ -275,9 +275,14 @@ argo tui --root /path/to/project
 ### TUI keys
 
 - `Tab`: accept a command completion.
-- `↑` / `↓`: navigate suggestions, pickers, or composer history.
+- `↑` / `↓`: navigate suggestions and pickers; with an empty composer, scroll
+  through the transcript.
 - `Shift+Enter` or `Ctrl+J`: insert a newline.
-- `PageUp` / `PageDown`: scroll transcript or overlays.
+- `PageUp` / `PageDown` or `Shift+↑` / `Shift+↓`: scroll the transcript by
+  rendered rows; `Home` / `End` jump to the beginning/end when the composer is
+  empty. Bare `↑` / `↓` also scroll an empty composer, including terminals that
+  translate the wheel into arrow keys on the alternate screen.
+- `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
 - `Cmd+click` on macOS (or your terminal's native link gesture): open a
   displayed `http://` or `https://` link.
 - Drag normally to select and copy transcript text; Argo does not capture mouse

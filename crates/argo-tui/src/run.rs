@@ -152,29 +152,13 @@ async fn event_loop(
         };
 
         tokio::select! {
-            // Streamed run events take priority so output stays responsive.
-            Some(event) = event_rx.recv() => {
-                let terminal_status = match &event.kind {
-                    argo_core::event::RunEventKind::RunFinished { status, .. } => Some(*status),
-                    _ => None,
-                };
-                app.apply_event(event.kind);
-
-                if let Some(status) = terminal_status {
-                    let offer_options = status == argo_core::event::RunStatus::Succeeded
-                        && app.queue_depth() == 0;
-                    refresh_conversation_summary(connection, app).await?;
-                    if should_drain_queue(status) {
-                        try_start_next_queued(connection, app, paths, &event_tx).await?;
-                        if offer_options && !app.is_busy() {
-                            app.open_latest_response_options();
-                        }
-                    } else if app.queue_depth() > 0 {
-                        app.set_status(format!(
-                            "{} queued · paused after {status:?} · Enter retries · Esc discards",
-                            app.queue_depth()
-                        ));
-                    }
+            Some(first) = event_rx.recv() => {
+                // ACP adapters may emit one event per token. Drain the ready burst
+                // before redrawing so a 600-token answer does not trigger 600
+                // complete Markdown/layout passes and appear frozen.
+                let batch = ready_event_batch(first, &mut event_rx, 512);
+                for event in batch {
+                    apply_stream_event(connection, app, paths, &event_tx, event).await?;
                 }
             }
             _ = animation => {
@@ -195,6 +179,56 @@ async fn event_loop(
             }
         }
     }
+}
+
+/// Collects an already-ready burst so token-sized ACP events share one redraw.
+fn ready_event_batch(
+    first: RunEvent,
+    receiver: &mut mpsc::UnboundedReceiver<RunEvent>,
+    limit: usize,
+) -> Vec<RunEvent> {
+    let mut batch = Vec::with_capacity(limit.clamp(1, 64));
+    batch.push(first);
+    while batch.len() < limit.max(1) {
+        match receiver.try_recv() {
+            Ok(event) => batch.push(event),
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
+/// Applies one streamed event and performs terminal-state bookkeeping.
+async fn apply_stream_event(
+    connection: &mut Connection,
+    app: &mut App,
+    paths: &ArgoPaths,
+    event_tx: &mpsc::UnboundedSender<RunEvent>,
+    event: RunEvent,
+) -> Result<()> {
+    let terminal_status = match &event.kind {
+        argo_core::event::RunEventKind::RunFinished { status, .. } => Some(*status),
+        _ => None,
+    };
+    app.apply_event(event.kind);
+
+    if let Some(status) = terminal_status {
+        let offer_options =
+            status == argo_core::event::RunStatus::Succeeded && app.queue_depth() == 0;
+        refresh_conversation_summary(connection, app).await?;
+        if should_drain_queue(status) {
+            try_start_next_queued(connection, app, paths, event_tx).await?;
+            if offer_options && !app.is_busy() {
+                app.open_latest_response_options();
+            }
+        } else if app.queue_depth() > 0 {
+            app.set_status(format!(
+                "{} queued · paused after {status:?} · Enter retries · Esc discards",
+                app.queue_depth()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_native_hyperlinks<W: std::io::Write>(
@@ -336,11 +370,31 @@ async fn handle_key(
         KeyCode::Delete => app.delete(),
         KeyCode::Left => app.move_left(),
         KeyCode::Right => app.move_right(),
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) || app.input.is_empty() => {
+            app.scroll_up(usize::MAX)
+        }
+        KeyCode::End
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                || (app.input.is_empty() && app.scroll_back > 0) =>
+        {
+            app.scroll_down(usize::MAX)
+        }
         KeyCode::Home => app.move_home(),
         KeyCode::End => app.move_end(),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_up(1),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_down(1),
+        // Ctrl+P/N retain explicit composer-history navigation now that bare
+        // arrows on an empty composer navigate the transcript (and also accept
+        // terminal wheel-to-arrow translation without enabling mouse capture).
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.history_previous()
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_next(),
         KeyCode::Up => {
             if app.has_completions() {
                 app.completion_move(-1);
+            } else if app.input.is_empty() {
+                app.scroll_up(1);
             } else {
                 app.history_previous();
             }
@@ -348,6 +402,8 @@ async fn handle_key(
         KeyCode::Down => {
             if app.has_completions() {
                 app.completion_move(1);
+            } else if app.scroll_back > 0 {
+                app.scroll_down(1);
             } else {
                 app.history_next();
             }
@@ -1282,6 +1338,10 @@ async fn refresh_conversation_summary(connection: &mut Connection, app: &mut App
 }
 
 /// Follows a run on its own connection, forwarding events to the UI.
+///
+/// The store is the durable cursor. A transient socket/read failure reconnects
+/// and asks only for events after the last delivered sequence instead of silently
+/// abandoning the run and leaving the TUI spinning with a completed reply hidden.
 fn spawn_stream(
     paths: &ArgoPaths,
     run_id: argo_core::ids::RunId,
@@ -1289,30 +1349,59 @@ fn spawn_stream(
 ) {
     let socket = paths.socket();
     tokio::spawn(async move {
-        let Ok(mut connection) = Connection::connect_to(&socket).await else {
-            return;
-        };
-        if connection
-            .send(Request::Subscribe {
-                run_id: run_id.clone(),
-                after_seq: 0,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
+        let mut after_seq = 0;
+        let mut delay = std::time::Duration::from_millis(50);
+
         loop {
-            match connection.next_response().await {
-                Ok(Response::Event { event }) => {
-                    // A closed receiver means the UI exited; stop quietly.
-                    if sender.send(event).is_err() {
-                        return;
-                    }
-                }
-                Ok(Response::StreamEnd { .. }) | Err(_) => return,
-                Ok(_) => continue,
+            if sender.is_closed() {
+                return;
             }
+            let mut connection = match Connection::connect_to(&socket).await {
+                Ok(connection) => connection,
+                Err(_) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            };
+            if connection
+                .send(Request::Subscribe {
+                    run_id: run_id.clone(),
+                    after_seq,
+                })
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                continue;
+            }
+            delay = std::time::Duration::from_millis(50);
+
+            loop {
+                match connection.next_response().await {
+                    Ok(Response::Event { event }) => {
+                        // Replayed backlogs may overlap the last delivered event
+                        // if the socket dropped between reading and reconnecting.
+                        if event.seq <= after_seq {
+                            continue;
+                        }
+                        after_seq = event.seq;
+                        let terminal = event.is_terminal();
+                        // A closed receiver means the UI exited; stop quietly.
+                        if sender.send(event).is_err() || terminal {
+                            return;
+                        }
+                    }
+                    // StreamEnd without a terminal event can occur if the socket
+                    // raced durable finalization. Reconnect and replay the cursor.
+                    Ok(Response::StreamEnd { .. }) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(1));
         }
     });
 }
@@ -1467,6 +1556,124 @@ mod tests {
             ),
             "{output:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ready_token_events_are_batched_before_redraw() {
+        let run_id = argo_core::ids::RunId::new("burst");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        for seq in 1..=620 {
+            sender
+                .send(RunEvent::new(
+                    run_id.clone(),
+                    seq,
+                    argo_core::event::RunEventKind::TextDelta { text: "x".into() },
+                ))
+                .expect("send event");
+        }
+        let first = receiver.recv().await.expect("first");
+        let batch = ready_event_batch(first, &mut receiver, 512);
+        assert_eq!(batch.len(), 512);
+        let next = receiver.recv().await.expect("next");
+        let remainder = ready_event_batch(next, &mut receiver, 512);
+        assert_eq!(remainder.len(), 108);
+    }
+
+    #[tokio::test]
+    async fn stream_follower_reconnects_from_the_last_durable_sequence() {
+        use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
+        use tokio::net::UnixListener;
+
+        let root = std::env::temp_dir().join(format!(
+            "argo-stream-test-{}-{}",
+            std::process::id(),
+            argo_core::now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create test root");
+        let paths = ArgoPaths::with_root(&root);
+        let socket = paths.socket();
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let run_id = argo_core::ids::RunId::new("replayed-run");
+        let server_run_id = run_id.clone();
+
+        let server = tokio::spawn(async move {
+            for (expected_after, event) in [
+                (
+                    0,
+                    RunEvent::new(
+                        server_run_id.clone(),
+                        1,
+                        RunEventKind::TextDelta {
+                            text: "persisted reply".into(),
+                        },
+                    ),
+                ),
+                (
+                    1,
+                    RunEvent::new(
+                        server_run_id.clone(),
+                        2,
+                        RunEventKind::RunFinished {
+                            status: RunStatus::Succeeded,
+                            usage: TokenUsage::default(),
+                        },
+                    ),
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (read_half, mut write_half) = stream.into_split();
+                let mut lines = BufReader::new(read_half).lines();
+
+                let hello = lines.next_line().await.expect("read hello").expect("hello");
+                assert!(matches!(Request::decode(&hello), Ok(Request::Hello { .. })));
+                write_half
+                    .write_all(
+                        Response::Welcome {
+                            protocol: IPC_PROTOCOL_VERSION,
+                            version: "test".into(),
+                            database: "test.sqlite".into(),
+                        }
+                        .encode()
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("welcome");
+
+                let subscribe = lines
+                    .next_line()
+                    .await
+                    .expect("read subscribe")
+                    .expect("subscribe");
+                match Request::decode(&subscribe).expect("decode subscribe") {
+                    Request::Subscribe { run_id, after_seq } => {
+                        assert_eq!(run_id, server_run_id);
+                        assert_eq!(after_seq, expected_after);
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+                write_half
+                    .write_all(Response::Event { event }.encode().as_bytes())
+                    .await
+                    .expect("event");
+                // First connection drops here without StreamEnd. The follower
+                // must reconnect with after_seq=1; the second event is terminal.
+            }
+        });
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        spawn_stream(&paths, run_id, sender);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("first timeout")
+            .expect("first event");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("second timeout")
+            .expect("second event");
+        assert_eq!((first.seq, second.seq), (1, 2));
+        assert!(second.is_terminal());
+        server.await.expect("server task");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
