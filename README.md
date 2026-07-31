@@ -287,9 +287,11 @@ argo tui --root /path/to/project
   Terminal starts in mouse-wheel mode; press `F2` for ordinary drag selection, or
   hold `Fn` while dragging to bypass mouse reporting temporarily.
 - `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
-- `Cmd+click` on macOS (or your terminal's native link gesture): open a
-  displayed `http://` or `https://` link. If the terminal intercepts it in
-  mouse-wheel mode, press `F2` first.
+- Web links: `Cmd+click` uses terminal-native OSC 8 handling when available. In
+  Apple Terminal mouse-wheel mode, clicking a rendered `http://` or `https://`
+  URL opens that exact validated destination in the default browser because the
+  terminal does not report the Command modifier to Argo. Other URL schemes are
+  never launched.
 - Outside mouse-wheel mode, drag normally to select and copy transcript text.
 - `Shift+Tab`: cycle the selected adapter's supported execution modes.
 - `Esc`: dismiss an overlay, cancel a running turn, or discard a paused queue

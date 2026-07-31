@@ -245,7 +245,14 @@ async fn event_loop(
                             handle_key(key, connection, app, paths, &event_tx).await?;
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse))) => handle_mouse(mouse, app),
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        if let Some(url) = handle_mouse(mouse, app, &hyperlinks) {
+                            match open_web_url(&url) {
+                                Ok(()) => app.set_status(format!("opened {url}")),
+                                Err(error) => app.report_error(error),
+                            }
+                        }
+                    }
                     Some(Ok(_)) => {}
                     // Terminal closed or errored: exit rather than spin.
                     Some(Err(error)) => {
@@ -342,14 +349,72 @@ fn write_native_hyperlinks<W: std::io::Write>(
     writer.flush()
 }
 
-/// Applies only wheel movement. Button presses are intentionally ignored: the
-/// fallback exists for scrolling, not for taking ownership of clicks or links.
-fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+fn is_safe_web_url(url: &str) -> bool {
+    let remainder = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    remainder.is_some_and(|value| {
+        !value.is_empty()
+            && !value
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+    })
+}
+
+fn hyperlink_at(
+    hyperlinks: &[crate::render::NativeHyperlink],
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    hyperlinks
+        .iter()
+        .find(|link| {
+            let width = link.text.chars().count().min(u16::MAX as usize) as u16;
+            link.row == row
+                && column >= link.column
+                && column < link.column.saturating_add(width)
+                && is_safe_web_url(&link.url)
+        })
+        .map(|link| link.url.clone())
+}
+
+fn open_web_url(url: &str) -> std::result::Result<(), String> {
+    if !is_safe_web_url(url) {
+        return Err("refusing to open a non-HTTP(S) link".into());
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open link: {error}"))
+}
+
+/// Applies wheel movement and resolves clicks on currently rendered web links.
+///
+/// Apple Terminal's mouse protocol does not carry the Command modifier. A click
+/// consumed by wheel mode is therefore opened only when it lands on an exact
+/// visible HTTP(S) hyperlink; outside wheel mode OSC 8 remains terminal-native.
+fn handle_mouse(
+    mouse: MouseEvent,
+    app: &mut App,
+    hyperlinks: &[crate::render::NativeHyperlink],
+) -> Option<String> {
     const ROWS_PER_NOTCH: i32 = 3;
     let delta = match mouse.kind {
         MouseEventKind::ScrollUp => -ROWS_PER_NOTCH,
         MouseEventKind::ScrollDown => ROWS_PER_NOTCH,
-        _ => return,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            return hyperlink_at(hyperlinks, mouse.column, mouse.row);
+        }
+        _ => return None,
     };
     if app.has_overlay() {
         app.overlay_move(delta);
@@ -358,6 +423,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     } else {
         app.scroll_down(delta as usize);
     }
+    None
 }
 
 /// Handles one key press.
@@ -1683,25 +1749,58 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_moves_the_transcript_and_ignores_clicks() {
+    fn mouse_wheel_scrolls_and_link_clicks_resolve_safe_destinations() {
         use crossterm::event::MouseButton;
 
         let mut app = App::new("/repo");
         app.set_scroll_limit(30);
         app.scroll_up(10);
-        let event = |kind| MouseEvent {
+        let event = |kind, column, row| MouseEvent {
             kind,
-            column: 1,
-            row: 1,
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
         };
+        let links = vec![crate::render::NativeHyperlink {
+            column: 4,
+            row: 7,
+            text: "https://example.com".into(),
+            url: "https://example.com/report".into(),
+        }];
 
-        handle_mouse(event(MouseEventKind::ScrollUp), &mut app);
+        assert!(handle_mouse(event(MouseEventKind::ScrollUp, 1, 1), &mut app, &links).is_none());
         assert_eq!(app.scroll_back, 13);
-        handle_mouse(event(MouseEventKind::ScrollDown), &mut app);
+        assert!(handle_mouse(event(MouseEventKind::ScrollDown, 1, 1), &mut app, &links).is_none());
         assert_eq!(app.scroll_back, 10);
-        handle_mouse(event(MouseEventKind::Down(MouseButton::Left)), &mut app);
-        assert_eq!(app.scroll_back, 10, "clicks are not application actions");
+        assert_eq!(
+            handle_mouse(
+                event(MouseEventKind::Down(MouseButton::Left), 8, 7),
+                &mut app,
+                &links,
+            )
+            .as_deref(),
+            Some("https://example.com/report")
+        );
+        assert!(handle_mouse(
+            event(MouseEventKind::Down(MouseButton::Left), 3, 7),
+            &mut app,
+            &links,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn browser_opening_accepts_only_http_and_https() {
+        assert!(is_safe_web_url("https://example.com/report"));
+        assert!(is_safe_web_url("http://localhost:3000/path"));
+        assert!(!is_safe_web_url("file:///tmp/secret"));
+        assert!(!is_safe_web_url("javascript:alert(1)"));
+        assert!(!is_safe_web_url("https://"));
+        assert!(!is_safe_web_url("https://example.com/has space"));
+        assert_eq!(
+            open_web_url("file:///tmp/secret").expect_err("unsafe scheme"),
+            "refusing to open a non-HTTP(S) link"
+        );
     }
 
     #[test]
