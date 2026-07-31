@@ -8,8 +8,9 @@ use crate::engine::{build_context_package, run_turn, SharedStore, TurnRequest};
 use crate::lock::InstanceLock;
 use crate::protocol::{ConversationSummary, MessageView, Request, Response};
 use argo_core::error::{ArgoError, Result};
-use argo_core::event::RunStatus;
+use argo_core::event::{RunEvent, RunEventKind, RunStatus};
 use argo_core::ids::{AgentId, ConversationId, MessageId, RunId};
+use argo_core::message::{ContentBlock, ToolCall, ToolStatus};
 use argo_core::session::{evaluate_resume, ResumeInputs, SelectionChange};
 use argo_core::{ArgoPaths, IPC_PROTOCOL_VERSION};
 use argo_runtime::{exec::CancelToken, AgentInfo};
@@ -368,8 +369,15 @@ impl Daemon {
     }
 }
 
-/// Renders a stored message for display.
-fn message_view(message: &argo_core::message::Message) -> MessageView {
+/// Renders a stored message for display, recovering old structured activity from
+/// durable run events when the historical message predates block persistence.
+fn message_view(message: &argo_core::message::Message, events: &[RunEvent]) -> MessageView {
+    let recovered = blocks_from_events(events);
+    let blocks = if recovered.is_empty() {
+        message.blocks.clone()
+    } else {
+        recovered
+    };
     MessageView {
         id: message.id.to_string(),
         role: match message.role {
@@ -379,11 +387,87 @@ fn message_view(message: &argo_core::message::Message) -> MessageView {
         }
         .to_string(),
         text: message.transferable_text(),
-        blocks: message.blocks.clone(),
+        blocks,
         agent_id: message.agent_id.as_ref().map(|a| a.to_string()),
         model: message.model.clone(),
         created_at: message.created_at,
     }
+}
+
+fn blocks_from_events(events: &[RunEvent]) -> Vec<ContentBlock> {
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    for event in events {
+        match &event.kind {
+            RunEventKind::TextDelta { text } if !text.is_empty() => match blocks.last_mut() {
+                Some(ContentBlock::Text { text: accumulated }) => accumulated.push_str(text),
+                _ => blocks.push(ContentBlock::text(text)),
+            },
+            RunEventKind::ThinkingDelta { text } if !text.is_empty() => {
+                match blocks.last_mut() {
+                    Some(ContentBlock::Thinking { text: accumulated }) => {
+                        accumulated.push_str(text)
+                    }
+                    _ => blocks.push(ContentBlock::Thinking { text: text.clone() }),
+                }
+            }
+            RunEventKind::ToolStarted { id, name, input } => {
+                blocks.push(ContentBlock::Tool {
+                    call: ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        output: None,
+                        status: ToolStatus::Pending,
+                    },
+                });
+            }
+            RunEventKind::ToolCompleted { id, output, ok } => {
+                let call = blocks.iter_mut().rev().find_map(|block| match block {
+                    ContentBlock::Tool { call } if call.id == *id => Some(call),
+                    _ => None,
+                });
+                if let Some(call) = call {
+                    call.output = output.clone();
+                    call.status = if *ok {
+                        ToolStatus::Completed
+                    } else {
+                        ToolStatus::Failed
+                    };
+                } else {
+                    blocks.push(ContentBlock::Tool {
+                        call: ToolCall {
+                            id: id.clone(),
+                            name: "tool".into(),
+                            input: None,
+                            output: output.clone(),
+                            status: if *ok {
+                                ToolStatus::Completed
+                            } else {
+                                ToolStatus::Failed
+                            },
+                        },
+                    });
+                }
+            }
+            RunEventKind::FileWritten { path }
+                if !blocks.iter().any(
+                    |block| matches!(block, ContentBlock::FileWrite { path: known } if known == path),
+                ) =>
+            {
+                blocks.push(ContentBlock::FileWrite { path: path.clone() });
+            }
+            _ => {}
+        }
+    }
+    blocks
+        .into_iter()
+        .filter(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+                !text.trim().is_empty()
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 /// Serves until shutdown is requested.
@@ -703,14 +787,21 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
         Request::GetConversation { conversation_id } => {
             let (conversation, messages) = {
                 let store = daemon.store()?;
-                (
-                    store.get_conversation(&conversation_id)?,
-                    store.list_messages(&conversation_id)?,
-                )
+                let conversation = store.get_conversation(&conversation_id)?;
+                let stored = store.list_messages(&conversation_id)?;
+                let mut messages = Vec::with_capacity(stored.len());
+                for message in &stored {
+                    let events = match &message.run_id {
+                        Some(run_id) => store.list_events_after(run_id, 0)?,
+                        None => Vec::new(),
+                    };
+                    messages.push(message_view(message, &events));
+                }
+                (conversation, messages)
             };
             Ok(Response::Conversation {
                 summary: daemon.summarize(&conversation).await?,
-                messages: messages.iter().map(message_view).collect(),
+                messages,
             })
         }
 
@@ -1664,6 +1755,72 @@ mod tests {
         .await
         .expect_err("must refuse to nest further");
         assert!(error.to_string().contains("limit is"));
+    }
+
+    #[test]
+    fn historical_messages_recover_structured_blocks_from_run_events() {
+        let run_id = RunId::new("r1");
+        let events = vec![
+            RunEvent::new(
+                run_id.clone(),
+                1,
+                RunEventKind::TextDelta {
+                    text: "Submitting. ".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id.clone(),
+                2,
+                RunEventKind::ToolStarted {
+                    id: "t1".into(),
+                    name: "run_backtest".into(),
+                    input: Some("SENSEX".into()),
+                },
+            ),
+            RunEvent::new(
+                run_id.clone(),
+                3,
+                RunEventKind::ToolCompleted {
+                    id: "t1".into(),
+                    output: Some("runID=backtest-123".into()),
+                    ok: true,
+                },
+            ),
+            RunEvent::new(
+                run_id.clone(),
+                4,
+                RunEventKind::TextDelta {
+                    text: "Done.".into(),
+                },
+            ),
+        ];
+        let message = argo_core::message::Message {
+            id: MessageId::new("m1"),
+            role: argo_core::message::Role::Assistant,
+            // Historical rows had only flattened prose despite richer run events.
+            blocks: vec![ContentBlock::text("Submitting. Done.")],
+            agent_id: Some(AgentId::new("antigravity")),
+            model: Some("sonnet".into()),
+            run_id: Some(run_id),
+            seq: 1,
+            created_at: 0,
+        };
+
+        let view = message_view(&message, &events);
+        assert_eq!(view.blocks.len(), 3);
+        assert!(matches!(
+            &view.blocks[0],
+            ContentBlock::Text { text } if text == "Submitting. "
+        ));
+        let ContentBlock::Tool { call } = &view.blocks[1] else {
+            panic!("tool block was not recovered");
+        };
+        assert_eq!(call.name, "run_backtest");
+        assert_eq!(call.output.as_deref(), Some("runID=backtest-123"));
+        assert!(matches!(
+            &view.blocks[2],
+            ContentBlock::Text { text } if text == "Done."
+        ));
     }
 
     #[test]
