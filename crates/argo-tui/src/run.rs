@@ -12,7 +12,10 @@ use argo_core::event::RunEvent;
 use argo_core::ids::ConversationId;
 use argo_core::{ArgoPaths, IPC_PROTOCOL_VERSION};
 use argo_daemon::protocol::{Request, Response};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -26,8 +29,19 @@ use tokio::sync::mpsc;
 /// Restores the terminal, tolerating already-restored state.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+}
+
+/// Restores terminal state if setup or the event loop exits early.
+struct TerminalRestoreGuard(bool);
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            restore_terminal();
+        }
+    }
 }
 
 /// Runs the TUI against the daemon.
@@ -75,9 +89,10 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
         default_hook(info);
     }));
 
+    let mut terminal_guard = TerminalRestoreGuard(true);
     enable_raw_mode().map_err(|e| ArgoError::Io(format!("enable raw mode: {e}")))?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
@@ -86,6 +101,7 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     let result = event_loop(&mut terminal, &mut connection, &mut app, paths).await;
 
     restore_terminal();
+    terminal_guard.0 = false;
     let _ = terminal.show_cursor();
 
     // The alternate screen is gone by now, so the transcript is no longer visible.
@@ -159,6 +175,13 @@ async fn event_loop(
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, connection, app, paths, &event_tx).await?;
                     }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        let area = terminal
+                            .size()
+                            .map_err(|error| ArgoError::Io(format!("terminal size: {error}")))?;
+                        handle_mouse(mouse, area.width, area.height, app);
+                    }
+
                     Some(Ok(_)) => {}
                     // Terminal closed or errored: exit rather than spin.
                     Some(Err(error)) => {
@@ -169,6 +192,72 @@ async fn event_loop(
             }
         }
     }
+}
+
+fn handle_mouse(mouse: MouseEvent, width: u16, height: u16, app: &mut App) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.has_overlay() {
+                app.overlay_move(-3);
+            } else {
+                app.scroll_up(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.has_overlay() {
+                app.overlay_move(3);
+            } else {
+                app.scroll_down(3);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if is_open_gesture(&mouse) => {
+            let Some(url) = crate::render::url_at(app, width, height, mouse.column, mouse.row)
+            else {
+                app.set_status("no URL under pointer");
+                return;
+            };
+            match open_url(&url) {
+                Ok(()) => app.set_status(format!("opened {url}")),
+                Err(error) => app.report_error(error),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_open_gesture(mouse: &MouseEvent) -> bool {
+    mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && (mouse.modifiers.contains(KeyModifiers::SUPER)
+            || mouse.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn open_url(url: &str) -> std::result::Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http:// and https:// links can be opened".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err("opening links is supported on macOS and Linux".into());
+
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open URL: {error}"))
 }
 
 /// Handles one key press.
@@ -1334,6 +1423,49 @@ mod tests {
         assert!(should_drain_queue(RunStatus::Cancelled));
         assert!(!should_drain_queue(RunStatus::Running));
         assert!(!should_drain_queue(RunStatus::Pending));
+    }
+
+    #[test]
+    fn command_click_is_the_only_url_open_gesture() {
+        let mouse = |kind, modifiers| MouseEvent {
+            kind,
+            column: 4,
+            row: 7,
+            modifiers,
+        };
+
+        assert!(is_open_gesture(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SUPER,
+        )));
+        assert!(is_open_gesture(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_open_gesture(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+        )));
+        assert!(!is_open_gesture(&mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            KeyModifiers::SUPER,
+        )));
+        assert!(!is_open_gesture(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::SUPER,
+        )));
+    }
+
+    #[test]
+    fn opener_rejects_non_web_schemes_before_spawning() {
+        assert_eq!(
+            open_url("file:///tmp/report").unwrap_err(),
+            "only http:// and https:// links can be opened"
+        );
+        assert_eq!(
+            open_url("javascript:alert(1)").unwrap_err(),
+            "only http:// and https:// links can be opened"
+        );
     }
 
     #[test]

@@ -625,6 +625,114 @@ pub fn shorten_path(path: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Resolves a URL under a rendered terminal cell.
+///
+/// Hit-testing the rendered buffer keeps this exactly aligned with Markdown
+/// wrapping, transcript scrollback, and overlays. The visible fragment is then
+/// expanded against canonical text so a URL wrapped by the viewport still opens
+/// in full.
+pub(crate) fn url_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<String> {
+    if width == 0 || height == 0 || column >= width || row >= height {
+        return None;
+    }
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).ok()?;
+    terminal.draw(|frame| draw(frame, app)).ok()?;
+    let buffer = terminal.backend().buffer();
+    let start = row as usize * width as usize;
+    let end = start + width as usize;
+    let rendered = buffer.content()[start..end]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let urls = urls_in_text(&rendered);
+    let clicked = column as usize;
+    let candidate = urls
+        .iter()
+        .find(|(start, end, _)| clicked >= *start && clicked < *end)
+        .or_else(|| (urls.len() == 1).then(|| &urls[0]))?
+        .2
+        .clone();
+
+    let mut known = app
+        .lines
+        .iter()
+        .flat_map(|line| urls_in_text(&line.text).into_iter().map(|(_, _, url)| url))
+        .collect::<Vec<_>>();
+    match &app.overlay {
+        Overlay::Text { lines, .. } => known.extend(
+            lines
+                .iter()
+                .flat_map(|line| urls_in_text(line).into_iter().map(|(_, _, url)| url)),
+        ),
+        Overlay::Picker { items, .. } => known.extend(
+            items
+                .iter()
+                .flat_map(|line| urls_in_text(line).into_iter().map(|(_, _, url)| url)),
+        ),
+        Overlay::None => {}
+    }
+    known
+        .iter()
+        .find(|url| url.as_str() == candidate)
+        .cloned()
+        .or_else(|| {
+            let matches = known
+                .into_iter()
+                .filter(|url| url.starts_with(&candidate))
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then(|| matches[0].clone())
+        })
+        .or(Some(candidate))
+}
+
+fn urls_in_text(text: &str) -> Vec<(usize, usize, String)> {
+    let mut urls = Vec::new();
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        let next_http = rest.find("http://");
+        let next_https = rest.find("https://");
+        let Some(relative) = (match (next_http, next_https) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(found), None) | (None, Some(found)) => Some(found),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+        let start_byte = offset + relative;
+        let mut end_byte = start_byte;
+        for (index, ch) in text[start_byte..].char_indices() {
+            if ch.is_whitespace()
+                || matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | '|' | '│' | '┃')
+            {
+                break;
+            }
+            end_byte = start_byte + index + ch.len_utf8();
+        }
+        while end_byte > start_byte
+            && text[..end_byte]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '.' | ',' | ';' | '!'))
+        {
+            end_byte -= text[..end_byte]
+                .chars()
+                .next_back()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        }
+        if end_byte > start_byte {
+            let start_column = text[..start_byte].chars().count();
+            let url = text[start_byte..end_byte].to_string();
+            let end_column = start_column + url.chars().count();
+            urls.push((start_column, end_column, url));
+        }
+        offset = end_byte.max(start_byte + 1);
+    }
+    urls
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -812,6 +920,79 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_cell(app: &App, width: u16, height: u16, needle: &str) -> (u16, u16) {
+        let output = render(app, width, height);
+        output
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find(needle).map(|byte| {
+                    (
+                        line[..byte].chars().count() as u16,
+                        u16::try_from(row).expect("rendered row"),
+                    )
+                })
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not rendered:\n{output}"))
+    }
+
+    #[test]
+    fn rendered_markdown_link_destination_is_hit_testable() {
+        let mut app = App::new("/repo");
+        app.push(
+            LineKind::Assistant,
+            "[Report Link](https://example.com/report/123)",
+        );
+        let (column, row) = rendered_cell(&app, 72, 16, "https://example.com/report/123");
+
+        assert_eq!(
+            url_at(&app, 72, 16, column, row).as_deref(),
+            Some("https://example.com/report/123")
+        );
+    }
+
+    #[test]
+    fn wrapped_link_prefix_expands_to_the_canonical_destination() {
+        let destination = "https://example.com/reports/very-long-backtest-identifier-123456789";
+        let mut app = App::new("/repo");
+        app.push(LineKind::Assistant, format!("[Report Link]({destination})"));
+        let (column, row) = rendered_cell(&app, 38, 18, "https://");
+
+        assert_eq!(
+            url_at(&app, 38, 18, column, row).as_deref(),
+            Some(destination)
+        );
+    }
+
+    #[test]
+    fn url_parser_accepts_web_links_and_rejects_unsafe_schemes() {
+        let urls = urls_in_text(
+            "https://example.com/a, http://localhost:3000/x! file://tmp/x javascript:alert(1)",
+        );
+        assert_eq!(
+            urls.iter()
+                .map(|(_, _, url)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://example.com/a", "http://localhost:3000/x"]
+        );
+        assert!(urls_in_text("file:///tmp/report javascript:alert(1)").is_empty());
+    }
+
+    #[test]
+    fn text_overlay_links_are_hit_testable() {
+        let mut app = App::new("/repo");
+        app.open_text(
+            "report",
+            vec!["Open https://example.com/overlay/report".into()],
+        );
+        let (column, row) = rendered_cell(&app, 70, 16, "https://example.com/overlay/report");
+
+        assert_eq!(
+            url_at(&app, 70, 16, column, row).as_deref(),
+            Some("https://example.com/overlay/report")
+        );
     }
 
     #[test]

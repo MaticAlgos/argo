@@ -275,7 +275,9 @@ argo tui --root /path/to/project
 - `Tab`: accept a command completion.
 - `↑` / `↓`: navigate suggestions, pickers, or composer history.
 - `Shift+Enter` or `Ctrl+J`: insert a newline.
-- `PageUp` / `PageDown`: scroll transcript or overlays.
+- `PageUp` / `PageDown` or the mouse wheel: scroll transcript or overlays.
+- `Cmd+click` on macOS (`Ctrl+click` is also accepted): open a displayed
+  `http://` or `https://` link in the system browser.
 - `Shift+Tab`: cycle the selected adapter's supported execution modes.
 - `Esc`: dismiss an overlay, cancel a running turn, or discard a paused queue
   while idle.
