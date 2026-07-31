@@ -5,6 +5,7 @@
 //! from the terminal size each frame so a resize needs no special handling.
 
 use crate::app::{App, LineKind, Overlay};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
@@ -625,34 +626,26 @@ pub fn shorten_path(path: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// Resolves a URL under a rendered terminal cell.
+/// A visible terminal fragment backed by a terminal-native OSC 8 destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeHyperlink {
+    pub(crate) column: u16,
+    pub(crate) row: u16,
+    pub(crate) text: String,
+    pub(crate) url: String,
+}
+
+/// Finds visible HTTP(S) destinations after Ratatui has laid out the frame.
 ///
-/// Hit-testing the rendered buffer keeps this exactly aligned with Markdown
-/// wrapping, transcript scrollback, and overlays. The visible fragment is then
-/// expanded against canonical text so a URL wrapped by the viewport still opens
-/// in full.
-pub(crate) fn url_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<String> {
-    if width == 0 || height == 0 || column >= width || row >= height {
-        return None;
+/// The URL text remains ordinary terminal text, so drag selection and copying are
+/// left to the terminal. `run` repaints these exact fragments with OSC 8 metadata
+/// after Ratatui flushes the frame, which gives supporting terminals native link
+/// interaction without enabling mouse capture.
+pub(crate) fn native_hyperlinks(buffer: &Buffer, app: &App) -> Vec<NativeHyperlink> {
+    let area = buffer.area;
+    if area.is_empty() {
+        return Vec::new();
     }
-    let backend = ratatui::backend::TestBackend::new(width, height);
-    let mut terminal = ratatui::Terminal::new(backend).ok()?;
-    terminal.draw(|frame| draw(frame, app)).ok()?;
-    let buffer = terminal.backend().buffer();
-    let start = row as usize * width as usize;
-    let end = start + width as usize;
-    let rendered = buffer.content()[start..end]
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    let urls = urls_in_text(&rendered);
-    let clicked = column as usize;
-    let candidate = urls
-        .iter()
-        .find(|(start, end, _)| clicked >= *start && clicked < *end)
-        .or_else(|| (urls.len() == 1).then(|| &urls[0]))?
-        .2
-        .clone();
 
     let mut known = app
         .lines
@@ -672,18 +665,36 @@ pub(crate) fn url_at(app: &App, width: u16, height: u16, column: u16, row: u16) 
         ),
         Overlay::None => {}
     }
-    known
-        .iter()
-        .find(|url| url.as_str() == candidate)
-        .cloned()
-        .or_else(|| {
-            let matches = known
-                .into_iter()
-                .filter(|url| url.starts_with(&candidate))
-                .collect::<Vec<_>>();
-            (matches.len() == 1).then(|| matches[0].clone())
-        })
-        .or(Some(candidate))
+    known.sort();
+    known.dedup();
+
+    let mut hyperlinks = Vec::new();
+    for row in area.y..area.y.saturating_add(area.height) {
+        let rendered = (area.x..area.x.saturating_add(area.width))
+            .map(|column| buffer[(column, row)].symbol())
+            .collect::<String>();
+        for (start, _, text) in urls_in_text(&rendered) {
+            let url = known
+                .iter()
+                .find(|url| url.as_str() == text)
+                .cloned()
+                .or_else(|| {
+                    let matches = known
+                        .iter()
+                        .filter(|url| url.starts_with(&text))
+                        .collect::<Vec<_>>();
+                    (matches.len() == 1).then(|| matches[0].clone())
+                })
+                .unwrap_or_else(|| text.clone());
+            hyperlinks.push(NativeHyperlink {
+                column: area.x.saturating_add(start as u16),
+                row,
+                text,
+                url,
+            });
+        }
+    }
+    hyperlinks
 }
 
 fn urls_in_text(text: &str) -> Vec<(usize, usize, String)> {
@@ -704,6 +715,7 @@ fn urls_in_text(text: &str) -> Vec<(usize, usize, String)> {
         let mut end_byte = start_byte;
         for (index, ch) in text[start_byte..].char_indices() {
             if ch.is_whitespace()
+                || ch.is_control()
                 || matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | '|' | '│' | '┃')
             {
                 break;
@@ -922,48 +934,42 @@ mod tests {
             .join("\n")
     }
 
-    fn rendered_cell(app: &App, width: u16, height: u16, needle: &str) -> (u16, u16) {
-        let output = render(app, width, height);
-        output
-            .lines()
-            .enumerate()
-            .find_map(|(row, line)| {
-                line.find(needle).map(|byte| {
-                    (
-                        line[..byte].chars().count() as u16,
-                        u16::try_from(row).expect("rendered row"),
-                    )
-                })
+    fn rendered_hyperlinks(app: &App, width: u16, height: u16) -> Vec<NativeHyperlink> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hyperlinks = Vec::new();
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+                hyperlinks = native_hyperlinks(frame.buffer_mut(), app);
             })
-            .unwrap_or_else(|| panic!("{needle:?} not rendered:\n{output}"))
+            .expect("draw");
+        hyperlinks
     }
 
     #[test]
-    fn rendered_markdown_link_destination_is_hit_testable() {
+    fn rendered_markdown_destination_becomes_a_native_hyperlink() {
         let mut app = App::new("/repo");
         app.push(
             LineKind::Assistant,
             "[Report Link](https://example.com/report/123)",
         );
-        let (column, row) = rendered_cell(&app, 72, 16, "https://example.com/report/123");
 
-        assert_eq!(
-            url_at(&app, 72, 16, column, row).as_deref(),
-            Some("https://example.com/report/123")
-        );
+        assert!(rendered_hyperlinks(&app, 72, 16).iter().any(|link| {
+            link.text == "https://example.com/report/123"
+                && link.url == "https://example.com/report/123"
+        }));
     }
 
     #[test]
-    fn wrapped_link_prefix_expands_to_the_canonical_destination() {
+    fn wrapped_link_prefix_uses_the_full_canonical_destination() {
         let destination = "https://example.com/reports/very-long-backtest-identifier-123456789";
         let mut app = App::new("/repo");
         app.push(LineKind::Assistant, format!("[Report Link]({destination})"));
-        let (column, row) = rendered_cell(&app, 38, 18, "https://");
 
-        assert_eq!(
-            url_at(&app, 38, 18, column, row).as_deref(),
-            Some(destination)
-        );
+        assert!(rendered_hyperlinks(&app, 38, 18)
+            .iter()
+            .any(|link| link.text.starts_with("https://") && link.url == destination));
     }
 
     #[test]
@@ -978,21 +984,25 @@ mod tests {
             vec!["https://example.com/a", "http://localhost:3000/x"]
         );
         assert!(urls_in_text("file:///tmp/report javascript:alert(1)").is_empty());
+        assert!(
+            urls_in_text("https://safe.example/\u{1b}]8;;https://evil.example")[0]
+                .2
+                .ends_with('/')
+        );
     }
 
     #[test]
-    fn text_overlay_links_are_hit_testable() {
+    fn text_overlay_destinations_become_native_hyperlinks() {
         let mut app = App::new("/repo");
         app.open_text(
             "report",
             vec!["Open https://example.com/overlay/report".into()],
         );
-        let (column, row) = rendered_cell(&app, 70, 16, "https://example.com/overlay/report");
 
-        assert_eq!(
-            url_at(&app, 70, 16, column, row).as_deref(),
-            Some("https://example.com/overlay/report")
-        );
+        assert!(rendered_hyperlinks(&app, 70, 16).iter().any(|link| {
+            link.text == "https://example.com/overlay/report"
+                && link.url == "https://example.com/overlay/report"
+        }));
     }
 
     #[test]

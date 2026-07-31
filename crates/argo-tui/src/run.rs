@@ -12,9 +12,10 @@ use argo_core::event::RunEvent;
 use argo_core::ids::ConversationId;
 use argo_core::{ArgoPaths, IPC_PROTOCOL_VERSION};
 use argo_daemon::protocol::{Request, Response};
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::{
+    Attribute, Color as CrosstermColor, Print, SetAttribute, SetForegroundColor,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,7 +30,7 @@ use tokio::sync::mpsc;
 /// Restores the terminal, tolerating already-restored state.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
 }
 
@@ -92,7 +93,10 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     let mut terminal_guard = TerminalRestoreGuard(true);
     enable_raw_mode().map_err(|e| ArgoError::Io(format!("enable raw mode: {e}")))?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+    // Mouse capture prevents ordinary drag selection and cannot reliably report
+    // the macOS Command modifier. Native OSC 8 links leave both gestures to the
+    // terminal instead.
+    crossterm::execute!(stdout, EnterAlternateScreen)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
@@ -124,9 +128,15 @@ async fn event_loop(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RunEvent>();
 
     loop {
+        let mut hyperlinks = Vec::new();
         terminal
-            .draw(|frame| crate::render::draw(frame, app))
+            .draw(|frame| {
+                crate::render::draw(frame, app);
+                hyperlinks = crate::render::native_hyperlinks(frame.buffer_mut(), app);
+            })
             .map_err(|e| ArgoError::Io(format!("draw: {e}")))?;
+        write_native_hyperlinks(&mut std::io::stdout(), &hyperlinks)
+            .map_err(|e| ArgoError::Io(format!("draw hyperlinks: {e}")))?;
 
         if app.should_quit {
             return Ok(());
@@ -175,13 +185,6 @@ async fn event_loop(
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, connection, app, paths, &event_tx).await?;
                     }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        let area = terminal
-                            .size()
-                            .map_err(|error| ArgoError::Io(format!("terminal size: {error}")))?;
-                        handle_mouse(mouse, area.width, area.height, app);
-                    }
-
                     Some(Ok(_)) => {}
                     // Terminal closed or errored: exit rather than spin.
                     Some(Err(error)) => {
@@ -194,70 +197,38 @@ async fn event_loop(
     }
 }
 
-fn handle_mouse(mouse: MouseEvent, width: u16, height: u16, app: &mut App) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if app.has_overlay() {
-                app.overlay_move(-3);
-            } else {
-                app.scroll_up(3);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if app.has_overlay() {
-                app.overlay_move(3);
-            } else {
-                app.scroll_down(3);
-            }
-        }
-        MouseEventKind::Down(MouseButton::Left) if is_open_gesture(&mouse) => {
-            let Some(url) = crate::render::url_at(app, width, height, mouse.column, mouse.row)
-            else {
-                app.set_status("no URL under pointer");
-                return;
-            };
-            match open_url(&url) {
-                Ok(()) => app.set_status(format!("opened {url}")),
-                Err(error) => app.report_error(error),
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_open_gesture(mouse: &MouseEvent) -> bool {
-    mouse.kind == MouseEventKind::Down(MouseButton::Left)
-        && (mouse.modifiers.contains(KeyModifiers::SUPER)
-            || mouse.modifiers.contains(KeyModifiers::CONTROL))
-}
-
-fn open_url(url: &str) -> std::result::Result<(), String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("only http:// and https:// links can be opened".into());
+fn write_native_hyperlinks<W: std::io::Write>(
+    writer: &mut W,
+    hyperlinks: &[crate::render::NativeHyperlink],
+) -> std::io::Result<()> {
+    if hyperlinks.is_empty() {
+        return Ok(());
     }
 
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err("opening links is supported on macOS and Linux".into());
-
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("could not open URL: {error}"))
+    crossterm::queue!(
+        writer,
+        SavePosition,
+        SetForegroundColor(CrosstermColor::Rgb {
+            r: 105,
+            g: 190,
+            b: 255,
+        }),
+        SetAttribute(Attribute::Underlined)
+    )?;
+    for hyperlink in hyperlinks {
+        let osc8 = format!(
+            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
+            hyperlink.url, hyperlink.text
+        );
+        crossterm::queue!(writer, MoveTo(hyperlink.column, hyperlink.row), Print(osc8))?;
+    }
+    crossterm::queue!(
+        writer,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(CrosstermColor::Reset),
+        RestorePosition
+    )?;
+    writer.flush()
 }
 
 /// Handles one key press.
@@ -1426,45 +1397,23 @@ mod tests {
     }
 
     #[test]
-    fn command_click_is_the_only_url_open_gesture() {
-        let mouse = |kind, modifiers| MouseEvent {
-            kind,
+    fn native_hyperlink_writer_emits_osc8_without_mouse_events() {
+        let hyperlink = crate::render::NativeHyperlink {
             column: 4,
             row: 7,
-            modifiers,
+            text: "https://example.com/report".into(),
+            url: "https://example.com/report/123".into(),
         };
+        let mut output = Vec::new();
 
-        assert!(is_open_gesture(&mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            KeyModifiers::SUPER,
-        )));
-        assert!(is_open_gesture(&mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            KeyModifiers::CONTROL,
-        )));
-        assert!(!is_open_gesture(&mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            KeyModifiers::NONE,
-        )));
-        assert!(!is_open_gesture(&mouse(
-            MouseEventKind::Down(MouseButton::Right),
-            KeyModifiers::SUPER,
-        )));
-        assert!(!is_open_gesture(&mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            KeyModifiers::SUPER,
-        )));
-    }
+        write_native_hyperlinks(&mut output, &[hyperlink]).expect("write hyperlink");
 
-    #[test]
-    fn opener_rejects_non_web_schemes_before_spawning() {
-        assert_eq!(
-            open_url("file:///tmp/report").unwrap_err(),
-            "only http:// and https:// links can be opened"
-        );
-        assert_eq!(
-            open_url("javascript:alert(1)").unwrap_err(),
-            "only http:// and https:// links can be opened"
+        let output = String::from_utf8(output).expect("terminal output");
+        assert!(
+            output.contains(
+                "\x1b]8;;https://example.com/report/123\x1b\\https://example.com/report\x1b]8;;\x1b\\"
+            ),
+            "{output:?}"
         );
     }
 
