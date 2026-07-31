@@ -490,9 +490,12 @@ impl AcpSession {
                 }
             }
             other if !other.is_empty() => {
+                let detail = chunk_text(update)
+                    .map(|text| format!("{other}: {text}"))
+                    .unwrap_or_else(|| other.to_string());
                 sink.emit(RunEventKind::Diagnostic {
                     code: "ACP_UPDATE".into(),
-                    detail: truncate(other, 120),
+                    detail: truncate(&detail, 200),
                 });
             }
             _ => {}
@@ -746,6 +749,21 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, RunEventKind::ToolCompleted { ok: true, .. })));
+    }
+
+    #[test]
+    fn unknown_textual_updates_remain_visible_as_diagnostics() {
+        let mut sink = CollectingSink::default();
+        let mut s = prompting_session();
+        s.handle_line(
+            &json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_progress_message","content":{"type":"text","text":"still checking"}}}}).to_string(),
+            &mut sink,
+        );
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            RunEventKind::Diagnostic { code, detail }
+                if code == "ACP_UPDATE" && detail.contains("still checking")
+        )));
     }
 
     #[test]

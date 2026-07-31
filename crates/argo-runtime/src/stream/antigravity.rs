@@ -75,25 +75,21 @@ impl AntigravityStreamParser {
             .unwrap_or_else(|| "unknown".into());
 
         match kind {
-            "agent_response" => {
-                if let Some(text) = step.get("text_delta").and_then(|v| v.as_str()) {
+            "agent_response" | "assistant_message" | "message" | "model_response"
+            | "final_response" => {
+                if let Some(text) = step_text(step) {
                     if !text.is_empty() {
                         self.streamed_text = true;
-                        sink.emit(RunEventKind::TextDelta { text: text.into() });
+                        sink.emit(RunEventKind::TextDelta { text });
                     }
                 }
             }
-            // Future/current builds may name an exposed reasoning step either way.
-            // If the CLI emits no text (as current Gemini models often do), Argo
-            // shows the animated thinking state but invents no chain-of-thought.
-            "thinking" | "reasoning" => {
-                if let Some(text) = step
-                    .get("text_delta")
-                    .or_else(|| step.get("text"))
-                    .and_then(|v| v.as_str())
-                {
+            // Future/current builds may name explicitly emitted reasoning in
+            // several ways. These are wire labels, not inferred chain-of-thought.
+            "thinking" | "reasoning" | "analysis" | "agent_thought" | "thought" => {
+                if let Some(text) = step_text(step) {
                     if !text.is_empty() {
-                        sink.emit(RunEventKind::ThinkingDelta { text: text.into() });
+                        sink.emit(RunEventKind::ThinkingDelta { text });
                     }
                 }
             }
@@ -190,6 +186,24 @@ impl AntigravityStreamParser {
     }
 }
 
+fn step_text(step: &serde_json::Value) -> Option<String> {
+    for key in ["text_delta", "text", "message", "description"] {
+        if let Some(text) = step.get(key).and_then(|value| value.as_str()) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    step.get("content")
+        .and_then(|content| {
+            content
+                .as_str()
+                .or_else(|| content.get("text").and_then(|value| value.as_str()))
+        })
+        .filter(|text| !text.is_empty())
+        .map(String::from)
+}
+
 fn parse_usage(value: Option<&serde_json::Value>) -> TokenUsage {
     let get = |key| value.and_then(|v| v.get(key)).and_then(|v| v.as_u64());
     TokenUsage {
@@ -271,6 +285,27 @@ mod tests {
             RunEventKind::ToolCompleted { ok: true, output: Some(output), .. }
                 if output.contains("/repo")
         ));
+    }
+
+    #[test]
+    fn explicit_thinking_and_message_aliases_are_not_dropped() {
+        let mut parser = AntigravityStreamParser::new();
+        let mut sink = CollectingSink::default();
+        parser.push_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"analysis","content":{"text":"checking context"}}}"#,
+            &mut sink,
+        );
+        parser.push_line(
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"assistant_message","message":"answer fragment"}}"#,
+            &mut sink,
+        );
+
+        assert!(sink.events.contains(&RunEventKind::ThinkingDelta {
+            text: "checking context".into()
+        }));
+        assert!(sink.events.contains(&RunEventKind::TextDelta {
+            text: "answer fragment".into()
+        }));
     }
 
     #[test]

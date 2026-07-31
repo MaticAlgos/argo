@@ -16,6 +16,17 @@ pub struct CodexStreamParser {
     outcome: Option<TerminalOutcome>,
     /// True once a session id has been captured, so it is emitted only once.
     session_seen: bool,
+    /// Cumulative text already emitted for message items, keyed by item id.
+    agent_items: std::collections::HashMap<String, String>,
+    /// Cumulative reasoning already emitted for reasoning items.
+    reasoning_items: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemPhase {
+    Started,
+    Updated,
+    Completed,
 }
 
 impl CodexStreamParser {
@@ -62,8 +73,9 @@ impl CodexStreamParser {
                     });
                 }
             }
-            "item.started" => self.handle_item(&value, false, sink),
-            "item.completed" | "item.updated" => self.handle_item(&value, true, sink),
+            "item.started" => self.handle_item(&value, ItemPhase::Started, sink),
+            "item.updated" => self.handle_item(&value, ItemPhase::Updated, sink),
+            "item.completed" => self.handle_item(&value, ItemPhase::Completed, sink),
             // OpenCode's vocabulary. `text` carries assistant output, and
             // `step_finish` terminates the turn with token accounting.
             "text" => {
@@ -188,7 +200,7 @@ impl CodexStreamParser {
     fn handle_item(
         &mut self,
         value: &serde_json::Value,
-        completed: bool,
+        phase: ItemPhase,
         sink: &mut dyn StreamSink,
     ) {
         let Some(item) = value.get("item") else {
@@ -203,32 +215,30 @@ impl CodexStreamParser {
             .and_then(|v| v.as_str())
             .unwrap_or("item")
             .to_string();
+        let completed = phase == ItemPhase::Completed;
 
         match item_type {
             "agent_message" => {
-                // Text arrives complete on the completed frame; emitting on both
-                // would duplicate it.
-                if completed {
+                // Newer Codex builds may send cumulative item.updated records.
+                // Emit only the unseen suffix, then suppress the identical final
+                // item.completed payload.
+                if phase != ItemPhase::Started {
                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            sink.emit(RunEventKind::TextDelta {
-                                text: text.to_string(),
-                            });
+                        if let Some(delta) = unseen_suffix(&mut self.agent_items, &id, text) {
+                            sink.emit(RunEventKind::TextDelta { text: delta });
                         }
                     }
                 }
             }
             "reasoning" => {
-                if completed {
+                if phase != ItemPhase::Started {
                     if let Some(text) = item
                         .get("text")
                         .or_else(|| item.get("summary"))
                         .and_then(|v| v.as_str())
                     {
-                        if !text.is_empty() {
-                            sink.emit(RunEventKind::ThinkingDelta {
-                                text: text.to_string(),
-                            });
+                        if let Some(delta) = unseen_suffix(&mut self.reasoning_items, &id, text) {
+                            sink.emit(RunEventKind::ThinkingDelta { text: delta });
                         }
                     }
                 }
@@ -251,7 +261,7 @@ impl CodexStreamParser {
                         .and_then(|v| v.as_str())
                         .map(|s| truncate(s, 4_000));
                     sink.emit(RunEventKind::ToolCompleted { id, output, ok });
-                } else {
+                } else if phase == ItemPhase::Started {
                     sink.emit(RunEventKind::ToolStarted {
                         id,
                         name: "shell".into(),
@@ -284,7 +294,7 @@ impl CodexStreamParser {
                         output: item.get("result").map(|v| truncate(&v.to_string(), 4_000)),
                         ok,
                     });
-                } else {
+                } else if phase == ItemPhase::Started {
                     sink.emit(RunEventKind::ToolStarted {
                         id,
                         name,
@@ -295,7 +305,7 @@ impl CodexStreamParser {
                 }
             }
             "web_search" => {
-                if !completed {
+                if phase == ItemPhase::Started {
                     sink.emit(RunEventKind::ToolStarted {
                         id,
                         name: "web_search".into(),
@@ -319,6 +329,25 @@ impl CodexStreamParser {
     pub fn outcome(&self) -> Option<&TerminalOutcome> {
         self.outcome.as_ref()
     }
+}
+
+fn unseen_suffix(
+    seen: &mut std::collections::HashMap<String, String>,
+    id: &str,
+    text: &str,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let delta = match seen.get(id) {
+        Some(previous) if previous == text => None,
+        Some(previous) if text.starts_with(previous) => Some(text[previous.len()..].to_string()),
+        // A replacement record is not cumulative. Preserve it rather than
+        // silently dropping the final agent message.
+        Some(_) | None => Some(text.to_string()),
+    };
+    seen.insert(id.to_string(), text.to_string());
+    delta.filter(|delta| !delta.is_empty())
 }
 
 /// Reads OpenCode's nested token shape.
@@ -568,6 +597,56 @@ mod tests {
             &RunEventKind::TextDelta {
                 text: "final text".into()
             }
+        );
+    }
+
+    #[test]
+    fn cumulative_message_and_reasoning_updates_emit_only_unseen_suffixes() {
+        let (events, _) = parse(&[
+            r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hel"}}"#,
+            r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hello"}}"#,
+            r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"Hello"}}"#,
+            r#"{"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"check"}}"#,
+            r#"{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"checking"}}"#,
+        ]);
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let thinking = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEventKind::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Hello");
+        assert_eq!(thinking, "checking");
+    }
+
+    #[test]
+    fn item_updates_do_not_duplicate_tool_start_or_complete_events() {
+        let (events, _) = parse(&[
+            r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test"}}"#,
+            r#"{"type":"item.updated","item":{"id":"c1","type":"command_execution","command":"cargo test","aggregated_output":"running"}}"#,
+            r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test","exit_code":0,"aggregated_output":"ok"}}"#,
+        ]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEventKind::ToolStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEventKind::ToolCompleted { .. }))
+                .count(),
+            1
         );
     }
 

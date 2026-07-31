@@ -625,11 +625,19 @@ impl App {
     pub fn apply_event(&mut self, kind: RunEventKind) {
         match kind {
             RunEventKind::TextDelta { text } => {
+                if self.activity != Activity::Responding {
+                    self.streaming.clear();
+                }
+                self.thinking_streaming.clear();
                 self.activity = Activity::Responding;
                 self.streaming.push_str(&text);
                 self.rewrite_streaming_line();
             }
             RunEventKind::ThinkingDelta { text } => {
+                if self.activity != Activity::Thinking {
+                    self.thinking_streaming.clear();
+                }
+                self.streaming.clear();
                 self.activity = Activity::Thinking;
                 self.thinking_streaming.push_str(&text);
                 self.rewrite_thinking_line();
@@ -644,8 +652,9 @@ impl App {
                     .map(|s| format!(" — {s}"))
                     .unwrap_or_default();
                 self.push(LineKind::Activity, format!("↳ calling {name}{detail}"));
-                // Text after a tool call belongs to a new paragraph.
+                // Output after a tool call belongs to a new block.
                 self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::ToolCompleted { id, output, ok } => {
                 let name = self
@@ -661,10 +670,12 @@ impl App {
                     .unwrap_or_default();
                 self.push(LineKind::Activity, format!("{mark} {name}{detail}"));
                 self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::FileWritten { path } => {
                 self.push(LineKind::Activity, format!("✎ wrote {path}"));
                 self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::ChildSpawned {
                 child_run_id,
@@ -680,6 +691,8 @@ impl App {
                         compact_activity(&task)
                     ),
                 );
+                self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::ChildCompleted {
                 child_run_id,
@@ -689,6 +702,8 @@ impl App {
                     LineKind::Activity,
                     format!("✓ subagent {child_run_id} — {status:?}"),
                 );
+                self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::PlanUpdated { steps } => {
                 self.push(LineKind::Activity, "· plan updated");
@@ -696,12 +711,15 @@ impl App {
                     self.push(LineKind::Activity, format!("  {step}"));
                 }
                 self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::SessionReseeded { reason } => {
                 self.push(
                     LineKind::Notice,
                     format!("· {reason}; retrying with full context"),
                 );
+                self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::Diagnostic { code, detail } => {
                 // Most diagnostics are noise for a chat view; surface only the ones
@@ -709,8 +727,13 @@ impl App {
                 if code == "PERMISSION_AUTO_APPROVED"
                     || code == "RUN_INTERRUPTED"
                     || code == "TRANSIENT_RETRY"
+                    || code == "ACP_METHOD_UNSUPPORTED"
+                    || code == "ACP_UPDATE"
+                    || code == "THINKING_UNAVAILABLE"
                 {
                     self.push(LineKind::Notice, format!("· {detail}"));
+                    self.streaming.clear();
+                    self.thinking_streaming.clear();
                 }
             }
             RunEventKind::Error {
@@ -718,6 +741,8 @@ impl App {
             } => {
                 self.active_error_retryable |= retryable;
                 self.push(LineKind::Error, format!("! {message}"));
+                self.streaming.clear();
+                self.thinking_streaming.clear();
             }
             RunEventKind::RunFinished { status, usage } => {
                 let can_retry = status == RunStatus::Failed && self.active_error_retryable;
@@ -1066,7 +1091,10 @@ impl App {
             }
             None => {
                 lines.push("No exact token counts were reported for that turn.".into());
-                lines.push("Plain-output adapters such as Grok cannot expose token usage.".into());
+                lines.push(
+                    "Plain-output adapters such as Command Code and Grok cannot expose token usage."
+                        .into(),
+                );
             }
         }
         lines.push(String::new());
@@ -1508,6 +1536,65 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_thinking_tools_and_responses_keep_stream_order_without_duplication() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "antigravity", None, false);
+        for event in [
+            RunEventKind::ThinkingDelta {
+                text: "first thought".into(),
+            },
+            RunEventKind::TextDelta {
+                text: "first answer".into(),
+            },
+            RunEventKind::ThinkingDelta {
+                text: "second thought".into(),
+            },
+            RunEventKind::ToolStarted {
+                id: "t1".into(),
+                name: "search".into(),
+                input: None,
+            },
+            RunEventKind::ToolCompleted {
+                id: "t1".into(),
+                output: Some("found".into()),
+                ok: true,
+            },
+            RunEventKind::ThinkingDelta {
+                text: "third thought".into(),
+            },
+            RunEventKind::TextDelta {
+                text: "final answer".into(),
+            },
+        ] {
+            app.apply_event(event);
+        }
+
+        let flow = app
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line.kind,
+                    LineKind::Thinking | LineKind::Assistant | LineKind::Activity
+                )
+            })
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flow,
+            vec![
+                "first thought",
+                "first answer",
+                "second thought",
+                "↳ calling search",
+                "✓ search — found",
+                "third thought",
+                "final answer",
+            ]
+        );
+    }
+
+    #[test]
     fn tool_start_completion_and_file_write_are_all_visible() {
         let mut app = new_app();
         app.begin_run(RunId::new("r1"), "claude", None, false);
@@ -1722,19 +1809,26 @@ mod tests {
     }
 
     #[test]
-    fn noisy_diagnostics_are_filtered_out_of_the_chat_view() {
+    fn noisy_diagnostics_are_filtered_but_agent_updates_remain_visible() {
         let mut app = new_app();
         app.apply_event(RunEventKind::Diagnostic {
-            code: "ACP_UPDATE".into(),
-            detail: "internal".into(),
+            code: "UNPARSEABLE_LINE".into(),
+            detail: "terminal banner noise".into(),
         });
         assert!(app.lines.is_empty());
+
+        app.apply_event(RunEventKind::Diagnostic {
+            code: "ACP_UPDATE".into(),
+            detail: "agent_progress_message: still checking".into(),
+        });
+        assert_eq!(app.lines.len(), 1);
+        assert!(app.lines[0].text.contains("still checking"));
 
         app.apply_event(RunEventKind::Diagnostic {
             code: "PERMISSION_AUTO_APPROVED".into(),
             detail: "auto-approved a write".into(),
         });
-        assert_eq!(app.lines.len(), 1);
+        assert_eq!(app.lines.len(), 2);
     }
 
     #[test]

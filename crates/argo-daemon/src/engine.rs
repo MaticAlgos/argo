@@ -325,6 +325,13 @@ pub async fn run_turn(
         model: request.model.clone(),
         resumed: plan.skip_transcript(),
     });
+    if thinking_stream_unavailable(def.id, request.reasoning.as_deref(), &request.help_flags) {
+        sink.emit(RunEventKind::Diagnostic {
+            code: "THINKING_UNAVAILABLE".into(),
+            detail: "this Claude build does not advertise partial-message streaming; Argo can show only reasoning the CLI emits"
+                .into(),
+        });
+    }
 
     // 5. Execute, with one transparent reseed if the handle turns out dead.
     let mut attempt_plan = plan.clone();
@@ -534,6 +541,18 @@ pub async fn run_turn(
 /// reliable without depending on the stream disclosing an id.
 fn uuid_v4() -> String {
     argo_core::ids::SessionId::generate().to_string()
+}
+
+fn thinking_stream_unavailable(
+    agent_id: &str,
+    reasoning: Option<&str>,
+    help_flags: &[String],
+) -> bool {
+    agent_id == "claude"
+        && reasoning.is_some()
+        && !help_flags
+            .iter()
+            .any(|flag| flag == "--include-partial-messages")
 }
 
 fn should_retry_transient(
@@ -979,6 +998,18 @@ mod tests {
         // Nothing was silently lost: the summary states what it stands in for.
         assert!(summary.contains("full history is retained"));
         assert!(package.recent_messages.len() < 80);
+    }
+
+    #[test]
+    fn missing_partial_message_support_is_reported_only_for_claude_reasoning() {
+        assert!(thinking_stream_unavailable("claude", Some("high"), &[]));
+        assert!(!thinking_stream_unavailable(
+            "claude",
+            Some("high"),
+            &["--include-partial-messages".into()]
+        ));
+        assert!(!thinking_stream_unavailable("codex", Some("high"), &[]));
+        assert!(!thinking_stream_unavailable("claude", None, &[]));
     }
 
     #[test]
