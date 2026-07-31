@@ -29,7 +29,7 @@ use argo_core::session::{
 use argo_core::{sha256_hex, ArgoPaths};
 use argo_runtime::{
     exec::{execute, CancelToken, ExecRequest},
-    InvocationContext, StagedPrompt, StreamSink,
+    InvocationContext, StagedPrompt, StreamSink, TerminalOutcome,
 };
 use argo_store::{NewMessage, NewRun, Store};
 use std::sync::{Arc, Mutex};
@@ -329,6 +329,7 @@ pub async fn run_turn(
     // 5. Execute, with one transparent reseed if the handle turns out dead.
     let mut attempt_plan = plan.clone();
     let mut reseeded = false;
+    let mut transient_retried = false;
     // Retained so a successful fresh turn can store the id it was told to use.
     let mut minted_session;
     let outcome = loop {
@@ -401,6 +402,25 @@ pub async fn run_turn(
                     reseeded = true;
                     continue;
                 }
+
+                let has_output = !sink.blocks().is_empty();
+                // Retry once only before the CLI emitted meaningful output. A
+                // retry after tools or prose could duplicate side effects; that
+                // case remains visible and available for explicit user retry.
+                if should_retry_transient(&exec.outcome, transient_retried, has_output) {
+                    let detail = exec
+                        .outcome
+                        .message
+                        .as_deref()
+                        .unwrap_or("transient network failure");
+                    sink.emit(RunEventKind::Diagnostic {
+                        code: "TRANSIENT_RETRY".into(),
+                        detail: format!("{detail}; retrying once"),
+                    });
+                    transient_retried = true;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
                 break exec;
             }
             Err(error) => {
@@ -440,6 +460,9 @@ pub async fn run_turn(
     // 6. Finalize canonical state before publishing the terminal event. Queued
     // clients treat RunFinished as a commit barrier and may send the next turn
     // immediately.
+    if let Some(error) = terminal_failure_event(&outcome.outcome) {
+        sink.emit(error);
+    }
     finalize(store, &sink, &assistant_id)?;
 
     let error_detail = outcome
@@ -511,6 +534,35 @@ pub async fn run_turn(
 /// reliable without depending on the stream disclosing an id.
 fn uuid_v4() -> String {
     argo_core::ids::SessionId::generate().to_string()
+}
+
+fn should_retry_transient(
+    outcome: &TerminalOutcome,
+    already_retried: bool,
+    has_output: bool,
+) -> bool {
+    outcome.status == RunStatus::Failed
+        && !already_retried
+        && !has_output
+        && outcome
+            .message
+            .as_deref()
+            .is_some_and(argo_runtime::stream::is_retryable_failure)
+}
+
+fn terminal_failure_event(outcome: &TerminalOutcome) -> Option<RunEventKind> {
+    if outcome.status != RunStatus::Failed {
+        return None;
+    }
+    let message = outcome
+        .message
+        .clone()
+        .unwrap_or_else(|| "the agent ended the turn without a response".into());
+    Some(RunEventKind::Error {
+        code: "AGENT_ERROR".into(),
+        retryable: argo_runtime::stream::is_retryable_failure(&message),
+        message,
+    })
 }
 
 /// Writes the accumulated assistant content into its pinned message.
@@ -927,6 +979,34 @@ mod tests {
         // Nothing was silently lost: the summary states what it stands in for.
         assert!(summary.contains("full history is retained"));
         assert!(package.recent_messages.len() < 80);
+    }
+
+    #[test]
+    fn failed_cli_outcomes_become_visible_retryable_error_events() {
+        let network = TerminalOutcome::failed(
+            "dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host",
+        );
+        assert!(should_retry_transient(&network, false, false));
+        assert!(!should_retry_transient(&network, true, false));
+        assert!(!should_retry_transient(&network, false, true));
+        assert!(matches!(
+            terminal_failure_event(&network),
+            Some(RunEventKind::Error {
+                code,
+                retryable: true,
+                message,
+            }) if code == "AGENT_ERROR" && message.contains("no such host")
+        ));
+
+        let invalid = TerminalOutcome::failed("invalid model name");
+        assert!(matches!(
+            terminal_failure_event(&invalid),
+            Some(RunEventKind::Error {
+                retryable: false,
+                ..
+            })
+        ));
+        assert!(terminal_failure_event(&TerminalOutcome::succeeded()).is_none());
     }
 
     #[tokio::test]

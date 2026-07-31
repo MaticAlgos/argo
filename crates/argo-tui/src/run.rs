@@ -288,11 +288,12 @@ async fn handle_key(
                     ));
                 }
             } else {
-                let dropped = app.clear_queue();
+                let retry_dropped = usize::from(app.clear_retry_prompt());
+                let dropped = app.clear_queue() + retry_dropped;
                 if dropped > 0 {
                     app.push(
                         LineKind::Notice,
-                        format!("discarded {dropped} queued message(s)"),
+                        format!("discarded {dropped} paused/queued message(s)"),
                     );
                 }
             }
@@ -319,8 +320,12 @@ async fn handle_key(
                 if line.trim().is_empty() {
                     // Failed turns pause the queue. Enter on an empty composer
                     // explicitly retries; cancellations advance automatically.
-                    if !app.is_busy() && app.queue_depth() > 0 {
-                        try_start_next_queued(connection, app, paths, event_tx).await?;
+                    if !app.is_busy() {
+                        if app.retry_prompt().is_some() {
+                            try_retry_prompt(connection, app, paths, event_tx).await?;
+                        } else if app.queue_depth() > 0 {
+                            try_start_next_queued(connection, app, paths, event_tx).await?;
+                        }
                     }
                     return Ok(());
                 }
@@ -402,8 +407,15 @@ async fn submit(
         return Ok(());
     }
 
-    // A queue retained after an error has priority over newly typed text. Append
-    // the new text and restart the oldest item, preserving FIFO ordering.
+    // A retryable failed prompt has priority over newly typed text. Preserve the
+    // new text behind it and retry the failed turn first, keeping FIFO semantics.
+    if app.retry_prompt().is_some() {
+        app.enqueue(line);
+        return try_retry_prompt(connection, app, paths, event_tx).await;
+    }
+
+    // A queue retained after a non-retryable error has priority over newly typed
+    // text. Append the new text and restart the oldest item.
     if app.queue_depth() > 0 {
         app.enqueue(line);
         return try_start_next_queued(connection, app, paths, event_tx).await;
@@ -465,6 +477,7 @@ async fn send_message(
                 summary.updated_at = argo_core::now_millis();
                 app.set_conversation_summary(summary);
             }
+            app.track_active_prompt(line.clone());
             app.push(LineKind::User, line);
             app.begin_run_with_reason(
                 run_id.clone(),
@@ -487,6 +500,35 @@ async fn send_message(
             Ok(false)
         }
     }
+}
+
+/// Retries the failed active prompt with the same two-phase acknowledgement used
+/// by the FIFO queue. The prompt is removed only after `RunStarted`.
+async fn try_retry_prompt(
+    connection: &mut Connection,
+    app: &mut App,
+    paths: &ArgoPaths,
+    event_tx: &mpsc::UnboundedSender<RunEvent>,
+) -> Result<()> {
+    if app.is_busy() {
+        return Ok(());
+    }
+    let Some(prompt) = app.retry_prompt().map(str::to_string) else {
+        return Ok(());
+    };
+
+    match send_message(connection, app, paths, prompt, event_tx).await {
+        Ok(true) => {
+            let _ = app.commit_retry_prompt();
+            app.set_status("retry started");
+        }
+        Ok(false) => app.set_status("retry rejected · Enter retries · Esc discards"),
+        Err(error) => {
+            app.set_status("daemon error · Enter retries · Esc discards");
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Starts the oldest queued message using a two-phase peek/commit protocol.

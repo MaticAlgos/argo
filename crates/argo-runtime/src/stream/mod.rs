@@ -73,6 +73,38 @@ impl TerminalOutcome {
     }
 }
 
+/// True when a CLI-reported failure is likely transient and safe to retry.
+///
+/// Coding CLIs frequently encode transport failures as an ordinary failed result
+/// rather than a process error. Keep this deliberately conservative: auth
+/// rejection, invalid requests, and model errors require user action, while DNS,
+/// connection, timeout, rate-limit, and service-unavailable failures may recover.
+pub fn is_retryable_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "no such host",
+        "temporary failure",
+        "network is unreachable",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "broken pipe",
+        "econnreset",
+        "eai_again",
+        "dns",
+        "rate limit",
+        "too many requests",
+        "status 429",
+        "service unavailable",
+        "status 502",
+        "status 503",
+        "status 504",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
 /// Truncates `text` to `max` bytes, respecting char boundaries.
 ///
 /// Tool output and error text from a CLI is unbounded in principle, so every
@@ -108,6 +140,17 @@ mod tests {
         let failed = TerminalOutcome::failed("boom");
         assert_eq!(failed.status, RunStatus::Failed);
         assert_eq!(failed.message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn retryability_is_limited_to_transient_transport_failures() {
+        assert!(is_retryable_failure(
+            "dial tcp: lookup api.example.com: no such host"
+        ));
+        assert!(is_retryable_failure("authentication request timed out"));
+        assert!(is_retryable_failure("HTTP status 503 service unavailable"));
+        assert!(!is_retryable_failure("invalid API key"));
+        assert!(!is_retryable_failure("model does not exist"));
     }
 
     #[test]

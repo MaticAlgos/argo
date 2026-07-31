@@ -157,6 +157,13 @@ pub struct App {
     /// Dropping them was the alternative, and it lost work: a follow-up thought
     /// typed mid-turn is exactly the thing a user does not want to retype.
     pub queued: std::collections::VecDeque<String>,
+    /// Prompt owned by the active run, retained only long enough to offer an
+    /// explicit retry after a transient failure.
+    active_prompt: Option<String>,
+    /// Failed retryable prompt waiting ahead of queued follow-ups.
+    retry_prompt: Option<String>,
+    /// Whether the active run emitted a retryable terminal error.
+    active_error_retryable: bool,
     /// Animation frame, advanced on a timer while a turn runs.
     pub tick: usize,
     /// What the agent is currently doing, for the activity indicator.
@@ -246,9 +253,33 @@ impl App {
             context_tokens: 0,
             version: env!("CARGO_PKG_VERSION").to_string(),
             queued: std::collections::VecDeque::new(),
+            active_prompt: None,
+            retry_prompt: None,
+            active_error_retryable: false,
             tick: 0,
             activity: Activity::Idle,
         }
+    }
+
+    /// Associates the accepted user prompt with the active run.
+    pub fn track_active_prompt(&mut self, prompt: String) {
+        self.active_prompt = Some(prompt);
+        self.active_error_retryable = false;
+    }
+
+    /// Retryable failed prompt, which has priority over queued follow-ups.
+    pub fn retry_prompt(&self) -> Option<&str> {
+        self.retry_prompt.as_deref()
+    }
+
+    /// Commits a retry only after the daemon acknowledges `RunStarted`.
+    pub fn commit_retry_prompt(&mut self) -> Option<String> {
+        self.retry_prompt.take()
+    }
+
+    /// Discards a paused failed prompt.
+    pub fn clear_retry_prompt(&mut self) -> bool {
+        self.retry_prompt.take().is_some()
     }
 
     /// Queues a message to send when the current turn finishes.
@@ -671,14 +702,27 @@ impl App {
             RunEventKind::Diagnostic { code, detail } => {
                 // Most diagnostics are noise for a chat view; surface only the ones
                 // that explain something the user can act on.
-                if code == "PERMISSION_AUTO_APPROVED" || code == "RUN_INTERRUPTED" {
+                if code == "PERMISSION_AUTO_APPROVED"
+                    || code == "RUN_INTERRUPTED"
+                    || code == "TRANSIENT_RETRY"
+                {
                     self.push(LineKind::Notice, format!("· {detail}"));
                 }
             }
-            RunEventKind::Error { message, .. } => {
+            RunEventKind::Error {
+                message, retryable, ..
+            } => {
+                self.active_error_retryable |= retryable;
                 self.push(LineKind::Error, format!("! {message}"));
             }
             RunEventKind::RunFinished { status, usage } => {
+                let can_retry = status == RunStatus::Failed && self.active_error_retryable;
+                if can_retry {
+                    self.retry_prompt = self.active_prompt.take();
+                } else {
+                    self.active_prompt = None;
+                }
+                self.active_error_retryable = false;
                 self.active_run = None;
                 self.activity = Activity::Idle;
                 self.streaming.clear();
@@ -691,6 +735,9 @@ impl App {
                 let mut note = match status {
                     RunStatus::Succeeded => "done".to_string(),
                     RunStatus::Cancelled => "cancelled".to_string(),
+                    RunStatus::Failed if can_retry => {
+                        "retryable failure · Enter retries · Esc discards".to_string()
+                    }
                     _ => "the turn did not complete".to_string(),
                 };
                 if let (Some(input), Some(output)) = (usage.input, usage.output) {
@@ -2134,6 +2181,52 @@ mod tests {
         let label = app.context_label();
         assert!(label.contains("ctx ~100"));
         assert!(!label.contains('%'));
+    }
+
+    #[test]
+    fn retryable_failure_preserves_partial_response_and_prompt() {
+        let mut app = new_app();
+        app.track_active_prompt("continue the analysis".into());
+        app.begin_run(RunId::new("r1"), "antigravity", None, true);
+        app.apply_event(RunEventKind::TextDelta {
+            text: "Partial answer before disconnect.".into(),
+        });
+        app.apply_event(RunEventKind::Error {
+            code: "AGENT_ERROR".into(),
+            message: "network connection reset".into(),
+            retryable: true,
+        });
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Failed,
+            usage: TokenUsage::default(),
+        });
+
+        assert_eq!(app.retry_prompt(), Some("continue the analysis"));
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Assistant
+                && line.text.contains("Partial answer before disconnect")
+        }));
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Error && line.text.contains("connection reset")
+        }));
+        assert!(app.status.contains("Enter retries"), "{}", app.status);
+    }
+
+    #[test]
+    fn non_retryable_failure_does_not_offer_the_prompt_again() {
+        let mut app = new_app();
+        app.track_active_prompt("use an invalid model".into());
+        app.begin_run(RunId::new("r1"), "codex", None, false);
+        app.apply_event(RunEventKind::Error {
+            code: "AGENT_ERROR".into(),
+            message: "invalid model".into(),
+            retryable: false,
+        });
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Failed,
+            usage: TokenUsage::default(),
+        });
+        assert_eq!(app.retry_prompt(), None);
     }
 
     #[test]
