@@ -29,6 +29,11 @@ fn build_args(ctx: &InvocationContext) -> Vec<String> {
     if ctx.supports_flag("--include-partial-messages") {
         args.push("--include-partial-messages".into());
     }
+    // Newer Claude builds can forward nested-agent frames into the same JSONL
+    // stream. The parser keeps their terminal result from ending the parent run.
+    if ctx.supports_flag("--forward-subagent-text") {
+        args.push("--forward-subagent-text".into());
+    }
 
     if let Some(model) = ctx.concrete_model() {
         args.push("--model".into());
@@ -323,6 +328,18 @@ mod tests {
             ..ctx()
         });
         assert!(with.windows(2).any(|w| w == ["--add-dir", "/skills"]));
+    }
+
+    #[test]
+    fn native_subagent_forwarding_is_gated_on_the_installed_build() {
+        let without = CLAUDE.args_for(&ctx());
+        assert!(!without.contains(&"--forward-subagent-text".to_string()));
+
+        let with = CLAUDE.args_for(&InvocationContext {
+            help_flags: vec!["--forward-subagent-text".into()],
+            ..ctx()
+        });
+        assert!(with.contains(&"--forward-subagent-text".to_string()));
     }
 
     #[test]

@@ -158,15 +158,15 @@ mod tests {
     }
 
     #[test]
-    fn delegation_hosts_are_the_mcp_capable_adapters() {
-        let hosts: Vec<&str> = ADAPTERS
+    fn delegation_hosts_distinguish_mcp_from_the_universal_command_fallback() {
+        let mcp_hosts: Vec<&str> = ADAPTERS
             .iter()
-            .filter(|d| d.capabilities.can_delegate())
+            .filter(|d| d.capabilities.delegates_via_mcp())
             .map(|d| d.id)
             .collect();
-        // Antigravity receives the user's MCP servers, but only through a shared
-        // global config, which cannot carry a per-conversation parent id — so it is
-        // a delegation target, not a host. Grok has no MCP path at all.
-        assert_eq!(hosts, vec!["claude", "codex", "kiro"]);
+        assert_eq!(mcp_hosts, vec!["claude", "codex", "kiro"]);
+        assert!(ADAPTERS
+            .iter()
+            .all(|definition| definition.capabilities.can_delegate()));
     }
 }

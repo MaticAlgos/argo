@@ -58,7 +58,11 @@ fn lock(store: &SharedStore) -> Result<std::sync::MutexGuard<'_, Store>> {
 pub const STABLE_INSTRUCTIONS: &str = "\
 You are working inside Argo, which orchestrates multiple coding-agent CLIs over one shared conversation. \
 The transcript below may include turns produced by a different agent or model; treat it as authoritative \
-history of this conversation. Continue the work rather than restarting it, and do not re-answer earlier turns.";
+history of this conversation. Continue the work rather than restarting it, and do not re-answer earlier turns. \
+Only describe reasoning, tools, or child activity that Argo or the underlying CLI actually emits.";
+
+/// Per-turn fallback available even when the upstream session is resumed.
+const DELEGATION_DIRECTIVE: &str = "Argo delegation is available for exploratory work or a second opinion: run \"$ARGO_BIN\" delegate <agent> <self-contained task>, wait for its report, and incorporate the result.";
 
 /// How many recent messages are considered before budgeting trims further.
 const MAX_RECENT_MESSAGES: usize = 200;
@@ -67,6 +71,10 @@ const MAX_RECENT_MESSAGES: usize = 200;
 pub struct TurnRequest {
     /// Conversation receiving the turn.
     pub conversation_id: ConversationId,
+    /// Host run that spawned this turn, for Argo-managed delegation.
+    pub parent_run_id: Option<RunId>,
+    /// Whether this turn is below the bounded delegation depth.
+    pub delegation_allowed: bool,
     /// The user's message.
     pub prompt: String,
     /// Resolved agent.
@@ -294,7 +302,7 @@ pub async fn run_turn(
         model: request.model.clone(),
         resumed: plan.skip_transcript(),
         invalidation_reason: plan.invalidation,
-        parent_run_id: None,
+        parent_run_id: request.parent_run_id.clone(),
     })?;
     lock(store)?.append_message_with_id(
         &request.conversation_id,
@@ -380,7 +388,19 @@ pub async fn run_turn(
                 bin: request.bin.clone(),
                 prompt: body,
                 context,
-                env: vec![],
+                env: vec![
+                    (
+                        crate::mcp::CONVERSATION_ENV.to_string(),
+                        request.conversation_id.to_string(),
+                    ),
+                    (crate::mcp::RUN_ENV.to_string(), run_id.to_string()),
+                    (
+                        crate::mcp::BINARY_ENV.to_string(),
+                        std::env::current_exe()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "argo".to_string()),
+                    ),
+                ],
                 mcp_servers: request.mcp_descriptors.clone(),
                 timeout_ms: request.timeout_ms,
             },
@@ -614,12 +634,20 @@ pub fn compose_body(
         compose_turn(plan, &package, &request.prompt)
     };
 
-    // The mode directive leads the turn: a restriction stated after several
-    // thousand tokens of context is easy for a model to lose track of.
-    Ok(match request.mode.directive() {
-        Some(directive) => format!("{directive}\n\n{body}"),
-        None => body,
-    })
+    // Per-turn directives lead the turn: restrictions and delegation availability
+    // must also reach resumed native sessions that skip canonical context.
+    let mut directives = Vec::new();
+    if let Some(mode) = request.mode.directive() {
+        directives.push(mode);
+    }
+    if request.delegation_allowed {
+        directives.push(DELEGATION_DIRECTIVE);
+    }
+    if directives.is_empty() {
+        Ok(body)
+    } else {
+        Ok(format!("{}\n\n{body}", directives.join("\n\n")))
+    }
 }
 
 /// Assembles the remaining context for a fresh session.
@@ -726,6 +754,8 @@ mod tests {
     fn request(conv: &ConversationId, agent: &str, prompt: &str) -> TurnRequest {
         TurnRequest {
             conversation_id: conv.clone(),
+            parent_run_id: None,
+            delegation_allowed: true,
             prompt: prompt.into(),
             agent_id: AgentId::new(agent),
             model: Some("m1".into()),
@@ -846,7 +876,9 @@ mod tests {
             "/repo",
         )
         .expect("body");
-        assert_eq!(body, "next thing");
+        assert!(body.starts_with(DELEGATION_DIRECTIVE));
+        assert!(body.ends_with("next thing"));
+        assert!(!body.contains(argo_context::TRANSCRIPT_HEADING));
     }
 
     #[test]

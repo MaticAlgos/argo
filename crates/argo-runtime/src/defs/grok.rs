@@ -231,7 +231,8 @@ mod tests {
         // No MCP injection path, so Grok cannot host Argo's delegation tools and
         // therefore cannot spawn children — it can only be a delegation target.
         const {
-            assert!(!GROK.capabilities.can_delegate());
+            assert!(GROK.capabilities.can_delegate());
+            assert!(!GROK.capabilities.delegates_via_mcp());
         }
         // Plain output means no per-tool granularity.
         const {

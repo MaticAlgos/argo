@@ -129,17 +129,34 @@ MCP delivery by adapter:
 
 ### Cross-runtime delegation
 
-Supported host agents receive two Argo tools:
+Every Argo-managed host turn can delegate exploratory work to any installed target
+CLI. Claude, Codex, and Kiro receive native `argo_delegate` MCP tools through safe
+per-run configuration. OpenCode, Antigravity, Command Code, Grok, and future
+adapters also receive a daemon-backed command fallback:
 
-- `argo_list_agents` lists available delegation targets.
-- `argo_delegate` runs a task through another coding CLI and returns its result as
-  a tool response.
+```text
+"$ARGO_BIN" delegate <agent> <self-contained task>
+```
 
-Delegated work runs in a child conversation with parent/child lineage, bounded
-nesting depth, its own native session, and the user's MCP servers. `/children`
-shows spawned conversations. The delegation MCP server is injected only where
-per-conversation environment can be represented safely; Argo does not place it
-in shared global config where concurrent conversations could race.
+The fallback carries parent conversation/run identity in the turn environment, so
+it does not rely on unsafe shared global MCP state. It requires the host CLI to
+execute its shell tool; plain-output hosts cannot expose that host tool invocation,
+but the delegated child's own Argo stream remains visible.
+
+Each delegated task runs in a child conversation with real parent/child run
+lineage, bounded nesting depth, its own native session, and the user's MCP servers.
+The parent transcript records durable spawn/completion events, while the TUI
+subscribes to the child run and shows its emitted reasoning, messages, tools,
+files, plans, errors, and completion with child-agent attribution. A child
+`RunFinished` is only the child's commit barrier and never finishes the parent or
+advances the parent's FIFO queue. `/children` lists spawned conversations and
+`/open <id>` opens the complete historical child transcript.
+
+Native CLI subagents are separate from Argo delegation. Claude nested frames are
+attributed when the installed build emits them with `--forward-subagent-text`.
+Kiro's current vendor extension has no verified child-event schema, and the other
+supported streams expose no stable native-child identity, so Argo reports those
+limits instead of inventing lifecycle or hidden reasoning.
 
 ### Execution modes and process safety
 
@@ -314,6 +331,7 @@ argo send --conversation-id <id> --agent codex --model <model> "optimize it"
 argo select <id> --agent claude --model <model> --reasoning high
 argo mode <id> plan
 argo context <id> "the next question"
+argo delegate codex "inspect this failure and report likely causes"
 
 argo skills --root /path/to/project
 argo mcp list

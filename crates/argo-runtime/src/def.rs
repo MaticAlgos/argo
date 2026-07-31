@@ -254,13 +254,29 @@ pub fn capability_diagnostics(def: &RuntimeDef) -> Vec<String> {
     }
     if !def.capabilities.stream_format.has_structured_tool_events() {
         out.push(
-            "this CLI emits plain text, so per-tool events are unavailable and file changes are reconciled after the run"
+            "this CLI emits plain text, so per-tool events and a separate reasoning channel are unavailable; Argo never invents hidden reasoning"
                 .to_string(),
         );
     }
-    if !def.capabilities.can_delegate() {
+    if def.id == "claude" {
         out.push(
-            "this CLI cannot host Argo's delegation tools, so it can be a subagent target but cannot spawn subagents"
+            "native Claude child frames are attributed when the installed build emits them with --forward-subagent-text"
+                .to_string(),
+        );
+    } else if def.id == "kiro" {
+        out.push(
+            "Kiro's emitted reasoning is visible, but its undocumented native subagent extension is not implemented; use Argo delegation for inspectable children"
+                .to_string(),
+        );
+    } else {
+        out.push(
+            "this CLI stream exposes no stable native-subagent lifecycle; Argo-managed delegated children remain fully linked and inspectable"
+                .to_string(),
+        );
+    }
+    if !def.capabilities.delegates_via_mcp() {
+        out.push(
+            "cross-CLI delegation uses Argo's per-turn command fallback because safe per-run MCP injection is unavailable"
                 .to_string(),
         );
     }

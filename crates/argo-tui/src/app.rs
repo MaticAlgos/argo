@@ -145,6 +145,12 @@ pub struct App {
     thinking_streaming: String,
     /// Tool ids to display names, retained until completion events arrive.
     active_tools: std::collections::HashMap<String, String>,
+    /// Adapter attribution for live delegated runs, keyed by durable child run id.
+    child_agents: std::collections::HashMap<RunId, String>,
+    /// Child tool ids retained independently so their lifecycle cannot disturb the parent.
+    child_tools: std::collections::HashMap<(RunId, String), String>,
+    /// Child streams already followed in this TUI session, preventing duplicate replay.
+    followed_children: std::collections::HashSet<RunId>,
     /// Live command suggestions for the current composer contents.
     pub completions: Vec<&'static str>,
     /// Highlighted suggestion, so the list is navigable rather than fixed.
@@ -264,6 +270,9 @@ impl App {
             streaming: String::new(),
             thinking_streaming: String::new(),
             active_tools: std::collections::HashMap::new(),
+            child_agents: std::collections::HashMap::new(),
+            child_tools: std::collections::HashMap::new(),
+            followed_children: std::collections::HashSet::new(),
             completions: Vec::new(),
             completion_index: 0,
             completion_touched: false,
@@ -721,7 +730,10 @@ impl App {
                 child_run_id,
                 child_agent_id,
                 task,
+                ..
             } => {
+                self.child_agents
+                    .insert(child_run_id.clone(), child_agent_id.to_string());
                 self.activity = Activity::Working;
                 self.activity_detail = Some(format!("subagent {child_agent_id}"));
                 self.push(
@@ -733,6 +745,14 @@ impl App {
                         compact_activity(&task)
                     ),
                 );
+                self.streaming.clear();
+                self.thinking_streaming.clear();
+            }
+            RunEventKind::ChildEvent {
+                child_run_id,
+                event,
+            } => {
+                self.apply_child_event(child_run_id, *event);
                 self.streaming.clear();
                 self.thinking_streaming.clear();
             }
@@ -774,6 +794,7 @@ impl App {
                     || code == "ACP_METHOD_UNSUPPORTED"
                     || code == "ACP_UPDATE"
                     || code == "THINKING_UNAVAILABLE"
+                    || code == "NATIVE_SUBAGENT_UNAVAILABLE"
                 {
                     self.push(LineKind::Notice, format!("· {detail}"));
                     self.streaming.clear();
@@ -822,6 +843,166 @@ impl App {
                     note.push_str(&format!(" · {input} in / {output} out"));
                 }
                 self.set_status(note);
+            }
+            _ => {}
+        }
+    }
+
+    /// Registers one child stream for following, returning true only once.
+    pub fn follow_child(&mut self, run_id: RunId, agent_id: impl Into<String>) -> bool {
+        self.child_agents.insert(run_id.clone(), agent_id.into());
+        self.followed_children.insert(run_id)
+    }
+
+    /// Applies an event from a delegated child without mutating parent run state.
+    pub fn apply_child_event(&mut self, run_id: RunId, kind: RunEventKind) {
+        let known_agent = self
+            .child_agents
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_else(|| "subagent".to_string());
+
+        match kind {
+            RunEventKind::RunStarted {
+                agent_id,
+                model,
+                resumed,
+            } => {
+                let agent = agent_id.to_string();
+                self.child_agents.insert(run_id.clone(), agent.clone());
+                let model = model.unwrap_or_else(|| "default".to_string());
+                self.push(
+                    LineKind::AgentHeader,
+                    format!(
+                        "{agent} · {model} · subagent {}{}",
+                        run_id,
+                        if resumed { " · resumed" } else { "" }
+                    ),
+                );
+            }
+            RunEventKind::TextDelta { text } if !text.is_empty() => {
+                let prefix = format!("[{known_agent} subagent] ");
+                match self.lines.last_mut() {
+                    Some(line)
+                        if line.kind == LineKind::Assistant && line.text.starts_with(&prefix) =>
+                    {
+                        line.text.push_str(&text)
+                    }
+                    _ => self.push(LineKind::Assistant, format!("{prefix}{text}")),
+                }
+            }
+            RunEventKind::ThinkingDelta { text } if !text.is_empty() => {
+                let prefix = format!("[{known_agent} subagent] ");
+                match self.lines.last_mut() {
+                    Some(line)
+                        if line.kind == LineKind::Thinking && line.text.starts_with(&prefix) =>
+                    {
+                        line.text.push_str(&text)
+                    }
+                    _ => self.push(LineKind::Thinking, format!("{prefix}{text}")),
+                }
+            }
+            RunEventKind::ToolStarted { id, name, input } => {
+                self.child_tools.insert((run_id, id), name.clone());
+                let detail = input
+                    .as_deref()
+                    .map(compact_activity)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!(" — {value}"))
+                    .unwrap_or_default();
+                self.push(
+                    LineKind::Activity,
+                    format!("[{known_agent} subagent] ↳ calling {name}{detail}"),
+                );
+            }
+            RunEventKind::ToolCompleted { id, output, ok } => {
+                let name = self
+                    .child_tools
+                    .remove(&(run_id, id))
+                    .unwrap_or_else(|| "tool".to_string());
+                let mark = if ok { "✓" } else { "✗" };
+                let detail = output
+                    .as_deref()
+                    .map(compact_activity)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!(" — {value}"))
+                    .unwrap_or_default();
+                self.push(
+                    LineKind::Activity,
+                    format!("[{known_agent} subagent] {mark} {name}{detail}"),
+                );
+            }
+            RunEventKind::FileWritten { path } => self.push(
+                LineKind::Activity,
+                format!("[{known_agent} subagent] ✎ wrote {path}"),
+            ),
+            RunEventKind::PlanUpdated { steps } => {
+                self.push(
+                    LineKind::Activity,
+                    format!("[{known_agent} subagent] · plan updated"),
+                );
+                for step in steps {
+                    self.push(LineKind::Activity, format!("  {step}"));
+                }
+            }
+            RunEventKind::ChildSpawned {
+                child_run_id,
+                child_agent_id,
+                task,
+                ..
+            } => {
+                self.child_agents
+                    .insert(child_run_id.clone(), child_agent_id.to_string());
+                self.push(
+                    LineKind::Activity,
+                    format!(
+                        "[{known_agent} subagent] ↳ subagent {} ({}) — {}",
+                        child_agent_id,
+                        child_run_id,
+                        compact_activity(&task)
+                    ),
+                );
+            }
+            RunEventKind::ChildCompleted {
+                child_run_id,
+                status,
+            } => self.push(
+                LineKind::Activity,
+                format!("[{known_agent} subagent] ✓ subagent {child_run_id} — {status:?}"),
+            ),
+            RunEventKind::SessionReseeded { reason } => self.push(
+                LineKind::Notice,
+                format!("[{known_agent} subagent] · {reason}; retrying with full context"),
+            ),
+            RunEventKind::Diagnostic { code, detail }
+                if matches!(
+                    code.as_str(),
+                    "PERMISSION_AUTO_APPROVED"
+                        | "RUN_INTERRUPTED"
+                        | "TRANSIENT_RETRY"
+                        | "ACP_METHOD_UNSUPPORTED"
+                        | "ACP_UPDATE"
+                        | "THINKING_UNAVAILABLE"
+                        | "NATIVE_SUBAGENT_UNAVAILABLE"
+                ) =>
+            {
+                self.push(
+                    LineKind::Notice,
+                    format!("[{known_agent} subagent] · {detail}"),
+                );
+            }
+            RunEventKind::Error { message, .. } => self.push(
+                LineKind::Error,
+                format!("[{known_agent} subagent] ! {message}"),
+            ),
+            RunEventKind::RunFinished { status, usage } => {
+                let mut detail =
+                    format!("[{known_agent} subagent] · child commit barrier — {status:?}");
+                if let (Some(input), Some(output)) = (usage.input, usage.output) {
+                    detail.push_str(&format!(" · {input} in / {output} out"));
+                }
+                self.push(LineKind::Activity, detail);
+                self.child_tools.retain(|(child, _), _| child != &run_id);
             }
             _ => {}
         }
@@ -1275,6 +1456,73 @@ impl App {
                             }
                             ContentBlock::FileWrite { path } => {
                                 self.push(LineKind::Activity, format!("✎ wrote {path}"));
+                            }
+                            ContentBlock::ChildActivity {
+                                run_id,
+                                agent_id,
+                                task,
+                                status,
+                                blocks,
+                            } => {
+                                self.push(
+                                    LineKind::Activity,
+                                    format!(
+                                        "↳ subagent {agent_id} ({run_id}) — {}",
+                                        compact_activity(&task)
+                                    ),
+                                );
+                                for child_block in blocks {
+                                    match child_block {
+                                        ContentBlock::Text { text } if !text.trim().is_empty() => {
+                                            self.push(
+                                                LineKind::Assistant,
+                                                format!("[{agent_id} subagent] {text}"),
+                                            );
+                                        }
+                                        ContentBlock::Thinking { text }
+                                            if !text.trim().is_empty() =>
+                                        {
+                                            self.push(
+                                                LineKind::Thinking,
+                                                format!("[{agent_id} subagent] {text}"),
+                                            );
+                                        }
+                                        ContentBlock::Tool { call } => {
+                                            self.push(
+                                                LineKind::Activity,
+                                                format!(
+                                                    "[{agent_id} subagent] ↳ calling {}",
+                                                    call.name
+                                                ),
+                                            );
+                                            if call.status != ToolStatus::Pending {
+                                                self.push(
+                                                    LineKind::Activity,
+                                                    format!(
+                                                        "[{agent_id} subagent] {} {}",
+                                                        if call.status == ToolStatus::Completed {
+                                                            "✓"
+                                                        } else {
+                                                            "✗"
+                                                        },
+                                                        call.name
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        ContentBlock::FileWrite { path } => self.push(
+                                            LineKind::Activity,
+                                            format!("[{agent_id} subagent] ✎ wrote {path}"),
+                                        ),
+                                        _ => {}
+                                    }
+                                }
+                                if let Some(status) = status {
+                                    self.push(
+                                        LineKind::Activity,
+                                        format!("✓ subagent {run_id} — {status:?}"),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1863,6 +2111,89 @@ mod tests {
         let line = app.lines.last().expect("line");
         assert_eq!(line.kind, LineKind::Notice);
         assert!(line.text.contains("retrying with full context"));
+    }
+
+    #[test]
+    fn child_streams_are_attributed_without_finishing_the_parent() {
+        let mut app = new_app();
+        let parent = RunId::new("parent-run");
+        let child = RunId::new("child-run");
+        app.begin_run(parent.clone(), "claude", None, false);
+        app.enqueue("follow up".into());
+        app.last_usage = Some(argo_core::event::TokenUsage {
+            input: Some(7),
+            ..Default::default()
+        });
+        assert!(app.follow_child(child.clone(), "codex"));
+        assert!(!app.follow_child(child.clone(), "codex"));
+
+        app.apply_child_event(
+            child.clone(),
+            RunEventKind::RunStarted {
+                agent_id: argo_core::ids::AgentId::new("codex"),
+                model: Some("gpt-5.6-sol".into()),
+                resumed: false,
+            },
+        );
+        app.apply_child_event(
+            child.clone(),
+            RunEventKind::ThinkingDelta {
+                text: "checking".into(),
+            },
+        );
+        app.apply_child_event(
+            child.clone(),
+            RunEventKind::TextDelta {
+                text: "found it".into(),
+            },
+        );
+        app.apply_child_event(
+            child,
+            RunEventKind::RunFinished {
+                status: RunStatus::Succeeded,
+                usage: argo_core::event::TokenUsage {
+                    input: Some(100),
+                    output: Some(20),
+                    ..Default::default()
+                },
+            },
+        );
+
+        assert_eq!(app.active_run, Some(parent));
+        assert_eq!(app.queue_depth(), 1);
+        assert_eq!(app.last_usage.and_then(|usage| usage.input), Some(7));
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Thinking && line.text.contains("[codex subagent] checking")
+        }));
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Assistant && line.text.contains("[codex subagent] found it")
+        }));
+    }
+
+    #[test]
+    fn inline_native_child_events_never_merge_into_parent_prose() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("parent"), "claude", None, false);
+        let child = RunId::new("claude-native-t1");
+        app.apply_event(RunEventKind::ChildSpawned {
+            child_run_id: child.clone(),
+            child_agent_id: argo_core::ids::AgentId::new("claude/explore"),
+            task: "inspect the parser".into(),
+            native: true,
+        });
+        app.apply_event(RunEventKind::ChildEvent {
+            child_run_id: child,
+            event: Box::new(RunEventKind::TextDelta {
+                text: "native finding".into(),
+            }),
+        });
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Assistant
+                && line
+                    .text
+                    .contains("[claude/explore subagent] native finding")
+        }));
+        assert!(app.streaming.is_empty());
     }
 
     #[test]

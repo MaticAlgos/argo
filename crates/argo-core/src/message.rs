@@ -4,6 +4,7 @@
 //! what makes switching agents mid-conversation possible: a fresh session on a
 //! different CLI is seeded from these rows.
 
+use crate::event::RunStatus;
 use crate::ids::{AgentId, MessageId, RunId};
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +91,20 @@ pub enum ContentBlock {
         /// Workspace-relative path.
         path: String,
     },
+    /// An Argo-managed child run linked to this assistant turn.
+    ChildActivity {
+        /// Durable child run id; its full transcript lives in the child conversation.
+        run_id: RunId,
+        /// CLI adapter that handled the child.
+        agent_id: AgentId,
+        /// Self-contained task handed to the child.
+        task: String,
+        /// Terminal status once the child's commit barrier was observed.
+        status: Option<RunStatus>,
+        /// Ordered content explicitly emitted by a CLI-native child.
+        #[serde(default)]
+        blocks: Vec<ContentBlock>,
+    },
 }
 
 impl ContentBlock {
@@ -162,6 +177,20 @@ impl Message {
                 }
                 ContentBlock::FileWrite { path } => {
                     parts.push(format!("[wrote {path}]"));
+                }
+                ContentBlock::ChildActivity {
+                    run_id,
+                    agent_id,
+                    task,
+                    status,
+                    blocks: _,
+                } => {
+                    let state = status
+                        .map(|value| format!("{value:?}").to_ascii_lowercase())
+                        .unwrap_or_else(|| "running".to_string());
+                    parts.push(format!(
+                        "[subagent {agent_id} · run {run_id} · {state}]\n{task}"
+                    ));
                 }
             }
         }

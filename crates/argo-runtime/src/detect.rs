@@ -391,6 +391,8 @@ mod tests {
         // The user should learn why Grok behaves differently before they hit it.
         assert!(joined.contains("reseeded"));
         assert!(joined.contains("plain text"));
-        assert!(joined.contains("cannot spawn subagents"));
+        assert!(joined.contains("separate reasoning channel"));
+        assert!(joined.contains("no stable native-subagent lifecycle"));
+        assert!(joined.contains("command fallback"));
     }
 }

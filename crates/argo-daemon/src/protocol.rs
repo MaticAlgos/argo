@@ -115,6 +115,11 @@ pub enum Request {
     Delegate {
         /// Conversation whose agent is delegating.
         parent_conversation_id: ConversationId,
+        /// Exact host run, when delegation came from an active agent turn.
+        ///
+        /// User-initiated delegation outside a turn leaves this unset.
+        #[serde(default)]
+        parent_run_id: Option<RunId>,
         /// Adapter to run the child on.
         agent_id: AgentId,
         /// Model for the child, when specified.
@@ -443,6 +448,7 @@ mod tests {
     fn delegation_requests_round_trip() {
         let request = Request::Delegate {
             parent_conversation_id: ConversationId::new("parent"),
+            parent_run_id: Some(RunId::new("host-run")),
             agent_id: AgentId::new("codex"),
             model: Some("gpt-5.6-sol".into()),
             task: "review the diff".into(),

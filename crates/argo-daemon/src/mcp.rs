@@ -24,6 +24,12 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// is attached to the right parent.
 pub const CONVERSATION_ENV: &str = "ARGO_PARENT_CONVERSATION";
 
+/// Environment variable naming the exact host run for durable child lineage.
+pub const RUN_ENV: &str = "ARGO_PARENT_RUN";
+
+/// Environment variable containing the absolute Argo executable for command fallback.
+pub const BINARY_ENV: &str = "ARGO_BIN";
+
 /// Builds the tool catalogue advertised to the agent.
 ///
 /// Descriptions matter: they are the only thing telling the model when handing
@@ -191,10 +197,13 @@ async fn run_delegation(paths: &ArgoPaths, arguments: &Value) -> Result<Value> {
         ))
     })?;
 
+    let parent_run_id = std::env::var(RUN_ENV).ok().map(argo_core::ids::RunId::new);
+
     let mut client = DaemonClient::connect(paths).await?;
     match client
         .request(Request::Delegate {
             parent_conversation_id: ConversationId::new(parent),
+            parent_run_id,
             agent_id: AgentId::new(agent),
             model,
             task: task.to_string(),

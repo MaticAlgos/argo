@@ -162,6 +162,25 @@ enum Command {
         /// The message.
         message: String,
     },
+    /// Delegate exploratory work to another installed coding CLI.
+    ///
+    /// Inside an Argo-managed agent turn, parent ids are read from the environment.
+    Delegate {
+        /// Target adapter id, for example codex, claude, or kiro.
+        agent: String,
+        /// Optional model for the delegated CLI.
+        #[arg(long)]
+        model: Option<String>,
+        /// Explicit parent conversation; normally supplied by Argo's environment.
+        #[arg(long)]
+        parent_conversation_id: Option<String>,
+        /// Explicit host run; normally supplied by Argo's environment.
+        #[arg(long)]
+        parent_run_id: Option<String>,
+        /// Self-contained task; unquoted remaining words are joined with spaces.
+        #[arg(required = true, trailing_var_arg = true)]
+        task: Vec<String>,
+    },
     /// Show the exact context the next turn would send.
     Context {
         /// Conversation id.
@@ -264,6 +283,23 @@ async fn run(cli: Cli) -> Result<()> {
             model,
             message,
         } => client::send(&paths, conversation_id, root, agent, model, message).await,
+        Command::Delegate {
+            agent,
+            model,
+            parent_conversation_id,
+            parent_run_id,
+            task,
+        } => {
+            client::delegate(
+                &paths,
+                parent_conversation_id,
+                parent_run_id,
+                agent,
+                model,
+                task.join(" "),
+            )
+            .await
+        }
         Command::Context {
             conversation_id,
             prompt,
@@ -364,6 +400,38 @@ mod tests {
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(model.as_deref(), Some("gpt-5.6"));
                 assert_eq!(message, "fix the bug");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delegate_accepts_a_multiword_task_and_optional_lineage() {
+        let cli = Cli::try_parse_from([
+            "argo",
+            "delegate",
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--parent-conversation-id",
+            "conversation-1",
+            "inspect",
+            "the",
+            "failure",
+        ])
+        .expect("parse");
+        match cli.command.expect("command") {
+            Command::Delegate {
+                agent,
+                model,
+                parent_conversation_id,
+                task,
+                ..
+            } => {
+                assert_eq!(agent, "codex");
+                assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(parent_conversation_id.as_deref(), Some("conversation-1"));
+                assert_eq!(task.join(" "), "inspect the failure");
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -191,9 +191,16 @@ pub struct AgentCapabilities {
 }
 
 impl AgentCapabilities {
-    /// True when the adapter can host Argo's delegation MCP server and therefore
-    /// spawn cross-runtime children.
+    /// True because every Argo-managed turn receives the daemon-backed command
+    /// fallback. Adapters with safe per-run MCP injection also receive native
+    /// `argo_delegate` tools; shared-config and non-MCP adapters use `$ARGO_BIN
+    /// delegate ...` through their shell tool instead.
     pub const fn can_delegate(&self) -> bool {
+        true
+    }
+
+    /// True when delegation is exposed as an MCP tool in addition to the command fallback.
+    pub const fn delegates_via_mcp(&self) -> bool {
         self.mcp_injection.hosts_delegation()
     }
 
@@ -234,7 +241,8 @@ mod tests {
         // Grok: plain stream, no native resume, no MCP injection path.
         let grok = caps(StreamFormat::Plain, false, McpInjection::None);
         assert!(grok.always_reseeds());
-        assert!(!grok.can_delegate());
+        assert!(grok.can_delegate());
+        assert!(!grok.delegates_via_mcp());
     }
 
     #[test]

@@ -147,6 +147,16 @@ pub enum RunEventKind {
         child_agent_id: AgentId,
         /// Task handed to the child.
         task: String,
+        /// True for a CLI-native child that has no independent Argo run stream.
+        #[serde(default)]
+        native: bool,
+    },
+    /// One explicitly emitted event attributed to a child agent.
+    ChildEvent {
+        /// Child identity announced by [`RunEventKind::ChildSpawned`].
+        child_run_id: RunId,
+        /// Event emitted by that child. Hidden reasoning is never synthesized.
+        event: Box<RunEventKind>,
     },
     /// A child agent run finished.
     ChildCompleted {
@@ -244,6 +254,24 @@ mod tests {
         assert!(json.contains("\"kind\":\"text_delta\""));
         let back: RunEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn attributed_child_events_round_trip_without_becoming_terminal() {
+        let event = RunEvent::new(
+            RunId::new("parent"),
+            3,
+            RunEventKind::ChildEvent {
+                child_run_id: RunId::new("child"),
+                event: Box::new(RunEventKind::ThinkingDelta {
+                    text: "emitted reasoning".into(),
+                }),
+            },
+        );
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: RunEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, event);
+        assert!(!back.is_terminal());
     }
 
     #[test]

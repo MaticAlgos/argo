@@ -197,6 +197,13 @@ impl AcpSession {
                     "result": { "outcome": { "outcome": "selected", "optionId": option } }
                 }))
             }
+            "_kiro.dev/subagent/list_update" => {
+                sink.emit(RunEventKind::Diagnostic {
+                    code: "NATIVE_SUBAGENT_UNAVAILABLE".into(),
+                    detail: "Kiro emitted a native-subagent update, but its vendor extension does not expose a verified child event schema; use Argo delegation for inspectable child activity".into(),
+                });
+                AcpAction::Idle
+            }
             // Anything else is unimplemented. The distinction that matters is not
             // the method name but whether the peer expects an answer: a request
             // carries an `id` and blocks until it gets one, so silently ignoring it
@@ -913,6 +920,31 @@ mod tests {
             &mut sink,
         );
         assert!(s.outcome().expect("outcome").resume_target_missing);
+    }
+
+    #[test]
+    fn kiro_native_subagent_updates_report_the_unverified_schema() {
+        let mut sink = CollectingSink::default();
+        let mut session = session(None, None);
+        let action = session.handle_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"agents": [{"id": "opaque"}]}
+            })
+            .to_string(),
+            &mut sink,
+        );
+        assert_eq!(action, AcpAction::Idle);
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            RunEventKind::Diagnostic { code, .. }
+                if code == "NATIVE_SUBAGENT_UNAVAILABLE"
+        )));
+        assert!(!sink
+            .events
+            .iter()
+            .any(|event| matches!(event, RunEventKind::ChildSpawned { .. })));
     }
 
     #[test]

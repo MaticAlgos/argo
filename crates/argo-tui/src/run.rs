@@ -290,6 +290,27 @@ async fn apply_stream_event(
     event_tx: &mpsc::UnboundedSender<RunEvent>,
     event: RunEvent,
 ) -> Result<()> {
+    let belongs_to_parent = app.active_run.as_ref() == Some(&event.run_id);
+    let child_to_follow = match &event.kind {
+        argo_core::event::RunEventKind::ChildSpawned {
+            child_run_id,
+            child_agent_id,
+            native: false,
+            ..
+        } => Some((child_run_id.clone(), child_agent_id.to_string())),
+        _ => None,
+    };
+    if let Some((child_run_id, child_agent_id)) = child_to_follow {
+        if app.follow_child(child_run_id.clone(), child_agent_id) {
+            spawn_stream(paths, child_run_id, event_tx.clone());
+        }
+    }
+
+    if !belongs_to_parent {
+        app.apply_child_event(event.run_id, event.kind);
+        return Ok(());
+    }
+
     let terminal_status = match &event.kind {
         argo_core::event::RunEventKind::RunFinished { status, .. } => Some(*status),
         _ => None,
@@ -1182,6 +1203,7 @@ async fn run_command(
                 match connection
                     .request(Request::Delegate {
                         parent_conversation_id: conversation,
+                        parent_run_id: None,
                         agent_id: agent.clone(),
                         model: None,
                         task: task.clone(),

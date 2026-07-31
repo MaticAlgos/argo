@@ -456,6 +456,44 @@ fn blocks_from_events(events: &[RunEvent]) -> Vec<ContentBlock> {
             {
                 blocks.push(ContentBlock::FileWrite { path: path.clone() });
             }
+            RunEventKind::ChildSpawned {
+                child_run_id,
+                child_agent_id,
+                task,
+                ..
+            } => blocks.push(ContentBlock::ChildActivity {
+                run_id: child_run_id.clone(),
+                agent_id: child_agent_id.clone(),
+                task: task.clone(),
+                status: None,
+                blocks: Vec::new(),
+            }),
+            RunEventKind::ChildEvent {
+                child_run_id,
+                event,
+            } => {
+                if let Some(ContentBlock::ChildActivity {
+                    blocks: child_blocks,
+                    ..
+                }) = blocks.iter_mut().rev().find(|block| {
+                    matches!(block, ContentBlock::ChildActivity { run_id, .. } if run_id == child_run_id)
+                }) {
+                    append_child_block(child_blocks, event);
+                }
+            }
+            RunEventKind::ChildCompleted {
+                child_run_id,
+                status,
+            } => {
+                if let Some(ContentBlock::ChildActivity {
+                    status: known_status,
+                    ..
+                }) = blocks.iter_mut().rev().find(|block| {
+                    matches!(block, ContentBlock::ChildActivity { run_id, .. } if run_id == child_run_id)
+                }) {
+                    *known_status = Some(*status);
+                }
+            }
             _ => {}
         }
     }
@@ -468,6 +506,50 @@ fn blocks_from_events(events: &[RunEvent]) -> Vec<ContentBlock> {
             _ => true,
         })
         .collect()
+}
+
+/// Appends one explicitly emitted native-child event to its own content list.
+fn append_child_block(blocks: &mut Vec<ContentBlock>, event: &RunEventKind) {
+    match event {
+        RunEventKind::TextDelta { text } if !text.is_empty() => match blocks.last_mut() {
+            Some(ContentBlock::Text { text: accumulated }) => accumulated.push_str(text),
+            _ => blocks.push(ContentBlock::text(text)),
+        },
+        RunEventKind::ThinkingDelta { text } if !text.is_empty() => match blocks.last_mut() {
+            Some(ContentBlock::Thinking { text: accumulated }) => accumulated.push_str(text),
+            _ => blocks.push(ContentBlock::Thinking { text: text.clone() }),
+        },
+        RunEventKind::ToolStarted { id, name, input } => blocks.push(ContentBlock::Tool {
+            call: ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                output: None,
+                status: ToolStatus::Pending,
+            },
+        }),
+        RunEventKind::ToolCompleted { id, output, ok } => {
+            if let Some(call) = blocks.iter_mut().rev().find_map(|block| match block {
+                ContentBlock::Tool { call } if call.id == *id => Some(call),
+                _ => None,
+            }) {
+                call.output = output.clone();
+                call.status = if *ok {
+                    ToolStatus::Completed
+                } else {
+                    ToolStatus::Failed
+                };
+            }
+        }
+        RunEventKind::FileWritten { path }
+            if !blocks.iter().any(
+                |block| matches!(block, ContentBlock::FileWrite { path: known } if known == path),
+            ) =>
+        {
+            blocks.push(ContentBlock::FileWrite { path: path.clone() });
+        }
+        _ => {}
+    }
 }
 
 /// Serves until shutdown is requested.
@@ -901,6 +983,7 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
 
         Request::Delegate {
             parent_conversation_id,
+            parent_run_id,
             agent_id,
             model,
             task,
@@ -909,6 +992,7 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             delegate(
                 daemon,
                 parent_conversation_id,
+                parent_run_id,
                 agent_id,
                 model,
                 task,
@@ -1039,6 +1123,8 @@ async fn preview_context(
 
     let turn = TurnRequest {
         conversation_id: conversation_id.clone(),
+        parent_run_id: None,
+        delegation_allowed: true,
         prompt: prompt.clone(),
         agent_id: AgentId::new(&agent.id),
         model,
@@ -1091,6 +1177,7 @@ const MAX_DELEGATION_DEPTH: usize = 3;
 async fn delegate(
     daemon: &Arc<Daemon>,
     parent_conversation_id: ConversationId,
+    parent_run_id: Option<RunId>,
     agent_id: AgentId,
     model: Option<String>,
     task: String,
@@ -1142,6 +1229,28 @@ async fn delegate(
         )));
     }
 
+    let parent_run_id = match parent_run_id {
+        Some(run_id) => Some(run_id),
+        None => daemon
+            .store()?
+            .running_run_for_conversation(&parent_conversation_id)?
+            .map(|run| run.id),
+    };
+
+    if let Some(parent_run_id) = &parent_run_id {
+        let run = daemon.store()?.get_run(parent_run_id)?;
+        if run.conversation_id != parent_conversation_id {
+            return Err(ArgoError::Invalid(format!(
+                "parent run {parent_run_id} does not belong to conversation {parent_conversation_id}"
+            )));
+        }
+        if run.status != RunStatus::Running {
+            return Err(ArgoError::Invalid(format!(
+                "parent run {parent_run_id} is not running"
+            )));
+        }
+    }
+
     // A bounded capsule of the parent's conversation, so the child understands the
     // work without being handed the entire history.
     let capsule = {
@@ -1161,9 +1270,7 @@ async fn delegate(
         store.create_child_conversation(
             &parent.workspace_id,
             &parent_conversation_id,
-            // The parent run is not known here; the lineage that matters for
-            // navigation is the conversation link.
-            &RunId::new("delegated"),
+            parent_run_id.as_ref(),
             Some(&title),
         )?
     };
@@ -1190,8 +1297,6 @@ async fn delegate(
         child_conversation.as_str(),
         child_may_delegate,
     );
-    let _ = descriptors;
-
     let prompt = if capsule.is_empty() {
         task.clone()
     } else {
@@ -1202,6 +1307,8 @@ async fn delegate(
 
     let turn = TurnRequest {
         conversation_id: child_conversation.clone(),
+        parent_run_id: parent_run_id.clone(),
+        delegation_allowed: child_may_delegate,
         prompt,
         agent_id: agent_id.clone(),
         model: model.clone(),
@@ -1209,9 +1316,9 @@ async fn delegate(
         bin: info.path.clone().unwrap_or_else(|| def.bin.to_string()),
         help_flags: argo_runtime::observed_flags(&info.id),
         active_skills: skill_names,
-        active_mcp_servers: vec![],
+        active_mcp_servers: mcp_plan.names.clone(),
         project_instructions: resolve_instructions(&workspace_root),
-        mcp_descriptors: vec![],
+        mcp_descriptors: descriptors,
         mcp_config: mcp_plan
             .config_path
             .as_ref()
@@ -1223,9 +1330,56 @@ async fn delegate(
 
     let cancel = CancelToken::new();
     let events = daemon.events.clone();
+    let store = Arc::clone(&daemon.store);
+    let lifecycle_parent = parent_run_id.clone();
+    let lifecycle_agent = agent_id.clone();
+    let lifecycle_task = task.clone();
+    let spawned = std::sync::atomic::AtomicBool::new(false);
     let listener = move |event: argo_core::event::RunEvent| {
-        // Children stream into the same fan-out, so the TUI can follow them.
+        // The first persisted child event discloses its real generated run id.
+        // Record spawn on the parent before publishing child output so a TUI can
+        // subscribe and replay from sequence zero without losing anything.
+        if let Some(parent_run_id) = &lifecycle_parent {
+            if !spawned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(store) = store.lock() {
+                    if let Ok(parent_event) = store.append_event(
+                        parent_run_id,
+                        RunEventKind::ChildSpawned {
+                            child_run_id: event.run_id.clone(),
+                            child_agent_id: lifecycle_agent.clone(),
+                            task: lifecycle_task.clone(),
+                            native: false,
+                        },
+                    ) {
+                        let _ = events.send(parent_event);
+                    }
+                }
+            }
+        }
+
+        let terminal = match &event.kind {
+            RunEventKind::RunFinished { status, .. } => Some(*status),
+            _ => None,
+        };
+        let child_run_id = event.run_id.clone();
         let _ = events.send(event);
+
+        // Child RunFinished is its own commit barrier. Publish completion to the
+        // parent only after that barrier, and never reinterpret it as the parent
+        // turn's terminal event.
+        if let (Some(parent_run_id), Some(status)) = (&lifecycle_parent, terminal) {
+            if let Ok(store) = store.lock() {
+                if let Ok(parent_event) = store.append_event(
+                    parent_run_id,
+                    RunEventKind::ChildCompleted {
+                        child_run_id,
+                        status,
+                    },
+                ) {
+                    let _ = events.send(parent_event);
+                }
+            }
+        }
     };
 
     let outcome = run_turn(&daemon.store, &daemon.paths, turn, &cancel, Some(&listener)).await?;
@@ -1317,6 +1471,8 @@ async fn send_message(
     let conversation_id_for_summary = conversation_id.clone();
     let turn = TurnRequest {
         conversation_id,
+        parent_run_id: None,
+        delegation_allowed: true,
         prompt,
         agent_id: AgentId::new(&agent.id),
         model: model.clone(),
@@ -1644,6 +1800,7 @@ mod tests {
             &daemon,
             Request::Delegate {
                 parent_conversation_id: conversation,
+                parent_run_id: None,
                 agent_id: AgentId::new("codex"),
                 model: None,
                 task: "   ".into(),
@@ -1663,6 +1820,7 @@ mod tests {
             &daemon,
             Request::Delegate {
                 parent_conversation_id: conversation,
+                parent_run_id: None,
                 agent_id: AgentId::new("not-real"),
                 model: None,
                 task: "do something".into(),
@@ -1734,7 +1892,7 @@ mod tests {
                     .create_child_conversation(
                         &workspace,
                         &current,
-                        &RunId::new("r"),
+                        Some(&RunId::new("r")),
                         Some(&format!("depth {depth}")),
                     )
                     .expect("child");
@@ -1746,6 +1904,7 @@ mod tests {
             &daemon,
             Request::Delegate {
                 parent_conversation_id: current,
+                parent_run_id: None,
                 agent_id: AgentId::new("codex"),
                 model: None,
                 task: "go deeper".into(),
@@ -1820,6 +1979,74 @@ mod tests {
         assert!(matches!(
             &view.blocks[2],
             ContentBlock::Text { text } if text == "Done."
+        ));
+    }
+
+    #[test]
+    fn native_child_activity_is_recovered_without_merging_into_parent_blocks() {
+        let parent = RunId::new("parent");
+        let child = RunId::new("claude-native-t1");
+        let events = vec![
+            RunEvent::new(
+                parent.clone(),
+                1,
+                RunEventKind::ChildSpawned {
+                    child_run_id: child.clone(),
+                    child_agent_id: AgentId::new("claude/explore"),
+                    task: "inspect parser".into(),
+                    native: true,
+                },
+            ),
+            RunEvent::new(
+                parent.clone(),
+                2,
+                RunEventKind::ChildEvent {
+                    child_run_id: child.clone(),
+                    event: Box::new(RunEventKind::ThinkingDelta {
+                        text: "checking".into(),
+                    }),
+                },
+            ),
+            RunEvent::new(
+                parent.clone(),
+                3,
+                RunEventKind::ChildEvent {
+                    child_run_id: child.clone(),
+                    event: Box::new(RunEventKind::TextDelta {
+                        text: "found it".into(),
+                    }),
+                },
+            ),
+            RunEvent::new(
+                parent,
+                4,
+                RunEventKind::ChildCompleted {
+                    child_run_id: child,
+                    status: RunStatus::Succeeded,
+                },
+            ),
+        ];
+
+        let blocks = blocks_from_events(&events);
+        assert_eq!(blocks.len(), 1);
+        let ContentBlock::ChildActivity {
+            agent_id,
+            status,
+            blocks,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected child activity block");
+        };
+        assert_eq!(agent_id.as_str(), "claude/explore");
+        assert_eq!(*status, Some(RunStatus::Succeeded));
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Thinking { text } if text == "checking"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::Text { text } if text == "found it"
         ));
     }
 

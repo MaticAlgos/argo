@@ -97,18 +97,25 @@ impl Client {
 
     /// Sends a request and reads one reply.
     pub async fn request(&mut self, request: Request) -> Result<Response> {
+        self.request_within(
+            request,
+            Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)),
+        )
+        .await
+    }
+
+    /// Sends a request with a caller-selected reply budget.
+    async fn request_within(
+        &mut self,
+        request: Request,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Response> {
         let line = serde_json::to_string(&request)?;
         self.writer
             .write_all(format!("{line}\n").as_bytes())
             .await
             .map_err(|e| ArgoError::Io(format!("send request: {e}")))?;
-        self.next_response().await
-    }
-
-    /// Reads the next reply, bounded by [`REQUEST_TIMEOUT_MS`].
-    pub async fn next_response(&mut self) -> Result<Response> {
-        self.next_response_within(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
-            .await
+        self.next_response_within(budget).await
     }
 
     /// Reads the next reply, waiting at most `budget`.
@@ -789,7 +796,74 @@ pub async fn context(paths: &ArgoPaths, conversation_id: &str, prompt: &str) -> 
     }
 }
 
-/// Sends one message and streams the reply.
+/// Delegates one self-contained task to another CLI and prints its report.
+///
+/// Agent-launched commands inherit these ids from the active turn. Explicit flags
+/// remain available for automation, but a parent conversation is always required
+/// so the child transcript cannot become unreachable.
+pub async fn delegate(
+    paths: &ArgoPaths,
+    parent_conversation_id: Option<String>,
+    parent_run_id: Option<String>,
+    agent: String,
+    model: Option<String>,
+    task: String,
+) -> Result<()> {
+    let parent_conversation_id = parent_conversation_id
+        .or_else(|| std::env::var(argo_daemon::mcp::CONVERSATION_ENV).ok())
+        .ok_or_else(|| {
+            ArgoError::Invalid(
+                "no parent conversation; run inside an Argo turn or pass --parent-conversation-id"
+                    .to_string(),
+            )
+        })?;
+    let parent_run_id = parent_run_id
+        .or_else(|| std::env::var(argo_daemon::mcp::RUN_ENV).ok())
+        .map(RunId::new);
+
+    let mut client = Client::connect(paths).await?;
+    match client
+        .request_within(
+            Request::Delegate {
+                parent_conversation_id: ConversationId::new(parent_conversation_id),
+                parent_run_id,
+                agent_id: AgentId::new(agent),
+                model,
+                task,
+                timeout_ms: None,
+            },
+            None,
+        )
+        .await?
+    {
+        Response::DelegateResult {
+            conversation_id,
+            run_id,
+            agent_id,
+            ok,
+            output,
+        } => {
+            println!(
+                "[subagent {agent_id} · conversation {conversation_id} · run {run_id} · {}]",
+                if ok { "completed" } else { "failed" }
+            );
+            println!("\n{output}");
+            if ok {
+                Ok(())
+            } else {
+                Err(ArgoError::Invalid(format!(
+                    "subagent {agent_id} did not complete"
+                )))
+            }
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    }
+}
 pub async fn send(
     paths: &ArgoPaths,
     conversation_id: Option<String>,

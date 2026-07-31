@@ -148,7 +148,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         parent_conversation_id: &ConversationId,
-        parent_run_id: &RunId,
+        parent_run_id: Option<&RunId>,
         title: Option<&str>,
     ) -> Result<ConversationId> {
         let id = ConversationId::generate();
@@ -164,7 +164,7 @@ impl Store {
                     workspace_id.as_str(),
                     title,
                     parent_conversation_id.as_str(),
-                    parent_run_id.as_str(),
+                    parent_run_id.as_ref().map(|run| run.as_str()),
                     now
                 ],
             )
@@ -551,7 +551,7 @@ mod tests {
         let parent = s.create_conversation(&ws, Some("parent")).expect("parent");
         let run = RunId::new("run-1");
         let child = s
-            .create_child_conversation(&ws, &parent, &run, Some("codex review"))
+            .create_child_conversation(&ws, &parent, Some(&run), Some("codex review"))
             .expect("child");
 
         let children = s.list_child_conversations(&parent).expect("list");

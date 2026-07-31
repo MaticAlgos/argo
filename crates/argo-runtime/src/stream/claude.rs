@@ -14,17 +14,19 @@
 
 use super::{truncate, StreamSink, TerminalOutcome};
 use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
-use argo_core::ids::SessionId;
+use argo_core::ids::{AgentId, RunId, SessionId};
+use std::collections::HashMap;
 
 /// Incremental parser for Claude's stream-json.
 #[derive(Debug, Default)]
 pub struct ClaudeStreamParser {
     outcome: Option<TerminalOutcome>,
-    /// True once assistant text was streamed from a message block.
-    ///
-    /// The terminal `result` record repeats the final text, so emitting both
-    /// would duplicate the whole reply in the transcript.
+    /// True once parent assistant text was streamed from a message block.
     streamed_text: bool,
+    /// Native subagent tool metadata keyed by Claude's parent tool-use id.
+    native_tools: HashMap<String, (AgentId, String)>,
+    /// Native children already announced, with whether they emitted prose.
+    native_children: HashMap<String, bool>,
 }
 
 impl ClaudeStreamParser {
@@ -52,11 +54,10 @@ impl ClaudeStreamParser {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // A nested agent's frames are surfaced but never terminate the parent.
-        let nested = value
+        let nested_id = value
             .get("parent_tool_use_id")
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         match record_type {
             "system" => {
@@ -66,13 +67,14 @@ impl ClaudeStreamParser {
                     });
                 }
             }
-            "assistant" | "user" => self.handle_message(&value, nested, sink),
-            "result" => {
-                if nested {
-                    return;
-                }
-                self.handle_result(&value, sink);
-            }
+            "assistant" | "user" => match nested_id.as_deref() {
+                Some(child_id) => self.handle_nested_message(&value, child_id, sink),
+                None => self.handle_message(&value, false, sink),
+            },
+            "result" => match nested_id.as_deref() {
+                Some(child_id) => self.handle_nested_result(&value, child_id, sink),
+                None => self.handle_result(&value, sink),
+            },
             _ => {}
         }
     }
@@ -129,6 +131,28 @@ impl ClaudeStreamParser {
                         .to_string();
                     let input = block.get("input").map(|v| truncate(&v.to_string(), 2_000));
 
+                    if matches!(name.as_str(), "Agent" | "Task") {
+                        let raw = block.get("input");
+                        let agent = raw
+                            .and_then(|value| value.get("subagent_type"))
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.trim().is_empty())
+                            .map(|value| AgentId::new(format!("claude/{value}")))
+                            .unwrap_or_else(|| AgentId::new("claude-native"));
+                        let task = raw
+                            .and_then(|value| {
+                                value
+                                    .get("description")
+                                    .or_else(|| value.get("prompt"))
+                                    .or_else(|| value.get("task"))
+                            })
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("task unavailable from Claude's emitted stream")
+                            .to_string();
+                        self.native_tools.insert(id.clone(), (agent, task));
+                    }
+
                     // File-producing tools also surface as explicit file events so
                     // the TUI and the store agree on what changed.
                     if let Some(path) = file_path_from_tool(&name, block.get("input")) {
@@ -166,6 +190,177 @@ impl ClaudeStreamParser {
                 detail: "output from a nested agent invoked by this turn".into(),
             });
         }
+    }
+
+    fn ensure_native_child(&mut self, child_id: &str, sink: &mut dyn StreamSink) -> RunId {
+        let run_id = RunId::new(format!("claude-native-{child_id}"));
+        if !self.native_children.contains_key(child_id) {
+            let (agent_id, task) = self.native_tools.get(child_id).cloned().unwrap_or_else(|| {
+                (
+                    AgentId::new("claude-native"),
+                    "task unavailable from Claude's emitted stream".to_string(),
+                )
+            });
+            self.native_children.insert(child_id.to_string(), false);
+            sink.emit(RunEventKind::ChildSpawned {
+                child_run_id: run_id.clone(),
+                child_agent_id: agent_id,
+                task,
+                native: true,
+            });
+        }
+        run_id
+    }
+
+    fn emit_native_child(sink: &mut dyn StreamSink, child_run_id: &RunId, event: RunEventKind) {
+        sink.emit(RunEventKind::ChildEvent {
+            child_run_id: child_run_id.clone(),
+            event: Box::new(event),
+        });
+    }
+
+    fn handle_nested_message(
+        &mut self,
+        value: &serde_json::Value,
+        child_id: &str,
+        sink: &mut dyn StreamSink,
+    ) {
+        let child_run_id = self.ensure_native_child(child_id, sink);
+        let Some(content) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_array())
+        else {
+            return;
+        };
+
+        for block in content {
+            let kind = block
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            match kind {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
+                        if !text.is_empty() {
+                            self.native_children.insert(child_id.to_string(), true);
+                            Self::emit_native_child(
+                                sink,
+                                &child_run_id,
+                                RunEventKind::TextDelta {
+                                    text: text.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = block.get("thinking").and_then(|value| value.as_str()) {
+                        if !text.is_empty() {
+                            Self::emit_native_child(
+                                sink,
+                                &child_run_id,
+                                RunEventKind::ThinkingDelta {
+                                    text: text.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+                "tool_use" => {
+                    let id = block
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    let input = block
+                        .get("input")
+                        .map(|value| truncate(&value.to_string(), 2_000));
+                    if let Some(path) = file_path_from_tool(&name, block.get("input")) {
+                        Self::emit_native_child(
+                            sink,
+                            &child_run_id,
+                            RunEventKind::FileWritten { path },
+                        );
+                    }
+                    if name == "TodoWrite" {
+                        if let Some(steps) = todo_steps(block.get("input")) {
+                            Self::emit_native_child(
+                                sink,
+                                &child_run_id,
+                                RunEventKind::PlanUpdated { steps },
+                            );
+                        }
+                    }
+                    Self::emit_native_child(
+                        sink,
+                        &child_run_id,
+                        RunEventKind::ToolStarted { id, name, input },
+                    );
+                }
+                "tool_result" => {
+                    let id = block
+                        .get("tool_use_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let ok = !block
+                        .get("is_error")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    let output = block
+                        .get("content")
+                        .map(|value| truncate(&render_content(value), 4_000));
+                    Self::emit_native_child(
+                        sink,
+                        &child_run_id,
+                        RunEventKind::ToolCompleted { id, output, ok },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_nested_result(
+        &mut self,
+        value: &serde_json::Value,
+        child_id: &str,
+        sink: &mut dyn StreamSink,
+    ) {
+        let child_run_id = self.ensure_native_child(child_id, sink);
+        let streamed = self.native_children.get(child_id).copied().unwrap_or(false);
+        if !streamed {
+            if let Some(text) = value.get("result").and_then(|value| value.as_str()) {
+                if !text.is_empty() {
+                    Self::emit_native_child(
+                        sink,
+                        &child_run_id,
+                        RunEventKind::TextDelta {
+                            text: text.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        let status = if value
+            .get("is_error")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            RunStatus::Failed
+        } else {
+            RunStatus::Succeeded
+        };
+        sink.emit(RunEventKind::ChildCompleted {
+            child_run_id,
+            status,
+        });
     }
 
     fn handle_result(&mut self, value: &serde_json::Value, sink: &mut dyn StreamSink) {
@@ -446,27 +641,38 @@ mod tests {
     #[test]
     fn nested_agent_output_does_not_terminate_the_parent_run() {
         // A subagent's own `result` frame must not end the real turn.
-        let (_, outcome) = parse(&[
+        let (events, outcome) = parse(&[
             r#"{"type":"result","parent_tool_use_id":"t1","is_error":false,"result":"child done"}"#,
         ]);
         assert!(
             outcome.is_none(),
             "nested result must not finish the parent"
         );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEventKind::ChildCompleted {
+                status: RunStatus::Succeeded,
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn nested_agent_output_is_still_surfaced() {
+    fn nested_agent_output_is_attributed_without_becoming_parent_prose() {
         let (events, _) = parse(&[
             r#"{"type":"assistant","parent_tool_use_id":"t1","message":{"content":[{"type":"text","text":"child text"}]}}"#,
         ]);
-        assert!(events.contains(&RunEventKind::TextDelta {
-            text: "child text".into()
-        }));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            RunEventKind::Diagnostic { code, .. } if code == "NESTED_AGENT_ACTIVITY"
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, RunEventKind::ChildSpawned { native: true, .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEventKind::ChildEvent { event, .. }
+                if matches!(event.as_ref(), RunEventKind::TextDelta { text } if text == "child text")
         )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RunEventKind::TextDelta { .. })));
     }
 
     #[test]

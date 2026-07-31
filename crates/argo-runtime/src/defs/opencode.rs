@@ -207,7 +207,8 @@ mod tests {
         const { assert!(OPENCODE.capabilities.captures_session) };
         // No MCP injection path is wired yet, so OpenCode can be a delegation
         // target but cannot host Argo's delegation tools.
-        const { assert!(!OPENCODE.capabilities.can_delegate()) };
+        const { assert!(OPENCODE.capabilities.can_delegate()) };
+        const { assert!(!OPENCODE.capabilities.delegates_via_mcp()) };
         const {
             assert!(OPENCODE
                 .capabilities

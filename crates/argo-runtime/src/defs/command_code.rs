@@ -391,6 +391,7 @@ mod tests {
         // Session capture and resume apply uniformly to every selectable model.
         const { assert!(COMMAND_CODE.capabilities.native_resume) };
         const { assert!(COMMAND_CODE.capabilities.captures_session) };
-        const { assert!(!COMMAND_CODE.capabilities.can_delegate()) };
+        const { assert!(COMMAND_CODE.capabilities.can_delegate()) };
+        const { assert!(!COMMAND_CODE.capabilities.delegates_via_mcp()) };
     }
 }

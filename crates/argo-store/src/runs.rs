@@ -213,6 +213,30 @@ impl Store {
         Ok(out)
     }
 
+    /// Returns the newest running invocation for a conversation, if any.
+    ///
+    /// Used only as a delegation fallback when an MCP launcher did not preserve
+    /// `ARGO_PARENT_RUN`; user-initiated delegation while idle remains unlinked.
+    pub fn running_run_for_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<Run>> {
+        self.conn
+            .query_row(
+                "SELECT id, conversation_id, workspace_id, agent_id, model, status,
+                        assistant_message_id, parent_run_id, resumed, invalidation_reason,
+                        error_code, error_message, created_at, finished_at
+                   FROM runs
+                  WHERE conversation_id = ?1 AND status = 'running'
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT 1",
+                [conversation_id.as_str()],
+                map_run,
+            )
+            .optional()
+            .map_err(|error| ArgoError::Store(format!("find running conversation run: {error}")))?
+            .transpose()
+    }
     /// Lists child runs spawned by a run.
     pub fn list_child_runs(&self, parent: &RunId) -> Result<Vec<Run>> {
         let mut stmt = self
@@ -512,6 +536,35 @@ mod tests {
         assert!(ids.contains(&pending));
         assert!(ids.contains(&running));
         assert!(!ids.contains(&done));
+    }
+
+    #[test]
+    fn running_run_lookup_ignores_pending_and_finished_turns() {
+        let (store, conversation, workspace) = setup();
+        let pending = store
+            .create_run(new_run(&conversation, &workspace, "claude"))
+            .expect("pending");
+        assert!(store
+            .running_run_for_conversation(&conversation)
+            .expect("lookup")
+            .is_none());
+
+        store.mark_run_running(&pending).expect("running");
+        assert_eq!(
+            store
+                .running_run_for_conversation(&conversation)
+                .expect("lookup")
+                .map(|run| run.id),
+            Some(pending.clone())
+        );
+
+        store
+            .finish_run(&pending, RunStatus::Succeeded, None)
+            .expect("finish");
+        assert!(store
+            .running_run_for_conversation(&conversation)
+            .expect("lookup")
+            .is_none());
     }
 
     #[test]
