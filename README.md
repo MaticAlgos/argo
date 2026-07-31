@@ -182,10 +182,21 @@ needed only when a CLI introduces a wire format Argo does not already support.
 Argo requires Rust 1.82 or newer and currently targets Unix-style environments
 (macOS and Linux).
 
-One-shot installation from GitHub:
+One-shot installation from GitHub after the repository is public:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | bash
+```
+
+For a private checkout, use a fine-grained GitHub token with read-only **Contents**
+access (the token is passed to `curl`/the installer and is never stored):
+
+```bash
+curl -fsSL \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw+json" \
+  "https://api.github.com/repos/MaticAlgos/argo/contents/install.sh?ref=main" \
+  | GITHUB_TOKEN="$GITHUB_TOKEN" bash
 ```
 
 The script downloads a clean source archive, performs a reproducible locked

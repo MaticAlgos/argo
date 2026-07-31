@@ -46,8 +46,12 @@ if [[ -z "$SOURCE_DIR" ]]; then
   ARCHIVE="$TEMP_DIR/argo.tar.gz"
   URL="https://codeload.github.com/$REPOSITORY/tar.gz/$REF"
   echo "downloading Argo source ($REF)..."
+  CURL_AUTH=()
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    CURL_AUTH+=(--header "Authorization: Bearer $GITHUB_TOKEN")
+  fi
   curl --fail --silent --show-error --location --retry 3 \
-    --output "$ARCHIVE" "$URL"
+    "${CURL_AUTH[@]}" --output "$ARCHIVE" "$URL"
   tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
   MANIFEST="$(find "$TEMP_DIR" -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)"
   [[ -n "$MANIFEST" ]] || fail "downloaded archive did not contain an Argo workspace"
