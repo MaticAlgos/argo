@@ -379,6 +379,7 @@ fn message_view(message: &argo_core::message::Message) -> MessageView {
         }
         .to_string(),
         text: message.transferable_text(),
+        blocks: message.blocks.clone(),
         agent_id: message.agent_id.as_ref().map(|a| a.to_string()),
         model: message.model.clone(),
         created_at: message.created_at,
@@ -1222,6 +1223,7 @@ async fn send_message(
         conversation_id.as_str(),
     );
 
+    let conversation_id_for_summary = conversation_id.clone();
     let turn = TurnRequest {
         conversation_id,
         prompt,
@@ -1293,12 +1295,21 @@ async fn send_message(
         .map_err(|_| ArgoError::Process("turn did not start".into()))?;
     daemon.running.lock().await.insert(run_id.clone(), cancel);
 
+    // The engine persists the title and both message rows before announcing the
+    // run, so this summary is authoritative and can update every client view
+    // immediately instead of waiting for RunFinished.
+    let conversation = daemon
+        .store()?
+        .get_conversation(&conversation_id_for_summary)?;
+    let conversation = daemon.summarize(&conversation).await?;
+
     Ok(Response::RunStarted {
         run_id,
         agent_id: agent.id,
         model,
         resumed,
         context_transfer_reason,
+        conversation: Some(conversation),
     })
 }
 

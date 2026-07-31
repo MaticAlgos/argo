@@ -10,6 +10,7 @@
 
 use argo_core::event::{EventSeq, RunEvent};
 use argo_core::ids::{AgentId, ConversationId, RunId};
+use argo_core::message::ContentBlock;
 use argo_core::runtime::{ModelOption, ReasoningOption};
 use argo_core::session::SelectionChange;
 use argo_runtime::AgentInfo;
@@ -188,6 +189,9 @@ pub enum Response {
         /// Why canonical context was transferred into a fresh session.
         #[serde(default)]
         context_transfer_reason: Option<String>,
+        /// Authoritative metadata after the user turn and assistant placeholder were persisted.
+        #[serde(default)]
+        conversation: Option<ConversationSummary>,
     },
     /// One streamed run event.
     Event {
@@ -260,8 +264,11 @@ pub struct MessageView {
     pub id: String,
     /// Author role.
     pub role: String,
-    /// Rendered text.
+    /// Legacy flattened text for simple clients.
     pub text: String,
+    /// Canonical structured blocks for native transcript reconstruction.
+    #[serde(default)]
+    pub blocks: Vec<ContentBlock>,
     /// Producing agent, for assistant turns.
     pub agent_id: Option<String>,
     /// Producing model, for assistant turns.
@@ -332,6 +339,42 @@ mod tests {
         assert!(encoded.ends_with('\n'));
         assert_eq!(encoded.matches('\n').count(), 1);
         assert!(encoded.contains("\"type\":\"ok\""));
+    }
+
+    #[test]
+    fn run_started_carries_immediate_authoritative_conversation_metadata() {
+        let summary = ConversationSummary {
+            id: ConversationId::new("c1"),
+            title: Some("first task".into()),
+            selected_agent_id: Some("codex".into()),
+            selected_model: Some("gpt-5".into()),
+            selected_reasoning: None,
+            selected_mode: None,
+            message_count: 2,
+            agents_with_sessions: vec![],
+            parent_conversation_id: None,
+            updated_at: 42,
+        };
+        let response = Response::RunStarted {
+            run_id: RunId::new("r1"),
+            agent_id: "codex".into(),
+            model: Some("gpt-5".into()),
+            resumed: false,
+            context_transfer_reason: None,
+            conversation: Some(summary.clone()),
+        };
+        let encoded = response.encode();
+        let decoded: Response = serde_json::from_str(encoded.trim()).expect("decode");
+        assert_eq!(decoded, response);
+        let Response::RunStarted {
+            conversation: Some(actual),
+            ..
+        } = decoded
+        else {
+            panic!("missing authoritative summary");
+        };
+        assert_eq!(actual.title, summary.title);
+        assert_eq!(actual.message_count, 2);
     }
 
     #[test]

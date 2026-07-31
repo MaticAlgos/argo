@@ -736,6 +736,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resumed_structured_history_renders_like_live_activity() {
+        use argo_core::message::{ContentBlock, ToolCall, ToolStatus};
+        use argo_daemon::protocol::MessageView;
+
+        let mut app = App::new("/repo");
+        app.replace_transcript(vec![MessageView {
+            id: "m1".into(),
+            role: "assistant".into(),
+            text: String::new(),
+            blocks: vec![
+                ContentBlock::Thinking {
+                    text: "checking the report".into(),
+                },
+                ContentBlock::Tool {
+                    call: ToolCall {
+                        id: "t1".into(),
+                        name: "run_backtest".into(),
+                        input: Some("SENSEX".into()),
+                        output: Some("runID backtest-123".into()),
+                        status: ToolStatus::Completed,
+                    },
+                },
+                ContentBlock::FileWrite {
+                    path: "strategy.py".into(),
+                },
+                ContentBlock::text(
+                    "## Result\n\n[Report Link](https://example.com/report/backtest-123)",
+                ),
+            ],
+            agent_id: Some("antigravity".into()),
+            model: Some("sonnet".into()),
+            created_at: 0,
+        }]);
+
+        let output = render(&app, 78, 20);
+        assert!(output.contains("◌ checking the report"), "{output}");
+        assert!(output.contains("calling run_backtest"), "{output}");
+        assert!(output.contains("backtest-123"), "{output}");
+        assert!(output.contains("wrote strategy.py"), "{output}");
+        assert!(output.contains("Result"), "{output}");
+        assert!(output.contains("https://example.com/report"), "{output}");
+        assert!(!output.contains("## Result"), "{output}");
+    }
+
+    #[test]
     fn reasoning_tools_files_and_answer_are_visually_distinct_and_visible() {
         let mut app = App::new("/repo");
         app.push(LineKind::Thinking, "checking the repository".to_string());

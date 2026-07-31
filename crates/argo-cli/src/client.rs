@@ -861,6 +861,7 @@ pub async fn send(
             model,
             resumed,
             context_transfer_reason,
+            conversation: _,
         } => {
             let model = model.unwrap_or_else(|| "default".into());
             println!(

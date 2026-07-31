@@ -47,7 +47,7 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
             conversations,
         } => {
             app.workspace = root;
-            app.conversations = conversations;
+            app.set_conversation_summaries(conversations);
         }
         Response::Error {
             code,
@@ -383,8 +383,13 @@ async fn send_message(
             model,
             resumed,
             context_transfer_reason,
+            conversation: authoritative_summary,
         } => {
-            if let Some(summary) = app.conversation.as_mut() {
+            if let Some(summary) = authoritative_summary {
+                app.set_conversation_summary(summary);
+            } else if let Some(mut summary) = app.conversation.clone() {
+                // Compatibility with a daemon from before RunStarted carried the
+                // authoritative summary. Keep both header and history cache fresh.
                 if summary
                     .title
                     .as_deref()
@@ -394,6 +399,11 @@ async fn send_message(
                 {
                     summary.title = Some(argo_core::conversation_title(&line));
                 }
+                summary.selected_agent_id = Some(agent_id.clone());
+                summary.selected_model = model.clone();
+                summary.message_count += 2; // accepted user + assistant placeholder
+                summary.updated_at = argo_core::now_millis();
+                app.set_conversation_summary(summary);
             }
             app.push(LineKind::User, line);
             app.begin_run_with_reason(
@@ -960,7 +970,7 @@ async fn set_mode(connection: &mut Connection, app: &mut App, mode: Option<Strin
         .await?
     {
         Response::Conversation { summary, .. } => {
-            app.conversation = Some(summary);
+            app.set_conversation_summary(summary);
             let mode = app.mode();
             // State what the mode actually permits: "plan" alone is ambiguous.
             app.push(
@@ -1050,7 +1060,7 @@ async fn select(
                     .clone()
                     .unwrap_or_else(|| "default".into())
             );
-            app.conversation = Some(summary);
+            app.set_conversation_summary(summary);
             // Selections apply at the next turn, never to a running child.
             app.push(
                 LineKind::Notice,
@@ -1093,7 +1103,7 @@ async fn new_conversation(
     {
         Response::Conversation { summary, .. } => {
             app.lines.clear();
-            app.conversation = Some(summary);
+            app.set_conversation_summary(summary);
             app.set_status("new conversation");
         }
         Response::Error { message, .. } => app.report_error(message),
@@ -1115,22 +1125,8 @@ async fn load_conversation(
         .await?
     {
         Response::Conversation { summary, messages } => {
-            app.lines.clear();
-            for message in messages {
-                match message.role.as_str() {
-                    "user" => app.push(LineKind::User, message.text),
-                    "assistant" => {
-                        if let Some(agent) = &message.agent_id {
-                            let model = message.model.clone().unwrap_or_else(|| "default".into());
-                            app.push(LineKind::AgentHeader, format!("{agent} · {model}"));
-                        }
-                        app.push(LineKind::Assistant, message.text);
-                    }
-                    _ => app.push(LineKind::Notice, message.text),
-                }
-            }
-            app.conversation = Some(summary);
-            app.scroll_back = 0;
+            app.replace_transcript(messages);
+            app.set_conversation_summary(summary);
             app.set_status("loaded conversation");
         }
         Response::Error { message, .. } => app.report_error(message),
@@ -1147,7 +1143,7 @@ async fn refresh_conversations(connection: &mut Connection, app: &mut App) -> Re
         })
         .await?
     {
-        app.conversations = conversations;
+        app.set_conversation_summaries(conversations);
     }
     Ok(())
 }
@@ -1166,7 +1162,7 @@ async fn refresh_conversation_summary(connection: &mut Connection, app: &mut App
         })
         .await?
     {
-        Response::Conversation { summary, .. } => app.conversation = Some(summary),
+        Response::Conversation { summary, .. } => app.set_conversation_summary(summary),
         Response::Error { message, .. } => app.report_error(message),
         other => app.report_error(format!("unexpected summary reply: {other:?}")),
     }

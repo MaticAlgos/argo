@@ -114,10 +114,7 @@ pub struct TurnOutcome {
 struct PersistingSink<'a> {
     store: SharedStore,
     run_id: RunId,
-    text: String,
-    thinking: String,
-    files: Vec<String>,
-    tools: Vec<ToolCall>,
+    blocks: Vec<ContentBlock>,
     session_id: Option<String>,
     listener: Option<&'a (dyn Fn(argo_core::event::RunEvent) + Send + Sync)>,
 }
@@ -127,24 +124,45 @@ impl StreamSink for PersistingSink<'_> {
         // Accumulate the assistant message as it forms, so a crash mid-turn still
         // leaves the partial reply recoverable from run_events.
         match &event {
-            RunEventKind::TextDelta { text } => self.text.push_str(text),
-            RunEventKind::ThinkingDelta { text } => self.thinking.push_str(text),
+            RunEventKind::TextDelta { text } if !text.is_empty() => match self.blocks.last_mut() {
+                Some(ContentBlock::Text { text: accumulated }) => accumulated.push_str(text),
+                _ => self.blocks.push(ContentBlock::text(text)),
+            },
+            RunEventKind::ThinkingDelta { text } if !text.is_empty() => {
+                match self.blocks.last_mut() {
+                    Some(ContentBlock::Thinking { text: accumulated }) => {
+                        accumulated.push_str(text)
+                    }
+                    _ => self
+                        .blocks
+                        .push(ContentBlock::Thinking { text: text.clone() }),
+                }
+            }
             RunEventKind::FileWritten { path } => {
-                if !self.files.contains(path) {
-                    self.files.push(path.clone());
+                if !self.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::FileWrite { path: known } if known == path),
+                ) {
+                    self.blocks
+                        .push(ContentBlock::FileWrite { path: path.clone() });
                 }
             }
             RunEventKind::ToolStarted { id, name, input } => {
-                self.tools.push(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    output: None,
-                    status: ToolStatus::Pending,
+                self.blocks.push(ContentBlock::Tool {
+                    call: ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        output: None,
+                        status: ToolStatus::Pending,
+                    },
                 });
             }
             RunEventKind::ToolCompleted { id, output, ok } => {
-                if let Some(call) = self.tools.iter_mut().rev().find(|call| call.id == *id) {
+                let call = self.blocks.iter_mut().rev().find_map(|block| match block {
+                    ContentBlock::Tool { call } if call.id == *id => Some(call),
+                    _ => None,
+                });
+                if let Some(call) = call {
                     call.output = output.clone();
                     call.status = if *ok {
                         ToolStatus::Completed
@@ -152,15 +170,17 @@ impl StreamSink for PersistingSink<'_> {
                         ToolStatus::Failed
                     };
                 } else {
-                    self.tools.push(ToolCall {
-                        id: id.clone(),
-                        name: "tool".to_string(),
-                        input: None,
-                        output: output.clone(),
-                        status: if *ok {
-                            ToolStatus::Completed
-                        } else {
-                            ToolStatus::Failed
+                    self.blocks.push(ContentBlock::Tool {
+                        call: ToolCall {
+                            id: id.clone(),
+                            name: "tool".to_string(),
+                            input: None,
+                            output: output.clone(),
+                            status: if *ok {
+                                ToolStatus::Completed
+                            } else {
+                                ToolStatus::Failed
+                            },
                         },
                     });
                 }
@@ -189,22 +209,16 @@ impl StreamSink for PersistingSink<'_> {
 impl PersistingSink<'_> {
     /// Builds the final content blocks for the assistant message.
     fn blocks(&self) -> Vec<ContentBlock> {
-        let mut blocks = Vec::new();
-        if !self.thinking.trim().is_empty() {
-            blocks.push(ContentBlock::Thinking {
-                text: self.thinking.trim().to_string(),
-            });
-        }
-        if !self.text.trim().is_empty() {
-            blocks.push(ContentBlock::text(self.text.trim()));
-        }
-        for call in &self.tools {
-            blocks.push(ContentBlock::Tool { call: call.clone() });
-        }
-        for path in &self.files {
-            blocks.push(ContentBlock::FileWrite { path: path.clone() });
-        }
-        blocks
+        self.blocks
+            .iter()
+            .filter(|block| match block {
+                ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+                    !text.trim().is_empty()
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -301,10 +315,7 @@ pub async fn run_turn(
     let mut sink = PersistingSink {
         store: Arc::clone(store),
         run_id: run_id.clone(),
-        text: String::new(),
-        thinking: String::new(),
-        files: Vec::new(),
-        tools: Vec::new(),
+        blocks: Vec::new(),
         session_id: None,
         listener,
     };
@@ -804,13 +815,13 @@ mod tests {
         let mut sink = PersistingSink {
             store,
             run_id: run,
-            text: String::new(),
-            thinking: String::new(),
-            files: Vec::new(),
-            tools: Vec::new(),
+            blocks: Vec::new(),
             session_id: None,
             listener: None,
         };
+        sink.emit(RunEventKind::TextDelta {
+            text: "Submitting. ".into(),
+        });
         sink.emit(RunEventKind::ToolStarted {
             id: "17".into(),
             name: "call_mcp_tool".into(),
@@ -821,9 +832,16 @@ mod tests {
             output: Some("{\"runID\":\"backtest-123\"}".into()),
             ok: true,
         });
+        sink.emit(RunEventKind::TextDelta {
+            text: "Done.".into(),
+        });
 
         let blocks = sink.blocks();
-        let ContentBlock::Tool { call } = &blocks[0] else {
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Text { text } if text == "Submitting. "
+        ));
+        let ContentBlock::Tool { call } = &blocks[1] else {
             panic!("expected durable tool block");
         };
         assert_eq!(call.name, "call_mcp_tool");
@@ -832,6 +850,10 @@ mod tests {
             .output
             .as_deref()
             .is_some_and(|out| out.contains("backtest-123")));
+        assert!(matches!(
+            &blocks[2],
+            ContentBlock::Text { text } if text == "Done."
+        ));
     }
 
     #[test]

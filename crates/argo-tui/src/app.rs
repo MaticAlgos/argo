@@ -6,7 +6,8 @@
 
 use argo_core::event::{RunEventKind, RunStatus};
 use argo_core::ids::{ConversationId, RunId};
-use argo_daemon::protocol::ConversationSummary;
+use argo_core::message::{ContentBlock, ToolStatus};
+use argo_daemon::protocol::{ConversationSummary, MessageView};
 use argo_runtime::AgentInfo;
 
 /// A rendered transcript line.
@@ -989,6 +990,131 @@ impl App {
         format!("{agent}/{model}")
     }
 
+    /// Rebuilds canonical history using the same visual vocabulary as live events.
+    pub fn replace_transcript(&mut self, messages: Vec<MessageView>) {
+        self.lines.clear();
+        for message in messages {
+            match message.role.as_str() {
+                "user" => {
+                    if message.blocks.is_empty() {
+                        self.push(LineKind::User, message.text);
+                    } else {
+                        for block in message.blocks {
+                            if let ContentBlock::Text { text } = block {
+                                self.push(LineKind::User, text);
+                            }
+                        }
+                    }
+                }
+                "assistant" => {
+                    if let Some(agent) = &message.agent_id {
+                        let model = message.model.as_deref().unwrap_or("default");
+                        self.push(LineKind::AgentHeader, format!("{agent} · {model}"));
+                    }
+                    if message.blocks.is_empty() {
+                        self.push(LineKind::Assistant, message.text);
+                        continue;
+                    }
+                    for block in message.blocks {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                if !text.trim().is_empty() {
+                                    self.push(LineKind::Assistant, text);
+                                }
+                            }
+                            ContentBlock::Thinking { text } => {
+                                if !text.trim().is_empty() {
+                                    self.push(LineKind::Thinking, text);
+                                }
+                            }
+                            ContentBlock::Tool { call } => {
+                                let input = call
+                                    .input
+                                    .as_deref()
+                                    .map(compact_activity)
+                                    .filter(|value| !value.is_empty())
+                                    .map(|value| format!(" — {value}"))
+                                    .unwrap_or_default();
+                                self.push(
+                                    LineKind::Activity,
+                                    format!("↳ calling {}{input}", call.name),
+                                );
+                                if call.status != ToolStatus::Pending {
+                                    let mark = if call.status == ToolStatus::Completed {
+                                        "✓"
+                                    } else {
+                                        "✗"
+                                    };
+                                    let output = call
+                                        .output
+                                        .as_deref()
+                                        .map(compact_activity)
+                                        .filter(|value| !value.is_empty())
+                                        .map(|value| format!(" — {value}"))
+                                        .unwrap_or_default();
+                                    self.push(
+                                        LineKind::Activity,
+                                        format!("{mark} {}{output}", call.name),
+                                    );
+                                }
+                            }
+                            ContentBlock::FileWrite { path } => {
+                                self.push(LineKind::Activity, format!("✎ wrote {path}"));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if message.blocks.is_empty() {
+                        self.push(LineKind::Notice, message.text);
+                    } else {
+                        for block in message.blocks {
+                            if let ContentBlock::Text { text } = block {
+                                self.push(LineKind::Notice, text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.scroll_back = 0;
+        self.recompute_context();
+    }
+
+    /// Replaces active metadata and its cached history-list entry atomically.
+    ///
+    /// Every view must observe one summary: otherwise the header can show the new
+    /// title while `/resume` still describes the same conversation as untitled.
+    pub fn set_conversation_summary(&mut self, summary: ConversationSummary) {
+        let id = summary.id.clone();
+        self.conversation = Some(summary.clone());
+        if let Some(existing) = self
+            .conversations
+            .iter_mut()
+            .find(|existing| existing.id == id)
+        {
+            *existing = summary;
+        } else {
+            self.conversations.push(summary);
+        }
+        self.conversations
+            .sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
+    }
+
+    /// Replaces the history cache and refreshes active metadata from the same list.
+    pub fn set_conversation_summaries(&mut self, conversations: Vec<ConversationSummary>) {
+        if let Some(active_id) = self.conversation.as_ref().map(|summary| summary.id.clone()) {
+            if let Some(authoritative) = conversations
+                .iter()
+                .find(|summary| summary.id == active_id)
+                .cloned()
+            {
+                self.conversation = Some(authoritative);
+            }
+        }
+        self.conversations = conversations;
+    }
+
     /// A one-line description of a conversation, for the history list.
     ///
     /// Argo has no titles until a turn happens, so the description falls back to
@@ -1844,6 +1970,99 @@ mod tests {
             parent_conversation_id: None,
             updated_at: argo_core::now_millis(),
         }
+    }
+
+    #[test]
+    fn authoritative_summary_updates_header_and_cached_description_together() {
+        let mut app = new_app();
+        app.set_conversation_summary(summary(None, 0, &[], None));
+
+        let mut updated = summary(Some("fix immediate metadata"), 2, &["codex"], Some("gpt-5"));
+        updated.updated_at += 1;
+        app.set_conversation_summary(updated);
+
+        assert_eq!(
+            app.conversation
+                .as_ref()
+                .and_then(|item| item.title.as_deref()),
+            Some("fix immediate metadata")
+        );
+        assert_eq!(app.conversations.len(), 1, "the cache must be upserted");
+        let description = App::describe(&app.conversations[0]);
+        assert!(
+            description.contains("fix immediate metadata"),
+            "{description}"
+        );
+        assert!(description.contains("2 msg"), "{description}");
+        assert!(description.contains("codex"), "{description}");
+    }
+
+    #[test]
+    fn resumed_transcript_restores_structured_activity_and_markdown() {
+        let mut app = new_app();
+        app.replace_transcript(vec![
+            MessageView {
+                id: "m1".into(),
+                role: "user".into(),
+                text: "run it".into(),
+                blocks: vec![ContentBlock::text("run it")],
+                agent_id: None,
+                model: None,
+                created_at: 1,
+            },
+            MessageView {
+                id: "m2".into(),
+                role: "assistant".into(),
+                text: "fallback text".into(),
+                blocks: vec![
+                    ContentBlock::Thinking {
+                        text: "checking data".into(),
+                    },
+                    ContentBlock::Tool {
+                        call: argo_core::message::ToolCall {
+                            id: "t1".into(),
+                            name: "run_backtest".into(),
+                            input: Some("{\"symbol\":\"SENSEX\"}".into()),
+                            output: Some("{\"runID\":\"backtest-123\"}".into()),
+                            status: ToolStatus::Completed,
+                        },
+                    },
+                    ContentBlock::FileWrite {
+                        path: "strategy.py".into(),
+                    },
+                    ContentBlock::text("## Result\n\n[Report](https://example.com/report)"),
+                ],
+                agent_id: Some("antigravity".into()),
+                model: Some("sonnet".into()),
+                created_at: 2,
+            },
+        ]);
+
+        assert_eq!(app.lines[0].kind, LineKind::User);
+        assert!(app
+            .lines
+            .iter()
+            .any(|line| line.kind == LineKind::Thinking && line.text == "checking data"));
+        let activity = app
+            .lines
+            .iter()
+            .filter(|line| line.kind == LineKind::Activity)
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(activity.contains("calling run_backtest"), "{activity}");
+        assert!(activity.contains("backtest-123"), "{activity}");
+        assert!(activity.contains("wrote strategy.py"), "{activity}");
+        let answer = app
+            .lines
+            .iter()
+            .find(|line| line.kind == LineKind::Assistant)
+            .expect("assistant markdown");
+        assert!(answer.text.contains("[Report](https://example.com/report)"));
+        assert!(
+            !answer.text.contains("runID"),
+            "tools must not flatten into prose"
+        );
     }
 
     #[test]
