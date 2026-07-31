@@ -13,7 +13,9 @@ use argo_core::ids::ConversationId;
 use argo_core::{ArgoPaths, IPC_PROTOCOL_VERSION};
 use argo_daemon::protocol::{Request, Response};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::style::{
     Attribute, Color as CrosstermColor, Print, SetAttribute, SetForegroundColor,
 };
@@ -33,6 +35,47 @@ use tokio::sync::mpsc;
 const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
 const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
 
+/// Minimal wheel fallback: normal button reporting plus SGR coordinates.
+///
+/// Deliberately omit 1002/1003 motion tracking and crossterm's RXVT mode. Apple
+/// Terminal reports wheel buttons through 1000, while F2 (or Fn temporarily)
+/// restores native selection whenever it is needed.
+const ENABLE_MOUSE_WHEEL: &str = "\x1b[?1000h\x1b[?1006h";
+const DISABLE_MOUSE_WHEEL: &str = "\x1b[?1006l\x1b[?1000l";
+
+fn set_mouse_wheel_reporting<W: std::io::Write>(
+    writer: &mut W,
+    enabled: bool,
+) -> std::io::Result<()> {
+    crossterm::execute!(
+        writer,
+        Print(if enabled {
+            ENABLE_MOUSE_WHEEL
+        } else {
+            DISABLE_MOUSE_WHEEL
+        })
+    )
+}
+
+fn needs_mouse_wheel_fallback(term_program: Option<&str>) -> bool {
+    term_program == Some("Apple_Terminal")
+}
+
+fn set_mouse_scroll_mode<W: std::io::Write>(
+    writer: &mut W,
+    app: &mut App,
+    enabled: bool,
+) -> std::io::Result<()> {
+    set_mouse_wheel_reporting(writer, enabled)?;
+    app.mouse_scroll_mode = enabled;
+    app.set_status(if enabled {
+        "mouse wheel enabled · F2 returns to normal selection · Fn-drag selects temporarily"
+    } else {
+        "selection mode · F2 enables mouse-wheel scrolling"
+    });
+    Ok(())
+}
+
 fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
     crossterm::execute!(writer, EnterAlternateScreen, Print(ENABLE_ALTERNATE_SCROLL))
 }
@@ -40,6 +83,7 @@ fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<(
 fn leave_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
     crossterm::execute!(
         writer,
+        Print(DISABLE_MOUSE_WHEEL),
         Print(DISABLE_ALTERNATE_SCROLL),
         LeaveAlternateScreen
     )
@@ -117,6 +161,13 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     // handles, while native OSC 8 links and normal selection remain terminal-owned.
     enter_terminal_screen(&mut stdout)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
+    // Apple Terminal exposes alternate-screen wheel translation as a profile
+    // preference and may ignore DECSET 1007. Enable the smallest reporting mode
+    // that delivers wheel buttons; F2 immediately restores normal selection.
+    if needs_mouse_wheel_fallback(std::env::var("TERM_PROGRAM").ok().as_deref()) {
+        set_mouse_scroll_mode(&mut stdout, &mut app, true)
+            .map_err(|e| ArgoError::Io(format!("enable mouse wheel: {e}")))?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
         Terminal::new(backend).map_err(|e| ArgoError::Io(format!("create terminal: {e}")))?;
@@ -186,8 +237,15 @@ async fn event_loop(
             maybe_key = keys.next() => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(key, connection, app, paths, &event_tx).await?;
+                        if key.code == KeyCode::F(2) {
+                            let enabled = !app.mouse_scroll_mode;
+                            set_mouse_scroll_mode(&mut std::io::stdout(), app, enabled)
+                                .map_err(|e| ArgoError::Io(format!("toggle mouse wheel: {e}")))?;
+                        } else {
+                            handle_key(key, connection, app, paths, &event_tx).await?;
+                        }
                     }
+                    Some(Ok(Event::Mouse(mouse))) => handle_mouse(mouse, app),
                     Some(Ok(_)) => {}
                     // Terminal closed or errored: exit rather than spin.
                     Some(Err(error)) => {
@@ -282,6 +340,24 @@ fn write_native_hyperlinks<W: std::io::Write>(
         RestorePosition
     )?;
     writer.flush()
+}
+
+/// Applies only wheel movement. Button presses are intentionally ignored: the
+/// fallback exists for scrolling, not for taking ownership of clicks or links.
+fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+    const ROWS_PER_NOTCH: i32 = 3;
+    let delta = match mouse.kind {
+        MouseEventKind::ScrollUp => -ROWS_PER_NOTCH,
+        MouseEventKind::ScrollDown => ROWS_PER_NOTCH,
+        _ => return,
+    };
+    if app.has_overlay() {
+        app.overlay_move(delta);
+    } else if delta < 0 {
+        app.scroll_up((-delta) as usize);
+    } else {
+        app.scroll_down(delta as usize);
+    }
 }
 
 /// Handles one key press.
@@ -1569,6 +1645,63 @@ mod tests {
         for tracking in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h"] {
             assert!(!output.contains(tracking), "{output:?}");
         }
+    }
+
+    #[test]
+    fn apple_terminal_uses_the_minimal_wheel_fallback() {
+        assert!(needs_mouse_wheel_fallback(Some("Apple_Terminal")));
+        assert!(!needs_mouse_wheel_fallback(Some("iTerm.app")));
+        assert!(!needs_mouse_wheel_fallback(None));
+    }
+
+    #[test]
+    fn minimal_wheel_reporting_omits_motion_tracking() {
+        let mut output = Vec::new();
+        set_mouse_wheel_reporting(&mut output, true).expect("enable wheel");
+        set_mouse_wheel_reporting(&mut output, false).expect("disable wheel");
+        let output = String::from_utf8(output).expect("terminal output");
+
+        assert!(output.contains("\x1b[?1000h"), "{output:?}");
+        assert!(output.contains("\x1b[?1006h"), "{output:?}");
+        assert!(output.contains("\x1b[?1006l"), "{output:?}");
+        assert!(output.contains("\x1b[?1000l"), "{output:?}");
+        for invasive in ["\x1b[?1002h", "\x1b[?1003h", "\x1b[?1015h"] {
+            assert!(!output.contains(invasive), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn f2_mode_switch_updates_terminal_and_app_state() {
+        let mut app = App::new("/repo");
+        let mut output = Vec::new();
+        set_mouse_scroll_mode(&mut output, &mut app, true).expect("wheel mode");
+        assert!(app.mouse_scroll_mode);
+        assert!(app.status.contains("F2 returns"));
+        set_mouse_scroll_mode(&mut output, &mut app, false).expect("selection mode");
+        assert!(!app.mouse_scroll_mode);
+        assert!(app.status.contains("selection mode"));
+    }
+
+    #[test]
+    fn mouse_wheel_moves_the_transcript_and_ignores_clicks() {
+        use crossterm::event::MouseButton;
+
+        let mut app = App::new("/repo");
+        app.set_scroll_limit(30);
+        app.scroll_up(10);
+        let event = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(event(MouseEventKind::ScrollUp), &mut app);
+        assert_eq!(app.scroll_back, 13);
+        handle_mouse(event(MouseEventKind::ScrollDown), &mut app);
+        assert_eq!(app.scroll_back, 10);
+        handle_mouse(event(MouseEventKind::Down(MouseButton::Left)), &mut app);
+        assert_eq!(app.scroll_back, 10, "clicks are not application actions");
     }
 
     #[test]

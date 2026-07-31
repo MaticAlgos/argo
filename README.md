@@ -281,13 +281,16 @@ argo tui --root /path/to/project
 - `PageUp` / `PageDown` or `Shift+↑` / `Shift+↓`: scroll the transcript by
   rendered rows; `Home` / `End` jump to the beginning/end when the composer is
   empty. Bare `↑` / `↓` also scroll an empty composer. Argo requests terminal
-  alternate-scroll mode so compatible macOS terminals translate wheel/trackpad
-  movement into those keys without capturing mouse selection.
+  alternate-scroll mode; on Apple Terminal it additionally enables minimal wheel
+  reporting because that profile setting can ignore the request.
+- `F2`: toggle between mouse-wheel mode and fully terminal-owned selection. Apple
+  Terminal starts in mouse-wheel mode; press `F2` for ordinary drag selection, or
+  hold `Fn` while dragging to bypass mouse reporting temporarily.
 - `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
 - `Cmd+click` on macOS (or your terminal's native link gesture): open a
-  displayed `http://` or `https://` link.
-- Drag normally to select and copy transcript text; Argo does not capture mouse
-  input.
+  displayed `http://` or `https://` link. If the terminal intercepts it in
+  mouse-wheel mode, press `F2` first.
+- Outside mouse-wheel mode, drag normally to select and copy transcript text.
 - `Shift+Tab`: cycle the selected adapter's supported execution modes.
 - `Esc`: dismiss an overlay, cancel a running turn, or discard a paused queue
   while idle.

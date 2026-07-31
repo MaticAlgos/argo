@@ -225,10 +225,15 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let scroll_back = app.scroll_back.min(max_scroll);
     let offset = max_scroll.saturating_sub(scroll_back);
 
-    let title = if scroll_back > 0 {
-        format!(" conversation — scrolled back {scroll_back} rows · PgDn/End ")
+    let mouse_hint = if app.mouse_scroll_mode {
+        "F2 selection"
     } else {
-        " conversation — PgUp to scroll ".to_string()
+        "F2 mouse wheel"
+    };
+    let title = if scroll_back > 0 {
+        format!(" conversation — scrolled back {scroll_back} rows · PgDn/End · {mouse_hint} ")
+    } else {
+        format!(" conversation — PgUp · {mouse_hint} ")
     };
     // Slice to the visible rows instead of passing a potentially overflowing
     // usize through Paragraph's u16 scroll offset. This also avoids asking the

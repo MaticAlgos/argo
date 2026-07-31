@@ -127,6 +127,12 @@ pub struct App {
     pub should_quit: bool,
     /// Transcript scrollback offset from the bottom.
     pub scroll_back: usize,
+    /// Whether Argo's minimal mouse-wheel fallback is active.
+    ///
+    /// Apple Terminal can ignore alternate-scroll mode according to its profile.
+    /// In fallback mode, wheel events are reported to Argo; F2 restores fully
+    /// terminal-owned mouse selection immediately.
+    pub mouse_scroll_mode: bool,
     /// Width-aware maximum rendered-row scroll, refreshed by the renderer.
     scroll_limit: std::cell::Cell<usize>,
     /// Recent inputs, newest last.
@@ -251,6 +257,7 @@ impl App {
             status: "Type a message, or /help for commands".to_string(),
             should_quit: false,
             scroll_back: 0,
+            mouse_scroll_mode: false,
             scroll_limit: std::cell::Cell::new(0),
             history: Vec::new(),
             history_cursor: None,
