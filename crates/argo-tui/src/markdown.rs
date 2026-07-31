@@ -31,6 +31,7 @@ struct MarkdownBuilder {
     current: Vec<Segment>,
     style: Style,
     style_stack: Vec<Style>,
+    destinations: Vec<String>,
     lists: Vec<ListState>,
     quote_depth: usize,
     in_code_block: bool,
@@ -44,6 +45,7 @@ impl MarkdownBuilder {
             current: Vec::new(),
             style: base,
             style_stack: Vec::new(),
+            destinations: Vec::new(),
             lists: Vec::new(),
             quote_depth: 0,
             in_code_block: false,
@@ -116,6 +118,32 @@ impl MarkdownBuilder {
     fn pop_style(&mut self) {
         if let Some(style) = self.style_stack.pop() {
             self.style = style;
+        }
+    }
+
+    fn start_destination(&mut self, destination: &str) {
+        self.destinations.push(destination.to_string());
+        self.push_style(self.style.fg(LINK).add_modifier(Modifier::UNDERLINED));
+    }
+
+    fn finish_destination(&mut self) {
+        self.pop_style();
+        let Some(destination) = self.destinations.pop() else {
+            return;
+        };
+        if destination.trim().is_empty() {
+            return;
+        }
+        let visible = self
+            .current
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        if !visible.trim_end().ends_with(&destination) {
+            self.push_styled(
+                &format!(" (↗ {destination})"),
+                self.style.fg(LINK).add_modifier(Modifier::UNDERLINED),
+            );
         }
     }
 
@@ -221,12 +249,10 @@ pub(crate) fn render(
                 Tag::Emphasis => builder.modify_style(Modifier::ITALIC),
                 Tag::Strong => builder.modify_style(Modifier::BOLD),
                 Tag::Strikethrough => builder.modify_style(Modifier::CROSSED_OUT),
-                Tag::Link { .. } => {
-                    builder.push_style(builder.style.fg(LINK).add_modifier(Modifier::UNDERLINED))
-                }
-                Tag::Image { .. } => {
+                Tag::Link { dest_url, .. } => builder.start_destination(&dest_url),
+                Tag::Image { dest_url, .. } => {
                     builder.push_styled("image: ", base.fg(QUOTE));
-                    builder.modify_style(Modifier::ITALIC);
+                    builder.start_destination(&dest_url);
                 }
                 Tag::Table(_) => builder.ensure_new_block(),
                 Tag::TableHead | Tag::TableRow => {
@@ -277,11 +303,8 @@ pub(crate) fn render(
                         builder.finish_line();
                     }
                 }
-                TagEnd::Emphasis
-                | TagEnd::Strong
-                | TagEnd::Strikethrough
-                | TagEnd::Link
-                | TagEnd::Image => builder.pop_style(),
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => builder.pop_style(),
+                TagEnd::Link | TagEnd::Image => builder.finish_destination(),
                 TagEnd::TableHead => {
                     if !builder.current.is_empty() {
                         builder.finish_line();
@@ -453,6 +476,46 @@ mod tests {
         assert!(text.contains("rust"), "{text}");
         assert!(text.contains("fn main() {}"), "{text}");
         assert!(!text.contains("```"));
+    }
+
+    #[test]
+    fn links_keep_a_visible_clickable_destination_without_duplication() {
+        let lines = render(
+            "[Report Link](https://reports.example.com/backtest/123) and [https://example.com](https://example.com)",
+            "│ ",
+            base(),
+            120,
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            text.contains("Report Link (↗ https://reports.example.com/backtest/123)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("https://example.com").count(), 1, "{text}");
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("reports.example.com")
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+    }
+
+    #[test]
+    fn long_link_destinations_wrap_without_disappearing() {
+        let destination = "https://reports.example.com/backtest/a-very-long-report-identifier";
+        let lines = render(&format!("[Report Link]({destination})"), "│ ", base(), 30);
+        let visible = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().skip(1))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(visible.contains("Report Link"));
+        assert_eq!(
+            visible.replace(' ', ""),
+            format!("ReportLink(↗{destination})")
+        );
     }
 
     #[test]
