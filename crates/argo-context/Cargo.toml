@@ -1,0 +1,12 @@
+[package]
+name = "argo-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Argo context engine: transcript flattening, delimiter safety, and cross-agent context packages."
+
+[dependencies]
+argo-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

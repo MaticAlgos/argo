@@ -1,0 +1,15 @@
+[package]
+name = "argo-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Argo domain model: identities, messages, normalized runtime events, and session policy types."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+directories = { workspace = true }

@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.argo/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+/open-design/

@@ -1,0 +1,1027 @@
+//! Rendering.
+//!
+//! One frame is: a header naming the workspace and current selection, the
+//! transcript (or an overlay), a composer, and a status line. Layout is computed
+//! from the terminal size each frame so a resize needs no special handling.
+
+use crate::app::{App, LineKind, Overlay};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line as TextLine, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::Frame;
+
+/// Most composer lines shown before it stops growing.
+const MAX_COMPOSER_LINES: usize = 8;
+
+/// Accent colour used for Argo's own chrome.
+const ACCENT: Color = Color::Rgb(94, 200, 255);
+/// Colour for Argo's own notices.
+const NOTICE: Color = Color::Rgb(255, 196, 92);
+/// Muted colour for secondary detail.
+const MUTED: Color = Color::Rgb(120, 130, 145);
+
+/// A stable colour per agent, so a multi-agent transcript is scannable.
+///
+/// Derived from the id rather than a fixed table, so a newly added adapter gets a
+/// colour without touching this function.
+fn agent_color(agent: &str) -> Color {
+    match agent {
+        "claude" => Color::Rgb(217, 138, 87),
+        "codex" => Color::Rgb(128, 208, 160),
+        "opencode" => Color::Rgb(168, 160, 255),
+        "kiro" => Color::Rgb(120, 190, 255),
+        "grok" => Color::Rgb(230, 130, 180),
+        other => {
+            // Cheap stable hash so unknown agents still differ from each other.
+            let hash = other.bytes().fold(17u32, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(byte as u32)
+            });
+            Color::Indexed(((hash % 200) + 20) as u8)
+        }
+    }
+}
+
+/// Extracts the agent name from an `agent · model · mode` header line.
+fn header_agent(text: &str) -> &str {
+    text.split('·').next().unwrap_or(text).trim()
+}
+
+/// A bordered block in Argo's style.
+fn panel(title: impl Into<String>, focused: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
+        .title(Span::styled(
+            title.into(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// Draws one frame.
+pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    // The composer grows with multi-line input, up to a cap so the transcript is
+    // never squeezed out.
+    let composer_rows = (app.input_line_count().min(MAX_COMPOSER_LINES) as u16) + 2;
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            // Header, body, composer, status.
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(composer_rows),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    draw_header(frame, areas[0], app);
+    draw_body(frame, areas[1], app);
+    draw_composer(frame, areas[2], app);
+    draw_status(frame, areas[3], app);
+
+    // Drawn last so it floats above the transcript, anchored to the composer.
+    draw_completions(frame, areas[1], areas[2], app);
+}
+
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = app
+        .conversation
+        .as_ref()
+        .and_then(|c| c.title.clone())
+        .unwrap_or_else(|| "new conversation".to_string());
+
+    let agent = app
+        .conversation
+        .as_ref()
+        .and_then(|c| c.selected_agent_id.clone())
+        .unwrap_or_else(|| "auto".to_string());
+
+    let mut spans = vec![
+        Span::styled(
+            " ARGO ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        // The active selection is the single most consulted fact on screen.
+        Span::styled(
+            format!(" {} ", app.selection_label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(agent_color(&agent))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    // Which CLIs already hold a live session here, which is what makes switching
+    // back cheap.
+    if let Some(conversation) = &app.conversation {
+        if !conversation.agents_with_sessions.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("live: ", Style::default().fg(MUTED)));
+            for (index, held) in conversation.agents_with_sessions.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" ", Style::default().fg(MUTED)));
+                }
+                spans.push(Span::styled(
+                    held.clone(),
+                    Style::default().fg(agent_color(held)),
+                ));
+            }
+        }
+    }
+
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        shorten_path(&app.workspace, 34),
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
+}
+
+fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    match &app.overlay {
+        Overlay::None => draw_transcript(frame, area, app),
+        Overlay::Picker {
+            title,
+            selected,
+            filter,
+            ..
+        } => {
+            let matches = app.picker_matches();
+            draw_picker(frame, area, title, app, &matches, *selected, filter)
+        }
+        Overlay::Text {
+            title,
+            lines,
+            scroll,
+        } => draw_text_overlay(frame, area, title, lines, *scroll),
+    }
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let height = area.height.saturating_sub(2) as usize;
+    // Minus the two border columns.
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    let mut rendered: Vec<TextLine<'_>> = Vec::new();
+    for line in &app.lines {
+        rendered.extend(render_line(line, inner_width));
+    }
+
+    if rendered.is_empty() {
+        // An empty conversation is the only place Argo can explain itself.
+        let agents: Vec<String> = app
+            .agents
+            .iter()
+            .filter(|info| info.available)
+            .map(|info| {
+                format!(
+                    "{:<10} {}",
+                    info.id,
+                    info.version.clone().unwrap_or_default()
+                )
+            })
+            .collect();
+        // `splash` returns owned lines, so they coerce into the borrowed vector.
+        rendered.extend(crate::banner::splash(
+            area.width.saturating_sub(4),
+            &app.version,
+            &agents,
+        ));
+    }
+
+    // Keep the newest content visible unless the user has scrolled back.
+    //
+    // Lines were wrapped to `inner_width` as they were built, so one entry is
+    // exactly one row on screen. Letting the widget wrap instead would make the
+    // count disagree with what is drawn, and any under-count scrolls the newest
+    // text — normally the agent's reply — off the bottom of the pane.
+    let total = rendered.len();
+    let offset = total
+        .saturating_sub(height)
+        .saturating_sub(app.scroll_back)
+        .min(total);
+
+    let title = if app.scroll_back > 0 {
+        format!(" conversation — scrolled back {} ", app.scroll_back)
+    } else {
+        " conversation ".to_string()
+    };
+    let paragraph = Paragraph::new(rendered)
+        .block(panel(title, false))
+        .scroll((offset as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// Breaks `text` into chunks no wider than `width`, preferring word boundaries.
+///
+/// Argo wraps the transcript itself rather than delegating to the widget so that a
+/// rendered entry is exactly one screen row. That keeps the scroll offset in step
+/// with what is drawn, and allows continuation rows to be indented under their
+/// prefix instead of starting flush against the border.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in text.split(' ') {
+        let word_width = word.chars().count();
+
+        // A word longer than the pane can never fit; split it rather than let it
+        // overflow and be clipped.
+        if word_width > width {
+            if current_width > 0 {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    rows.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                current = chunk;
+                current_width = current.chars().count();
+            }
+            continue;
+        }
+
+        let needed = if current_width == 0 {
+            word_width
+        } else {
+            current_width + 1 + word_width
+        };
+        if needed > width {
+            rows.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            if current_width > 0 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_width = needed;
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+/// Styles one transcript line, wrapped to `inner_width`.
+fn render_line(line: &crate::app::Line, inner_width: usize) -> Vec<TextLine<'static>> {
+    if line.kind == LineKind::Assistant {
+        let style = Style::default().fg(Color::Rgb(228, 228, 235));
+        return crate::markdown::render(&line.text, "│ ", style, inner_width);
+    }
+
+    let (prefix, style) = match line.kind {
+        LineKind::User => (
+            "▌ ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // A visible rail keeps a multi-line response distinct from tool activity and
+        // from the next user turn. Explicit colour avoids terminal themes where
+        // Color::Reset is nearly the background.
+        LineKind::Assistant => ("│ ", Style::default().fg(Color::Rgb(228, 228, 235))),
+        LineKind::Thinking => (
+            "◌ ",
+            Style::default()
+                .fg(Color::Rgb(145, 150, 170))
+                .add_modifier(Modifier::ITALIC),
+        ),
+        // Coloured by agent so a transcript spanning several CLIs is scannable.
+        LineKind::AgentHeader => (
+            "◆ ",
+            Style::default()
+                .fg(agent_color(header_agent(&line.text)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        LineKind::Activity => ("  ", Style::default().fg(MUTED)),
+        LineKind::Notice => ("  ", Style::default().fg(NOTICE)),
+        LineKind::Error => ("  ", Style::default().fg(Color::Rgb(255, 110, 110))),
+    };
+
+    let mut out: Vec<TextLine<'static>> = Vec::new();
+    // A blank row above each turn header; without it a reply and the next prompt
+    // run together into one block that is hard to read.
+    if line.kind == LineKind::AgentHeader {
+        out.push(TextLine::from(""));
+    }
+
+    // Continuation rows line up under the text, not under the marker.
+    let indent: String = " ".repeat(prefix.chars().count());
+    let text_width = inner_width.saturating_sub(prefix.chars().count());
+
+    // Embedded newlines are hard breaks and are preserved.
+    for paragraph in line.text.split('\n') {
+        for (index, row) in wrap_words(paragraph, text_width).into_iter().enumerate() {
+            let marker = if index == 0 {
+                prefix.to_string()
+            } else {
+                indent.clone()
+            };
+            out.push(TextLine::from(vec![
+                Span::styled(marker, style),
+                Span::styled(row, style),
+            ]));
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    app: &App,
+    matches: &[usize],
+    selected: usize,
+    filter: &str,
+) {
+    frame.render_widget(Clear, area);
+
+    let all_items = match &app.overlay {
+        Overlay::Picker { items, .. } => items.as_slice(),
+        _ => &[],
+    };
+
+    // Only the visible window is built: a provider list can be several hundred
+    // rows, and rendering all of them every frame is wasted work.
+    let height = area.height.saturating_sub(2) as usize;
+    let first = selected.saturating_sub(height.saturating_sub(1).min(selected));
+
+    let rows: Vec<ListItem<'_>> = matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height.max(1))
+        .map(|(position, item_index)| {
+            let label = all_items
+                .get(*item_index)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let style = if position == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(TextLine::from(Span::styled(format!(" {label} "), style)))
+        })
+        .collect();
+
+    let rows = if rows.is_empty() {
+        vec![ListItem::new(TextLine::from(Span::styled(
+            " no match — keep typing or Esc to cancel ",
+            Style::default().fg(Color::Yellow),
+        )))]
+    } else {
+        rows
+    };
+
+    let heading = if filter.is_empty() {
+        format!(
+            " {title} — {} items · type to filter, Enter, Esc ",
+            matches.len()
+        )
+    } else {
+        format!(
+            " {title} — filter '{filter}' · {} of {} ",
+            matches.len(),
+            all_items.len()
+        )
+    };
+
+    frame.render_widget(List::new(rows).block(panel(heading, true)), area);
+}
+
+/// Floats live command suggestions just above the composer.
+fn draw_completions(frame: &mut Frame<'_>, body: Rect, composer: Rect, app: &App) {
+    if app.completions.is_empty() || app.has_overlay() {
+        return;
+    }
+
+    let rows = app.completions.len().min(8) as u16;
+    let width = 48u16.min(body.width);
+    let height = rows + 2;
+    if body.height < height {
+        return;
+    }
+
+    // Anchored to the composer's top edge so it reads as part of the input.
+    let area = Rect {
+        x: composer.x,
+        y: composer.y.saturating_sub(height),
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    // Scroll the window so the highlighted entry stays visible in a long list.
+    let visible = 8usize;
+    let first = app
+        .completion_index
+        .saturating_sub(visible.saturating_sub(1));
+
+    let items: Vec<ListItem<'_>> = app
+        .completions
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .map(|(index, name)| {
+            let selected = index == app.completion_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ACCENT)
+            };
+            let marker = if selected { "›" } else { " " };
+            ListItem::new(TextLine::from(Span::styled(
+                format!("{marker} {name} "),
+                style,
+            )))
+        })
+        .collect();
+
+    frame.render_widget(
+        List::new(items).block(panel(
+            " ↑↓ pick · Tab complete · Enter run · Esc dismiss ",
+            true,
+        )),
+        area,
+    );
+}
+
+fn draw_text_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: usize,
+) {
+    frame.render_widget(Clear, area);
+    let body: Vec<TextLine<'_>> = lines
+        .iter()
+        .map(|line| TextLine::from(line.as_str()))
+        .collect();
+    let paragraph = Paragraph::new(body)
+        .block(panel(format!(" {title} — ↑↓ scroll · Esc close "), true))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let hint = match app.activity_indicator() {
+        Some(indicator) => format!(" {indicator} — Esc cancels "),
+        None => " message — / for commands ".to_string(),
+    };
+
+    let paragraph = Paragraph::new(app.input.as_str())
+        .block(panel(hint, !app.is_busy()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    // Place the real terminal caret so editing feels native. Rows come from
+    // newlines, not from dividing the caret index, which breaks on multi-line input.
+    if !app.has_overlay() {
+        let inner_width = area.width.saturating_sub(2).max(1) as usize;
+        let (row, column) = app.caret_row_column();
+        // Account for wrapping within the caret's own line.
+        let wrapped_row = row + column / inner_width;
+        let wrapped_column = column % inner_width;
+        let max_row = area.height.saturating_sub(3) as usize;
+        frame.set_cursor_position((
+            area.x + 1 + wrapped_column as u16,
+            area.y + 1 + wrapped_row.min(max_row) as u16,
+        ));
+    }
+}
+
+/// Text of the standing authority warning.
+const AUTHORITY_WARNING: &str = " unrestricted mode ";
+
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // The warning is reserved its own cell: a long status line must never be able
+    // to push a standing authority grant off screen.
+    let warning_width = (AUTHORITY_WARNING.chars().count() as u16).min(area.width);
+    let cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(warning_width)])
+        .split(area);
+    let (info_area, warning_area) = (cells[0], cells[1]);
+
+    frame.render_widget(
+        Paragraph::new(TextLine::from(Span::styled(
+            AUTHORITY_WARNING,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(200, 80, 80))
+                .add_modifier(Modifier::BOLD),
+        ))),
+        warning_area,
+    );
+    let agent = app
+        .conversation
+        .as_ref()
+        .and_then(|c| c.selected_agent_id.clone())
+        .unwrap_or_else(|| "auto".to_string());
+    let model = app
+        .conversation
+        .as_ref()
+        .and_then(|c| c.selected_model.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    let mut spans = vec![
+        // The active target, which is the fact a user checks most often.
+        Span::styled(
+            format!(" {agent} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(agent_color(&agent))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {model} "), Style::default().fg(ACCENT)),
+    ];
+
+    if let Some(effort) = app.effort_label() {
+        spans.push(Span::styled(
+            format!("· {effort} "),
+            Style::default().fg(NOTICE),
+        ));
+    }
+
+    spans.push(Span::styled("│", Style::default().fg(MUTED)));
+    spans.push(Span::styled(
+        format!(" {} ", app.context_label()),
+        Style::default().fg(MUTED),
+    ));
+
+    if let Some(usage) = &app.last_usage {
+        if let (Some(input), Some(output)) = (usage.input, usage.output) {
+            spans.push(Span::styled(
+                format!("· last {input}→{output} "),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+
+    if app.queue_depth() > 0 {
+        spans.push(Span::styled(
+            format!("· {} queued ", app.queue_depth()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(NOTICE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    spans.extend([
+        Span::styled("│", Style::default().fg(MUTED)),
+        Span::styled(format!(" {} ", app.status), Style::default().fg(MUTED)),
+    ]);
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), info_area);
+}
+
+/// Shortens a path from the left so the tail stays readable.
+pub fn shorten_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(max.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn wrapping_prefers_word_boundaries() {
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_words("", 10), vec![""]);
+        // A zero-width pane must not loop or panic.
+        assert_eq!(wrap_words("text", 0), vec!["text"]);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_pane_is_split_rather_than_clipped() {
+        // A long path or URL would otherwise vanish past the border.
+        let rows = wrap_words("/very/long/path/that/exceeds/the/pane", 10);
+        assert!(rows.iter().all(|r| r.chars().count() <= 10), "{rows:?}");
+        assert_eq!(rows.concat(), "/very/long/path/that/exceeds/the/pane");
+    }
+
+    #[test]
+    fn no_wrapped_row_exceeds_the_pane_width() {
+        let rows = wrap_words(&"word ".repeat(40), 12);
+        assert!(rows.iter().all(|r| r.chars().count() <= 12), "{rows:?}");
+    }
+
+    #[test]
+    fn a_long_agent_reply_stays_visible_without_scrolling() {
+        // The bug: the offset was computed from logical line count, so one long
+        // paragraph counted as a single row and pushed itself off the bottom.
+        let mut app = App::new("/repo");
+        app.push(LineKind::User, "summarise the repo".to_string());
+        app.push(
+            LineKind::Assistant,
+            "filler words to force wrapping ".repeat(12) + "END_MARKER",
+        );
+        let out = render(&app, 40, 14);
+        assert!(
+            out.contains("END_MARKER"),
+            "the end of a wrapped reply must remain on screen:\n{out}"
+        );
+    }
+
+    #[test]
+    fn markdown_styles_reach_terminal_cells_without_changing_canonical_text() {
+        let source = "# HMARK\n\n**BMARK** and *IMARK* with `CMARK`\n\n- first\n- second";
+        let mut app = App::new("/repo");
+        app.push(LineKind::Assistant, source);
+
+        let backend = TestBackend::new(70, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let cells = buffer.content();
+        let output = cells
+            .chunks(70)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(output.contains("HMARK"), "{output}");
+        assert!(output.contains("• first"), "{output}");
+        assert!(!output.contains("# HMARK"), "{output}");
+        assert!(!output.contains("**BMARK**"), "{output}");
+        assert!(cells
+            .iter()
+            .any(|cell| { cell.symbol() == "B" && cell.modifier.contains(Modifier::BOLD) }));
+        assert!(cells
+            .iter()
+            .any(|cell| { cell.symbol() == "I" && cell.modifier.contains(Modifier::ITALIC) }));
+        assert!(cells
+            .iter()
+            .any(|cell| { cell.symbol() == "C" && cell.bg == Color::Rgb(38, 43, 52) }));
+        assert_eq!(app.lines.last().expect("assistant").text, source);
+    }
+
+    #[test]
+    fn a_long_markdown_response_keeps_its_formatted_tail_visible() {
+        let mut app = App::new("/repo");
+        app.push(
+            LineKind::Assistant,
+            format!(
+                "# Result\n\n{}\n\n## Choices\n\n1. **Keep current design**\n2. Select `TAIL_MARKER`",
+                "Markdown paragraph content that wraps safely. ".repeat(12)
+            ),
+        );
+        let output = render(&app, 48, 16);
+        assert!(output.contains("Choices"), "{output}");
+        assert!(output.contains("TAIL_MARKER"), "{output}");
+        assert!(!output.contains("**"), "{output}");
+    }
+
+    #[test]
+    fn command_code_choice_picker_keeps_long_response_options_visible() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::User, "available data for nifty using volrix mcp?");
+        app.push(
+            LineKind::Assistant,
+            format!(
+                "{}\n\nA few options to move forward — which do you want?\n\n1. Invoke it yourself\n2. **Re-authenticate** the MCP server\n3. Use curl directly",
+                "Introductory Command Code response text that wraps. ".repeat(10)
+            ),
+        );
+        assert!(app.open_latest_response_options());
+        let out = render(&app, 62, 16);
+        assert!(out.contains("choose a response"), "{out}");
+        assert!(out.contains("Re-authenticate"), "{out}");
+        assert!(out.contains("Use curl directly"), "{out}");
+    }
+    use super::*;
+
+    #[test]
+    fn reasoning_tools_files_and_answer_are_visually_distinct_and_visible() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::Thinking, "checking the repository".to_string());
+        app.push(
+            LineKind::Activity,
+            "↳ calling shell — cargo test".to_string(),
+        );
+        app.push(LineKind::Activity, "✎ wrote src/main.rs".to_string());
+        app.push(LineKind::Assistant, "ANSWER_MARKER finished".to_string());
+
+        let out = render(&app, 62, 15);
+        assert!(out.contains("◌ checking the repository"), "{out}");
+        assert!(out.contains("calling shell"), "{out}");
+        assert!(out.contains("wrote src/main.rs"), "{out}");
+        assert!(out.contains("│ ANSWER_MARKER finished"), "{out}");
+    }
+    use crate::app::LineKind;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn each_agent_gets_a_distinct_colour() {
+        // A transcript spanning several CLIs is only scannable if they differ.
+        let claude = agent_color("claude");
+        let codex = agent_color("codex");
+        let opencode = agent_color("opencode");
+        assert_ne!(claude, codex);
+        assert_ne!(codex, opencode);
+        // Unknown adapters still get a stable colour rather than a default.
+        assert_eq!(agent_color("future-cli"), agent_color("future-cli"));
+    }
+
+    #[test]
+    fn the_agent_is_extracted_from_a_header_line() {
+        assert_eq!(header_agent("codex · default · resumed session"), "codex");
+        assert_eq!(header_agent("claude"), "claude");
+    }
+
+    #[test]
+    fn live_sessions_are_shown_in_the_header() {
+        let mut app = App::new("/repo");
+        app.conversation = Some(argo_daemon::protocol::ConversationSummary {
+            id: argo_core::ids::ConversationId::new("c1"),
+            title: Some("demo".into()),
+            selected_agent_id: Some("codex".into()),
+            selected_model: None,
+            selected_reasoning: None,
+            selected_mode: None,
+            message_count: 4,
+            agents_with_sessions: vec!["claude".into(), "codex".into()],
+            parent_conversation_id: None,
+            updated_at: 0,
+        });
+        let output = render(&app, 100, 12);
+        assert!(output.contains("live:"));
+        assert!(output.contains("ARGO"));
+    }
+
+    #[test]
+    fn scrollback_is_indicated_in_the_transcript_title() {
+        let mut app = App::new("/repo");
+        for i in 0..40 {
+            app.push(LineKind::Assistant, format!("line {i}"));
+        }
+        app.scroll_up(5);
+        assert!(render(&app, 70, 14).contains("scrolled back 5"));
+    }
+
+    #[test]
+    fn paths_are_shortened_from_the_left() {
+        assert_eq!(shorten_path("/short", 40), "/short");
+        let long = "/Users/someone/very/deep/nested/project/path/here";
+        let short = shorten_path(long, 20);
+        assert!(short.starts_with('…'));
+        assert!(short.ends_with("here"), "the tail is the useful part");
+        assert_eq!(short.chars().count(), 20);
+    }
+
+    #[test]
+    fn an_empty_conversation_shows_guidance() {
+        let app = App::new("/repo");
+        let output = render(&app, 80, 20);
+        assert!(output.contains("ARGO"));
+        assert!(output.contains("/help"));
+        // The authority warning is always visible.
+        assert!(output.contains("unrestricted mode"));
+    }
+
+    #[test]
+    fn transcript_lines_are_rendered() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::User, "add a health endpoint");
+        app.push(LineKind::AgentHeader, "claude · haiku · resumed session");
+        app.push(LineKind::Assistant, "Added /health.");
+        let output = render(&app, 80, 20);
+        assert!(output.contains("add a health endpoint"));
+        assert!(output.contains("claude"));
+        assert!(output.contains("Added /health."));
+    }
+
+    #[test]
+    fn multiline_assistant_text_is_split_into_rows() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::Assistant, "first\nsecond\nthird");
+        let output = render(&app, 40, 20);
+        assert!(output.contains("first"));
+        assert!(output.contains("second"));
+        assert!(output.contains("third"));
+    }
+
+    #[test]
+    fn a_picker_replaces_the_transcript() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::Assistant, "hidden behind the overlay");
+        app.open_picker(
+            "Agent",
+            vec!["claude".into(), "codex".into()],
+            vec!["claude".into(), "codex".into()],
+            crate::app::PickerAction::Agent,
+        );
+        let output = render(&app, 80, 20);
+        assert!(output.contains("Agent"));
+        assert!(output.contains("codex"));
+        assert!(output.contains("type to filter"));
+        assert!(!output.contains("hidden behind the overlay"));
+    }
+
+    #[test]
+    fn typing_a_slash_floats_a_suggestion_list() {
+        let mut app = App::new("/repo");
+        app.insert('/');
+        app.insert('m');
+        let output = render(&app, 60, 16);
+        assert!(output.contains("/model"));
+        assert!(output.contains("Enter run"));
+    }
+
+    #[test]
+    fn the_highlighted_suggestion_is_marked() {
+        let mut app = App::new("/repo");
+        app.insert('/');
+        app.insert('a');
+        app.completion_move(1);
+        let output = render(&app, 70, 16);
+        assert!(output.contains("↑↓ pick"));
+        // The marker sits on the highlighted row.
+        let marked: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains('›') && line.contains("/agents"))
+            .collect();
+        assert!(!marked.is_empty(), "highlighted entry must be marked");
+    }
+
+    #[test]
+    fn a_multiline_composer_renders_every_line() {
+        let mut app = App::new("/repo");
+        for ch in "first line".chars() {
+            app.insert(ch);
+        }
+        app.insert_newline();
+        for ch in "second line".chars() {
+            app.insert(ch);
+        }
+        let output = render(&app, 60, 16);
+        assert!(output.contains("first line"));
+        assert!(output.contains("second line"));
+    }
+
+    #[test]
+    fn suggestions_are_hidden_behind_an_overlay() {
+        let mut app = App::new("/repo");
+        app.insert('/');
+        app.open_text("commands", vec!["something".into()]);
+        let output = render(&app, 60, 16);
+        assert!(!output.contains("Tab to accept"));
+    }
+
+    #[test]
+    fn a_filtered_picker_shows_the_match_count() {
+        let mut app = App::new("/repo");
+        let items: Vec<String> = (0..300).map(|i| format!("provider/model-{i}")).collect();
+        app.open_picker(
+            "model",
+            items.clone(),
+            items,
+            crate::app::PickerAction::Model,
+        );
+        for ch in "model-29".chars() {
+            app.picker_filter_push(ch);
+        }
+        let output = render(&app, 70, 20);
+        assert!(output.contains("filter 'model-29'"));
+        assert!(output.contains("model-29"));
+    }
+
+    #[test]
+    fn a_picker_filter_matching_nothing_says_so() {
+        let mut app = App::new("/repo");
+        let items: Vec<String> = vec!["alpha".into()];
+        app.open_picker(
+            "model",
+            items.clone(),
+            items,
+            crate::app::PickerAction::Model,
+        );
+        for ch in "zzz".chars() {
+            app.picker_filter_push(ch);
+        }
+        assert!(render(&app, 60, 12).contains("no match"));
+    }
+
+    #[test]
+    fn a_large_picker_renders_without_panicking() {
+        // Only the visible window should be built.
+        let mut app = App::new("/repo");
+        let items: Vec<String> = (0..475).map(|i| format!("provider/model-{i}")).collect();
+        app.open_picker(
+            "model",
+            items.clone(),
+            items,
+            crate::app::PickerAction::Model,
+        );
+        app.overlay_move(400);
+        assert!(!render(&app, 80, 20).is_empty());
+    }
+
+    #[test]
+    fn the_composer_shows_a_running_state() {
+        let mut app = App::new("/repo");
+        assert!(render(&app, 60, 12).contains("message"));
+        app.begin_run(
+            argo_core::ids::RunId::new("r1"),
+            "claude",
+            Some("haiku"),
+            false,
+        );
+        assert!(render(&app, 60, 12).contains("Esc cancels"));
+        assert!(render(&app, 60, 12).contains("starting"));
+    }
+
+    #[test]
+    fn rendering_survives_a_very_narrow_terminal() {
+        // Layout arithmetic must not panic when there is almost no room.
+        let mut app = App::new("/a/very/long/workspace/path/that/will/not/fit");
+        app.push(LineKind::Assistant, "some text that must wrap somewhere");
+        let output = render(&app, 20, 10);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn rendering_survives_a_tiny_terminal() {
+        let app = App::new("/repo");
+        let output = render(&app, 10, 8);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn selection_is_shown_in_the_header() {
+        let mut app = App::new("/repo");
+        app.conversation = Some(argo_daemon::protocol::ConversationSummary {
+            id: argo_core::ids::ConversationId::new("c1"),
+            title: Some("switching demo".into()),
+            selected_agent_id: Some("codex".into()),
+            selected_model: Some("gpt-5.6".into()),
+            selected_reasoning: None,
+            selected_mode: None,
+            message_count: 2,
+            agents_with_sessions: vec!["claude".into()],
+            parent_conversation_id: None,
+            updated_at: 0,
+        });
+        let output = render(&app, 90, 12);
+        assert!(output.contains("switching demo"));
+        assert!(output.contains("codex/gpt-5.6"));
+    }
+}

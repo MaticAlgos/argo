@@ -1,0 +1,18 @@
+[package]
+name = "argo-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Argo canonical SQLite store: conversations, messages, runs, events, and native session handles."
+
+[dependencies]
+argo-core = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+argo-context = { workspace = true }
+tempfile = { workspace = true }

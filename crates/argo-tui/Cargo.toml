@@ -1,0 +1,21 @@
+[package]
+name = "argo-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Argo interactive terminal UI with slash-command configuration."
+
+[dependencies]
+argo-core = { workspace = true }
+argo-daemon = { workspace = true }
+argo-runtime = { workspace = true }
+argo-resources = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
