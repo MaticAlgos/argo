@@ -148,6 +148,9 @@ pub struct App {
     completion_touched: bool,
     /// Tokens the last turn reported, when the CLI reported any.
     pub last_usage: Option<argo_core::event::TokenUsage>,
+    /// Agent/model attribution for the last completed turn, including turns that
+    /// omitted token data.
+    pub last_usage_source: Option<String>,
     /// Running estimate of tokens the conversation would replay.
     pub context_tokens: usize,
     /// Argo build version, shown on the splash.
@@ -250,6 +253,7 @@ impl App {
             completion_index: 0,
             completion_touched: false,
             last_usage: None,
+            last_usage_source: None,
             context_tokens: 0,
             version: env!("CARGO_PKG_VERSION").to_string(),
             queued: std::collections::VecDeque::new(),
@@ -728,9 +732,13 @@ impl App {
                 self.streaming.clear();
                 self.thinking_streaming.clear();
                 self.active_tools.clear();
-                if !usage.is_empty() {
-                    self.last_usage = Some(usage);
-                }
+                self.last_usage_source = self
+                    .lines
+                    .iter()
+                    .rev()
+                    .find(|line| line.kind == LineKind::AgentHeader)
+                    .map(|line| line.text.split(" · ").take(2).collect::<Vec<_>>().join("/"));
+                self.last_usage = (!usage.is_empty()).then_some(usage);
                 self.recompute_context();
                 let mut note = match status {
                     RunStatus::Succeeded => "done".to_string(),
@@ -1037,6 +1045,81 @@ impl App {
         format!("{agent}/{model}")
     }
 
+    /// Exact last-turn token accounting reported by the selected CLI stream.
+    pub fn usage_report(&self) -> Vec<String> {
+        let source = self
+            .last_usage_source
+            .as_deref()
+            .unwrap_or("no completed turn");
+        let mut lines = vec![format!("Last completed turn: {source}")];
+        match self.last_usage {
+            Some(usage) => {
+                lines.push(format!("input:       {}", token_count(usage.input)));
+                lines.push(format!("output:      {}", token_count(usage.output)));
+                lines.push(format!("cached input: {}", token_count(usage.cached_input)));
+                lines.push(format!("reasoning:   {}", token_count(usage.reasoning)));
+                lines.push(String::new());
+                lines.push("Exact values reported by that CLI's turn stream.".into());
+                lines.push(
+                    "An unavailable field was not reported; Argo does not estimate it.".into(),
+                );
+            }
+            None => {
+                lines.push("No exact token counts were reported for that turn.".into());
+                lines.push("Plain-output adapters such as Grok cannot expose token usage.".into());
+            }
+        }
+        lines.push(String::new());
+        lines.push("Account quota, credits, and billing are unavailable: installed CLIs do not expose them non-interactively.".into());
+        lines.push(
+            "OpenCode users can also run `opencode stats` for its CLI-local aggregate.".into(),
+        );
+        lines
+    }
+
+    /// Current Argo session state; this deliberately avoids invented provider
+    /// billing or quota information.
+    pub fn status_report(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(conversation) = &self.conversation {
+            let title = conversation
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("(untitled)");
+            lines.push(format!("Conversation: {title} ({})", conversation.id));
+        } else {
+            lines.push("Conversation: none".into());
+        }
+        lines.push(format!("Selection: {}", self.selection_label()));
+        lines.push(format!("Mode: {}", self.mode().label()));
+        lines.push(format!("Context: {} (estimated)", self.context_label()));
+        let state = if self.is_busy() {
+            self.activity.label()
+        } else if self.retry_prompt.is_some() {
+            "paused — Enter retries"
+        } else {
+            "idle"
+        };
+        lines.push(format!("Run state: {state}"));
+        lines.push(format!("Queued follow-ups: {}", self.queue_depth()));
+        if let Some(source) = &self.last_usage_source {
+            lines.push(format!(
+                "Last usage source: {source} ({})",
+                if self.last_usage.is_some() {
+                    "exact stream values available"
+                } else {
+                    "CLI reported no token counts"
+                }
+            ));
+        }
+        lines.push(String::new());
+        lines.push(
+            "Provider account quota/status is not exposed by the installed CLI interfaces.".into(),
+        );
+        lines
+    }
+
     /// Rebuilds canonical history using the same visual vocabulary as live events.
     pub fn replace_transcript(&mut self, messages: Vec<MessageView>) {
         self.lines.clear();
@@ -1189,6 +1272,21 @@ impl App {
     pub fn conversation_at(&self, index: usize) -> Option<ConversationId> {
         self.conversations.get(index).map(|c| c.id.clone())
     }
+}
+
+fn token_count(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "unavailable".into();
+    };
+    let digits = value.to_string();
+    let mut rendered = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            rendered.push(',');
+        }
+        rendered.push(ch);
+    }
+    rendered
 }
 
 /// Makes tool arguments/results readable in one bounded transcript row.
@@ -2232,17 +2330,54 @@ mod tests {
     #[test]
     fn usage_from_a_finished_turn_is_retained() {
         let mut app = new_app();
-        app.begin_run(RunId::new("r1"), "codex", None, false);
+        app.begin_run(RunId::new("r1"), "codex", Some("gpt-5"), false);
         app.apply_event(RunEventKind::RunFinished {
             status: RunStatus::Succeeded,
             usage: TokenUsage {
                 input: Some(2_000),
                 output: Some(50),
-                ..Default::default()
+                cached_input: Some(1_500),
+                reasoning: None,
             },
         });
         let usage = app.last_usage.expect("usage");
         assert_eq!(usage.input, Some(2_000));
+        let report = app.usage_report().join("\n");
+        assert!(report.contains("codex/gpt-5"), "{report}");
+        assert!(report.contains("2,000"), "{report}");
+        assert!(report.contains("reasoning:   unavailable"), "{report}");
+        assert!(report.contains("do not expose them"), "{report}");
+    }
+
+    #[test]
+    fn a_turn_without_usage_clears_stale_counts_and_says_so() {
+        let mut app = new_app();
+        app.last_usage = Some(TokenUsage {
+            input: Some(999),
+            ..Default::default()
+        });
+        app.begin_run(RunId::new("r1"), "grok", None, false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage::default(),
+        });
+
+        assert!(app.last_usage.is_none());
+        let report = app.usage_report().join("\n");
+        assert!(report.contains("grok/default"), "{report}");
+        assert!(report.contains("No exact token counts"), "{report}");
+    }
+
+    #[test]
+    fn status_report_uses_current_argo_state_without_claiming_provider_quota() {
+        let mut app = new_app();
+        app.conversation = Some(summary(Some("network retry"), 4, &["codex"], Some("gpt-5")));
+        app.enqueue("follow-up".into());
+        let report = app.status_report().join("\n");
+        assert!(report.contains("network retry"), "{report}");
+        assert!(report.contains("codex/gpt-5"), "{report}");
+        assert!(report.contains("Queued follow-ups: 1"), "{report}");
+        assert!(report.contains("not exposed"), "{report}");
     }
 
     #[test]

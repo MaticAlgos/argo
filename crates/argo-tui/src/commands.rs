@@ -21,6 +21,10 @@ pub enum Command {
     Effort(Option<String>),
     /// Set or cycle the execution mode.
     Mode(Option<String>),
+    /// Show exact token usage reported for the last completed turn.
+    Usage,
+    /// Show current Argo conversation/run state.
+    Status,
     /// Show the detected agent inventory.
     Agents,
     /// List discovered skills.
@@ -105,6 +109,8 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "model" => Ok(Command::Model(argument)),
         "effort" | "reasoning" => Ok(Command::Effort(argument)),
         "mode" | "plan" => Ok(Command::Mode(argument)),
+        "usage" => Ok(Command::Usage),
+        "status" => Ok(Command::Status),
         "agents" => Ok(Command::Agents),
         "skills" => Ok(Command::Skills),
         "mcp" => Ok(Command::Mcp),
@@ -146,6 +152,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/model",
     "/effort",
     "/mode",
+    "/usage",
+    "/status",
     "/agents",
     "/skills",
     "/mcp",
@@ -216,6 +224,14 @@ pub fn help() -> Vec<HelpEntry> {
         HelpEntry {
             usage: "/mode [id]",
             detail: "switch execution mode (Shift+Tab cycles): full, plan, accept-edits",
+        },
+        HelpEntry {
+            usage: "/usage",
+            detail: "show exact token counts reported by the last CLI turn",
+        },
+        HelpEntry {
+            usage: "/status",
+            detail: "show current conversation, selection, context, run, and queue state",
         },
         HelpEntry {
             usage: "/agents",

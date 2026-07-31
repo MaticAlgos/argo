@@ -257,6 +257,8 @@ argo tui --root /path/to/project
 | `/model [id]` | Filter/pick or directly select a model |
 | `/effort [level]` | Set model-specific reasoning effort |
 | `/mode [id]` | Set execution mode; `Shift+Tab` cycles supported modes |
+| `/usage` | Show exact token counts reported by the last CLI turn; missing fields stay unavailable |
+| `/status` | Show current Argo conversation, selection, context, run, and queue state |
 | `/agents` | Show detected CLIs, versions, and limitations |
 | `/skills` | List shared skills discovered for this workspace |
 | `/mcp` | List configured MCP servers |

@@ -728,6 +728,16 @@ async fn run_command(
             set_mode(connection, app, Some(requested)).await?;
         }
 
+        Command::Usage => {
+            let lines = app.usage_report();
+            app.open_text("exact CLI usage", lines);
+        }
+
+        Command::Status => {
+            let lines = app.status_report();
+            app.open_text("Argo status", lines);
+        }
+
         Command::Agents => {
             let mut lines = Vec::new();
             for info in &app.agents {
