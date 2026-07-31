@@ -280,8 +280,9 @@ argo tui --root /path/to/project
 - `Shift+Enter` or `Ctrl+J`: insert a newline.
 - `PageUp` / `PageDown` or `Shift+↑` / `Shift+↓`: scroll the transcript by
   rendered rows; `Home` / `End` jump to the beginning/end when the composer is
-  empty. Bare `↑` / `↓` also scroll an empty composer, including terminals that
-  translate the wheel into arrow keys on the alternate screen.
+  empty. Bare `↑` / `↓` also scroll an empty composer. Argo requests terminal
+  alternate-scroll mode so compatible macOS terminals translate wheel/trackpad
+  movement into those keys without capturing mouse selection.
 - `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
 - `Cmd+click` on macOS (or your terminal's native link gesture): open a
   displayed `http://` or `https://` link.

@@ -27,10 +27,28 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+/// Ask compatible terminals to translate wheel motion to Up/Down while the
+/// alternate screen is active. Unlike mouse tracking (1000/1002/1003), DEC 1007
+/// leaves clicks and drags owned by the terminal, so ordinary selection survives.
+const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
+const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
+
+fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
+    crossterm::execute!(writer, EnterAlternateScreen, Print(ENABLE_ALTERNATE_SCROLL))
+}
+
+fn leave_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
+    crossterm::execute!(
+        writer,
+        Print(DISABLE_ALTERNATE_SCROLL),
+        LeaveAlternateScreen
+    )
+}
+
 /// Restores the terminal, tolerating already-restored state.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = leave_terminal_screen(&mut std::io::stdout());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
 }
 
@@ -94,9 +112,10 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     enable_raw_mode().map_err(|e| ArgoError::Io(format!("enable raw mode: {e}")))?;
     let mut stdout = std::io::stdout();
     // Mouse capture prevents ordinary drag selection and cannot reliably report
-    // the macOS Command modifier. Native OSC 8 links leave both gestures to the
-    // terminal instead.
-    crossterm::execute!(stdout, EnterAlternateScreen)
+    // the macOS Command modifier. DEC alternate-scroll mode instead asks the
+    // terminal to translate wheel movement into the Up/Down keys Argo already
+    // handles, while native OSC 8 links and normal selection remain terminal-owned.
+    enter_terminal_screen(&mut stdout)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
@@ -1535,6 +1554,21 @@ mod tests {
         assert!(should_drain_queue(RunStatus::Cancelled));
         assert!(!should_drain_queue(RunStatus::Running));
         assert!(!should_drain_queue(RunStatus::Pending));
+    }
+
+    #[test]
+    fn alternate_scroll_mode_translates_wheel_without_mouse_capture() {
+        let mut output = Vec::new();
+        enter_terminal_screen(&mut output).expect("enter screen");
+        leave_terminal_screen(&mut output).expect("leave screen");
+
+        let output = String::from_utf8(output).expect("terminal output");
+        assert!(output.contains(ENABLE_ALTERNATE_SCROLL), "{output:?}");
+        assert!(output.contains(DISABLE_ALTERNATE_SCROLL), "{output:?}");
+        // Mouse tracking modes would steal ordinary click/drag selection.
+        for tracking in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h"] {
+            assert!(!output.contains(tracking), "{output:?}");
+        }
     }
 
     #[test]
