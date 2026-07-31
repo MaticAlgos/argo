@@ -356,8 +356,8 @@ mod tests {
     #[test]
     fn workspace_path_maps_to_command_code_project_slug() {
         assert_eq!(
-            workspace_slug("/Users/matic/WORK/agentmux"),
-            "users-matic-work-agentmux"
+            workspace_slug("/Users/developer/projects/argo"),
+            "users-developer-projects-argo"
         );
     }
 

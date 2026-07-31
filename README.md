@@ -19,6 +19,28 @@ $ argo
 one conversation · many coding CLIs
 ```
 
+## Quick install
+
+Argo currently supports macOS and Linux and builds from source with Rust 1.82 or
+newer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | bash
+```
+
+The installer uses no `sudo`, performs a locked release build, and installs to
+`~/.local/bin/argo`. To inspect the script first, pin a version, choose another
+install directory, update, uninstall, or install from a private repository, see
+the **[complete installation guide](docs/installation.md)**.
+
+After installation:
+
+```bash
+cd your-project
+argo doctor
+argo
+```
+
 ## Why Argo
 
 Every coding CLI keeps its own session store. Switching tools normally means
@@ -195,6 +217,10 @@ Adding an adapter is a declarative file under
 needed only when a CLI introduces a wire format Argo does not already support.
 
 ## Installation
+
+For prerequisites, inspect-first installation, version pinning, updates,
+uninstallation, private-repository access, and troubleshooting, see the
+**[complete installation guide](docs/installation.md)**.
 
 Argo requires Rust 1.82 or newer and currently targets Unix-style environments
 (macOS and Linux).
