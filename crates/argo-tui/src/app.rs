@@ -138,6 +138,8 @@ pub struct App {
     history: Vec<String>,
     /// Position while browsing history.
     history_cursor: Option<usize>,
+    /// Whether the composer contains a multiline bracketed-paste payload.
+    multiline_paste: bool,
     /// Assistant text accumulated for the streaming turn.
     streaming: String,
     /// Reasoning text accumulated for the streaming turn.
@@ -266,6 +268,7 @@ impl App {
             scroll_limit: std::cell::Cell::new(0),
             history: Vec::new(),
             history_cursor: None,
+            multiline_paste: false,
             streaming: String::new(),
             thinking_streaming: String::new(),
             active_tools: std::collections::HashMap::new(),
@@ -494,6 +497,20 @@ impl App {
         self.insert('\n');
     }
 
+    /// Inserts pasted text atomically as a single multiline block.
+    ///
+    /// Bracketed paste delivers the entire clipboard in one event. Line endings
+    /// are normalized to `\n` to match the internal composer representation.
+    pub fn paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let index = self.byte_index(self.cursor);
+        self.input.insert_str(index, &normalized);
+        self.cursor += normalized.chars().count();
+        self.history_cursor = None;
+        self.multiline_paste |= normalized.contains('\n');
+        self.refresh_completions();
+    }
+
     /// Caret position as (row, column) within the composer.
     ///
     /// Computed from newlines rather than by dividing the caret index, which is
@@ -517,7 +534,12 @@ impl App {
 
     /// Number of lines the composer currently holds.
     pub fn input_line_count(&self) -> usize {
-        self.input.lines().count().max(1)
+        self.input.split('\n').count()
+    }
+
+    /// True when a multiline clipboard block is still present in the composer.
+    pub fn has_multiline_paste(&self) -> bool {
+        self.multiline_paste
     }
 
     /// Deletes the character before the caret.
@@ -567,6 +589,7 @@ impl App {
         let taken = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.history_cursor = None;
+        self.multiline_paste = false;
         self.completions.clear();
         self.completion_index = 0;
         if !taken.trim().is_empty() {
@@ -600,6 +623,7 @@ impl App {
         self.history_cursor = Some(next);
         self.input = self.history[next].clone();
         self.cursor = self.input.chars().count();
+        self.multiline_paste = false;
     }
 
     /// Moves forward through history, ending at an empty composer.
@@ -609,11 +633,13 @@ impl App {
                 self.history_cursor = Some(current + 1);
                 self.input = self.history[current + 1].clone();
                 self.cursor = self.input.chars().count();
+                self.multiline_paste = false;
             }
             Some(_) => {
                 self.history_cursor = None;
                 self.input.clear();
                 self.cursor = 0;
+                self.multiline_paste = false;
             }
             None => {}
         }
@@ -1314,6 +1340,7 @@ impl App {
             .as_deref()
             .unwrap_or("no completed turn");
         let mut lines = vec![format!("Last completed turn: {source}")];
+        let agent_id = source.split('/').next().unwrap_or("");
         match self.last_usage {
             Some(usage) => {
                 lines.push(format!("input:       {}", token_count(usage.input)));
@@ -1321,24 +1348,34 @@ impl App {
                 lines.push(format!("cached input: {}", token_count(usage.cached_input)));
                 lines.push(format!("reasoning:   {}", token_count(usage.reasoning)));
                 lines.push(String::new());
-                lines.push("Exact values reported by that CLI's turn stream.".into());
+                lines.push(format!(
+                    "Exact values reported by the {} stream for this turn.",
+                    adapter_display_name(agent_id)
+                ));
                 lines.push(
-                    "An unavailable field was not reported; Argo does not estimate it.".into(),
-                );
-            }
-            None => {
-                lines.push("No exact token counts were reported for that turn.".into());
-                lines.push(
-                    "Plain-output adapters such as Command Code and Grok cannot expose token usage."
+                    "A field showing \"unavailable\" was not emitted; Argo does not estimate it."
                         .into(),
                 );
             }
+            None if is_plain_text_adapter(agent_id) => {
+                lines.push(format!(
+                    "{} uses plain-text output; token counts are structurally unavailable.",
+                    adapter_display_name(agent_id)
+                ));
+            }
+            None => {
+                lines.push(format!(
+                    "{} did not report exact token counts for this completed turn.",
+                    adapter_display_name(agent_id)
+                ));
+                lines.push("Argo does not estimate values the CLI did not emit.".into());
+            }
         }
-        lines.push(String::new());
-        lines.push("Account quota, credits, and billing are unavailable: installed CLIs do not expose them non-interactively.".into());
-        lines.push(
-            "OpenCode users can also run `opencode stats` for its CLI-local aggregate.".into(),
-        );
+        // OpenCode-specific tip only when the adapter is actually OpenCode.
+        if agent_id == "opencode" {
+            lines.push(String::new());
+            lines.push("For cumulative stats, run `opencode stats` in a separate terminal.".into());
+        }
         lines
     }
 
@@ -1626,6 +1663,18 @@ fn token_count(value: Option<u64>) -> String {
     rendered
 }
 
+/// Whether the registered adapter's transport can carry structured usage.
+fn is_plain_text_adapter(agent_id: &str) -> bool {
+    argo_runtime::find(agent_id).is_some_and(|definition| {
+        definition.capabilities.stream_format == argo_core::runtime::StreamFormat::Plain
+    })
+}
+
+/// Human-readable adapter name from the same registry used to execute turns.
+fn adapter_display_name(agent_id: &str) -> &str {
+    argo_runtime::find(agent_id).map_or(agent_id, |definition| definition.name)
+}
+
 /// Makes tool arguments/results readable in one bounded transcript row.
 ///
 /// Event parsers already cap payload size; this tighter UI cap avoids a large JSON
@@ -1656,46 +1705,137 @@ fn relative_time(at: i64) -> String {
 ///
 /// Numbered prose alone is not enough: a nearby choice phrase is required so
 /// ordinary explanations and plans do not unexpectedly become interactive.
+///
+/// Guards against false positives:
+/// - The choice phrase must appear within the last 200 characters before the
+///   first numbered item (proximity).
+/// - The numbered list must be terminal (only trailing whitespace after it).
+/// - Each option must be brief (≤150 chars); long paragraphs are explanations.
+/// - Code blocks (fenced with ```) are stripped before phrase detection.
 fn response_options(response: &str) -> Option<Vec<String>> {
-    let lower = response.to_ascii_lowercase();
-    let asks_for_choice = [
+    // Strip fenced code blocks so SQL `SELECT` etc. do not trigger.
+    let stripped = strip_fenced_code_blocks(response);
+    let lower = stripped.to_ascii_lowercase();
+
+    // Require a deliberate interactive phrase — bare "choose"/"select" removed.
+    const CHOICE_PHRASES: &[&str] = &[
         "which do you want",
         "which option",
-        "choose",
-        "select",
+        "which approach",
+        "which would you",
         "pick one",
+        "pick an option",
+        "please pick",
+        "choose one",
+        "choose an option",
+        "select one",
+        "select an option",
         "what would you like",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    if !asks_for_choice {
-        return None;
-    }
+        "how would you like",
+        "would you like me to",
+        "what do you prefer",
+    ];
 
+    // Locate the numbered list first, then check proximity.
     let mut options = Vec::new();
     let mut expected: Option<usize> = None;
-    for line in response.lines() {
+    let mut first_option_byte: Option<usize> = None;
+    let mut last_option_end: usize = 0;
+
+    let mut line_start = 0usize;
+    for segment in stripped.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let current_line_start = line_start;
+        line_start += segment.len();
         let trimmed = line.trim();
         let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
         if digits == 0 {
             continue;
         }
-        let number = trimmed[..digits].parse::<usize>().ok()?;
-        let rest = trimmed[digits..].strip_prefix(['.', ')'])?.trim();
+        let Ok(number) = trimmed[..digits].parse::<usize>() else {
+            continue;
+        };
+        let Some(rest) = trimmed[digits..].strip_prefix(['.', ')']) else {
+            continue;
+        };
+        let rest = rest.trim();
         if rest.is_empty() {
             continue;
         }
+        // Brevity check: explanatory paragraphs are not chooseable options.
+        if rest.chars().count() > 150 {
+            options.clear();
+            expected = None;
+            first_option_byte = None;
+            continue;
+        }
         match expected {
-            None => expected = Some(number + 1),
-            Some(next) if number == next => expected = Some(number + 1),
+            None => {
+                first_option_byte = Some(current_line_start);
+                expected = Some(number + 1);
+            }
+            Some(next) if number == next => {
+                expected = Some(number + 1);
+            }
             Some(_) => {
                 options.clear();
+                first_option_byte = Some(current_line_start);
                 expected = Some(number + 1);
             }
         }
+        last_option_end = current_line_start + line.len();
         options.push(format!("{number}. {rest}"));
     }
-    (options.len() >= 2).then_some(options)
+
+    if options.len() < 2 {
+        return None;
+    }
+
+    // Terminal check: only trailing whitespace after the last option.
+    if !stripped[last_option_end..].trim().is_empty() {
+        return None;
+    }
+
+    // Proximity check: a choice phrase must appear within the last 200 chars
+    // before the first numbered item.
+    let first_byte = first_option_byte.unwrap_or(0);
+    let prefix = &lower[..first_byte];
+    let window_start = prefix
+        .char_indices()
+        .rev()
+        .nth(199)
+        .map_or(0, |(index, _)| index);
+    let proximity_window = &lower[window_start..first_byte];
+    let has_choice_phrase = CHOICE_PHRASES
+        .iter()
+        .any(|phrase| proximity_window.contains(phrase));
+    if !has_choice_phrase {
+        return None;
+    }
+
+    Some(options)
+}
+
+/// Removes fenced code blocks (``` … ```) so their content does not trigger
+/// choice-phrase detection. Non-code text is preserved.
+fn strip_fenced_code_blocks(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut inside_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            inside_fence = !inside_fence;
+            result.push('\n');
+            continue;
+        }
+        if inside_fence {
+            result.push('\n');
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2837,7 +2977,11 @@ mod tests {
         assert!(report.contains("codex/gpt-5"), "{report}");
         assert!(report.contains("2,000"), "{report}");
         assert!(report.contains("reasoning:   unavailable"), "{report}");
-        assert!(report.contains("do not expose them"), "{report}");
+        assert!(report.contains("Codex CLI stream"), "{report}");
+        // Must NEVER mention billing/quota/credits.
+        assert!(!report.contains("quota"), "{report}");
+        assert!(!report.contains("billing"), "{report}");
+        assert!(!report.contains("credits"), "{report}");
     }
 
     #[test]
@@ -2856,7 +3000,14 @@ mod tests {
         assert!(app.last_usage.is_none());
         let report = app.usage_report().join("\n");
         assert!(report.contains("grok/default"), "{report}");
-        assert!(report.contains("No exact token counts"), "{report}");
+        assert!(
+            report.contains("plain-text output"),
+            "grok should be identified as plain-text: {report}"
+        );
+        assert!(report.contains("structurally unavailable"), "{report}");
+        // Must not mention unrelated adapters or billing.
+        assert!(!report.contains("opencode"), "{report}");
+        assert!(!report.contains("quota"), "{report}");
     }
 
     #[test]
@@ -2875,5 +3026,400 @@ mod tests {
     fn selection_label_degrades_without_a_conversation() {
         let app = new_app();
         assert_eq!(app.selection_label(), "no conversation");
+    }
+
+    // --- Regression: Issue 1 — picker vs false positives ---
+
+    #[test]
+    fn sql_select_does_not_trigger_response_picker() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "claude · sonnet · fresh session");
+        app.push(
+            LineKind::Assistant,
+            "Here's the query:\n\n```sql\nSELECT * FROM users WHERE id = 1;\n```\n\nThe results:\n1. User found\n2. Row returned",
+        );
+        assert!(!app.open_latest_response_options());
+    }
+
+    #[test]
+    fn numbered_list_in_middle_of_response_does_not_trigger_picker() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "codex · gpt-5 · fresh session");
+        app.push(
+            LineKind::Assistant,
+            "Which option would you like?\n\n1. Keep it\n2. Remove it\n\nEither way, I recommend testing first.",
+        );
+        // The numbered list is NOT terminal (prose follows), so no picker.
+        assert!(!app.open_latest_response_options());
+    }
+
+    #[test]
+    fn long_numbered_paragraphs_do_not_trigger_picker() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "claude · sonnet · fresh session");
+        let long_item = "a".repeat(200);
+        app.push(
+            LineKind::Assistant,
+            format!("Which option do you want?\n\n1. {long_item}\n2. {long_item}"),
+        );
+        // Items are too long (>150 chars) — these are explanatory paragraphs.
+        assert!(!app.open_latest_response_options());
+    }
+
+    #[test]
+    fn choice_phrase_far_from_numbered_list_does_not_trigger() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "claude · sonnet · fresh session");
+        let filler = "This is explanation text. ".repeat(20); // >200 chars
+        app.push(
+            LineKind::Assistant,
+            format!("Which option do you want?\n\n{filler}\n\n1. Option A\n2. Option B"),
+        );
+        // The choice phrase is >200 chars from the first numbered item.
+        assert!(!app.open_latest_response_options());
+    }
+
+    #[test]
+    fn unicode_near_choice_window_is_safe_and_detected() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "kiro · auto · fresh session");
+        let context = "é".repeat(80);
+        app.push(
+            LineKind::Assistant,
+            format!(
+                "{context} How would you like to proceed?
+
+1. Keep it
+2. Replace it"
+            ),
+        );
+        assert!(app.open_latest_response_options());
+    }
+
+    #[test]
+    fn common_imperative_choice_phrases_trigger_picker() {
+        for prompt in [
+            "Choose an option:
+1. Keep it
+2. Replace it",
+            "Select an option:
+1. Keep it
+2. Replace it",
+            "Would you like me to:
+1. Keep it
+2. Replace it",
+        ] {
+            assert!(response_options(prompt).is_some(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn deliberate_choice_at_end_still_triggers_picker() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "codex · o3 · resumed session");
+        app.push(
+            LineKind::Assistant,
+            "I found two approaches. Which would you like?\n\n1. Refactor the module\n2. Add a wrapper",
+        );
+        assert!(app.open_latest_response_options());
+        let Overlay::Picker { items, .. } = &app.overlay else {
+            panic!("expected picker");
+        };
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn code_block_with_choose_does_not_trigger_picker() {
+        let mut app = new_app();
+        app.push(LineKind::AgentHeader, "claude · sonnet · fresh session");
+        app.push(
+            LineKind::Assistant,
+            "Here's the code:\n\n```rust\n// choose one of these\nlet x = vec![1, 2, 3];\n```\n\n1. First approach\n2. Second approach",
+        );
+        // "choose" is inside a code block — should not count.
+        // And there's no choice phrase outside the code block near the list.
+        assert!(!app.open_latest_response_options());
+    }
+
+    #[test]
+    fn arrow_keys_navigate_picker_not_history() {
+        let mut app = new_app();
+        // Type something into composer history first.
+        for ch in "previous message".chars() {
+            app.insert(ch);
+        }
+        app.take_input();
+
+        // Now open a response picker.
+        app.push(LineKind::AgentHeader, "claude · sonnet · fresh session");
+        app.push(
+            LineKind::Assistant,
+            "Pick one:\n\n1. Alpha\n2. Beta\n3. Gamma",
+        );
+        assert!(app.open_latest_response_options());
+        assert!(app.has_overlay());
+
+        // Up/Down should navigate the picker, not recall history.
+        app.overlay_move(1); // Down
+        let Overlay::Picker { selected, .. } = &app.overlay else {
+            panic!("expected picker");
+        };
+        assert_eq!(*selected, 1);
+
+        // Enter should choose from the picker.
+        let (action, value) = app.overlay_choose().expect("selection");
+        assert_eq!(action, PickerAction::ResponseOption);
+        assert_eq!(value, "2. Beta");
+        // Composer should be empty — history not recalled.
+        assert!(app.input.is_empty());
+    }
+
+    // --- Regression: Issue 2 — adapter-specific /usage ---
+
+    #[test]
+    fn usage_report_for_claude_with_all_fields() {
+        let mut app = new_app();
+        app.begin_run(
+            RunId::new("r1"),
+            "claude",
+            Some("claude-sonnet-4-20250514"),
+            false,
+        );
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage {
+                input: Some(5_234),
+                output: Some(1_891),
+                cached_input: Some(3_100),
+                reasoning: Some(450),
+            },
+        });
+        let report = app.usage_report().join("\n");
+        assert!(
+            report.contains("claude/claude-sonnet-4-20250514"),
+            "{report}"
+        );
+        assert!(report.contains("5,234"), "{report}");
+        assert!(report.contains("1,891"), "{report}");
+        assert!(report.contains("3,100"), "{report}");
+        assert!(report.contains("450"), "{report}");
+        assert!(report.contains("Claude Code stream"), "{report}");
+        assert!(!report.contains("quota"), "{report}");
+        assert!(!report.contains("billing"), "{report}");
+        assert!(!report.contains("opencode"), "{report}");
+    }
+
+    #[test]
+    fn usage_report_for_opencode_includes_stats_tip() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "opencode", Some("o3"), false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage {
+                input: Some(1_000),
+                output: Some(200),
+                cached_input: None,
+                reasoning: None,
+            },
+        });
+        let report = app.usage_report().join("\n");
+        assert!(report.contains("opencode/o3"), "{report}");
+        assert!(report.contains("opencode stats"), "{report}");
+        assert!(!report.contains("quota"), "{report}");
+    }
+
+    #[test]
+    fn usage_report_for_command_code_says_plain_text() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "cmd", Some("gemini"), false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage::default(),
+        });
+        let report = app.usage_report().join("\n");
+        assert!(report.contains("cmd/gemini"), "{report}");
+        assert!(report.contains("Command Code"), "{report}");
+        assert!(report.contains("plain-text output"), "{report}");
+        assert!(report.contains("structurally unavailable"), "{report}");
+        assert!(!report.contains("quota"), "{report}");
+        assert!(!report.contains("opencode"), "{report}");
+    }
+
+    #[test]
+    fn usage_report_for_kiro_truthfully_names_missing_token_counts() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "kiro", Some("auto"), false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage::default(),
+        });
+        let report = app.usage_report().join("\n");
+        assert!(
+            report.contains("Kiro CLI did not report exact token counts"),
+            "{report}"
+        );
+        assert!(report.contains("does not estimate"), "{report}");
+        assert!(!report.contains("quota"), "{report}");
+        assert!(!report.contains("billing"), "{report}");
+    }
+
+    #[test]
+    fn usage_report_never_contains_quota_billing_credits() {
+        // Exhaustive: check every adapter scenario.
+        for (agent, has_usage) in [
+            ("claude", true),
+            ("codex", true),
+            ("opencode", true),
+            ("kiro", true),
+            ("antigravity", true),
+            ("cmd", false),
+            ("grok", false),
+        ] {
+            let mut app = new_app();
+            app.begin_run(RunId::new("r1"), agent, None, false);
+            let usage = if has_usage {
+                TokenUsage {
+                    input: Some(100),
+                    output: Some(50),
+                    ..Default::default()
+                }
+            } else {
+                TokenUsage::default()
+            };
+            app.apply_event(RunEventKind::RunFinished {
+                status: RunStatus::Succeeded,
+                usage,
+            });
+            let report = app.usage_report().join("\n");
+            assert!(!report.contains("quota"), "agent={agent}: {report}");
+            assert!(!report.contains("billing"), "agent={agent}: {report}");
+            assert!(!report.contains("credits"), "agent={agent}: {report}");
+        }
+    }
+
+    // --- Regression: Issue 3 — bracketed paste ---
+
+    #[test]
+    fn paste_inserts_multiline_text_atomically() {
+        let mut app = new_app();
+        app.paste("line1\nline2\nline3");
+        assert_eq!(app.input, "line1\nline2\nline3");
+        assert_eq!(app.cursor, 17); // 17 chars total
+        assert_eq!(app.input_line_count(), 3);
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_to_lf() {
+        let mut app = new_app();
+        app.paste("hello\r\nworld\rfoo");
+        assert_eq!(app.input, "hello\nworld\nfoo");
+    }
+
+    #[test]
+    fn paste_at_cursor_position_splices_correctly() {
+        let mut app = new_app();
+        for ch in "hello".chars() {
+            app.insert(ch);
+        }
+        // Move cursor left 2 positions: cursor at "hel|lo"
+        app.move_left();
+        app.move_left();
+        app.paste("WORLD\n");
+        assert_eq!(app.input, "helWORLD\nlo");
+        // Cursor should be after the pasted text (after the \n).
+        assert_eq!(app.cursor, 9); // "helWORLD\n" = 9 chars
+    }
+
+    #[test]
+    fn paste_does_not_submit() {
+        let mut app = new_app();
+        app.paste("line1\nline2\nline3");
+        // The input should still be in the composer, not submitted.
+        assert_eq!(app.input, "line1\nline2\nline3");
+        // take_input would consume it (simulating Enter press).
+        let taken = app.take_input();
+        assert_eq!(taken, "line1\nline2\nline3");
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn paste_clears_history_cursor() {
+        let mut app = new_app();
+        // Add history entries.
+        for ch in "first message".chars() {
+            app.insert(ch);
+        }
+        app.take_input();
+        // Navigate to history.
+        app.history_previous();
+        assert_eq!(app.input, "first message");
+        // Pasting should reset history navigation.
+        app.paste(" appended");
+        assert!(app.history_cursor.is_none());
+    }
+
+    #[test]
+    fn large_paste_line_count_is_correct() {
+        let mut app = new_app();
+        let text = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.paste(&text);
+        assert_eq!(app.input_line_count(), 50);
+    }
+
+    #[test]
+    fn paste_preserves_and_counts_a_trailing_newline() {
+        let mut app = new_app();
+        app.paste(
+            "first
+second
+",
+        );
+        assert_eq!(
+            app.input,
+            "first
+second
+"
+        );
+        assert_eq!(app.input_line_count(), 3);
+        assert_eq!(app.caret_row_column(), (2, 0));
+        assert!(app.has_multiline_paste());
+    }
+
+    #[test]
+    fn paste_empty_string_is_harmless() {
+        let mut app = new_app();
+        app.paste("");
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn paste_whitespace_only_is_preserved() {
+        let mut app = new_app();
+        app.paste("\n\n\n");
+        assert_eq!(app.input, "\n\n\n");
+        assert_eq!(app.cursor, 3);
+    }
+
+    // --- Regression: strip_fenced_code_blocks ---
+
+    #[test]
+    fn fenced_code_blocks_are_stripped_for_choice_detection() {
+        // Bare "choose" inside code should NOT trigger.
+        let text = "Here's an example:\n\n```\nchoose one:\n1. alpha\n2. beta\n```";
+        let stripped = strip_fenced_code_blocks(text);
+        assert!(!stripped.contains("choose"));
+    }
+
+    #[test]
+    fn text_outside_fences_is_preserved() {
+        let text = "Before\n```\ninside\n```\nAfter";
+        let stripped = strip_fenced_code_blocks(text);
+        assert!(stripped.contains("Before"));
+        assert!(stripped.contains("After"));
+        assert!(!stripped.contains("inside"));
     }
 }

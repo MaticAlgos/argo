@@ -201,7 +201,7 @@ of leaving compilers, language servers, or shell commands orphaned.
 | Kiro CLI | ACP over stdio | yes | yes | — |
 | Command Code | plain text + session sidecar | yes | no | plan, accept-edits |
 | Antigravity | stream JSON | yes | yes | plan, accept-edits |
-| Grok CLI | plain text | no | no | plan |
+| Grok CLI | plain text | no | no | — |
 
 Command Code session IDs are discovered from its workspace JSONL sidecar and
 resumed with `--resume <id>` for every model. Argo never uses Command Code's

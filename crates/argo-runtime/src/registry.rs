@@ -141,8 +141,8 @@ mod tests {
         assert_eq!(kiro.capabilities.stream_format, StreamFormat::AcpJsonRpc);
         assert_eq!(grok.capabilities.stream_format, StreamFormat::Plain);
 
-        // Only Grok needs a staged prompt file.
-        assert_eq!(grok.capabilities.prompt_delivery, PromptDelivery::File);
+        // Grok passes the prompt as a CLI argument; Kiro uses its protocol.
+        assert_eq!(grok.capabilities.prompt_delivery, PromptDelivery::Argument);
         assert_eq!(kiro.capabilities.prompt_delivery, PromptDelivery::Protocol);
     }
 

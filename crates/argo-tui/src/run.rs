@@ -14,7 +14,8 @@ use argo_core::{ArgoPaths, IPC_PROTOCOL_VERSION};
 use argo_daemon::protocol::{Request, Response};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{
     Attribute, Color as CrosstermColor, Print, SetAttribute, SetForegroundColor,
@@ -67,16 +68,22 @@ fn set_mouse_scroll_mode<W: std::io::Write>(
 }
 
 fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(writer, EnterAlternateScreen)
+    crossterm::execute!(writer, EnterAlternateScreen, EnableBracketedPaste)
 }
 
 fn leave_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(writer, Print(DISABLE_MOUSE_WHEEL), LeaveAlternateScreen)
+    crossterm::execute!(
+        writer,
+        DisableBracketedPaste,
+        Print(DISABLE_MOUSE_WHEEL),
+        LeaveAlternateScreen
+    )
 }
 
 /// Restores the terminal, tolerating already-restored state.
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = leave_terminal_screen(&mut std::io::stdout());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
 }
@@ -231,6 +238,9 @@ async fn event_loop(
                                 Err(error) => app.report_error(error),
                             }
                         }
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        handle_paste(app, &text);
                     }
                     Some(Ok(_)) => {}
                     // Terminal closed or errored: exit rather than spin.
@@ -435,6 +445,25 @@ fn navigate_vertical(app: &mut App, previous: bool) {
     } else {
         app.history_next();
     }
+}
+
+/// Handles a bracketed paste event.
+///
+/// When an overlay picker is open, a single-line paste extends the picker filter.
+/// Multi-line pastes into a picker are ignored (the picker is for navigation, not
+/// bulk input). When no overlay is open, the full text is inserted atomically.
+fn handle_paste(app: &mut App, text: &str) {
+    if app.has_overlay() {
+        // Single-line paste into a picker filter is useful (e.g., pasting a model name).
+        if !text.contains('\n') && !text.contains('\r') {
+            for ch in text.chars() {
+                app.picker_filter_push(ch);
+            }
+        }
+        // Multi-line paste into a picker is ignored.
+        return;
+    }
+    app.paste(text);
 }
 
 /// Handles one key press.

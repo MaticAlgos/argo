@@ -138,8 +138,8 @@ mod tests {
 
     #[test]
     fn a_silent_success_is_reported_as_a_failure_with_guidance() {
-        // Grok exits 0 when a write is permission-cancelled; without this the user
-        // would see an empty turn and no reason.
+        // A silent plain-text process must not look like a successful empty reply;
+        // the user needs an actionable diagnostic instead.
         let parser = PlainStreamParser::new();
         let outcome = parser.finish(true, "");
         assert_eq!(outcome.status, RunStatus::Failed);

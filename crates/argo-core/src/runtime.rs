@@ -40,8 +40,8 @@ pub enum PromptDelivery {
     Stdin,
     /// Staged in a temp file whose path is passed as an argument.
     ///
-    /// Required by Grok, whose recent builds demand an argv value while Argo's
-    /// composed prompts routinely exceed safe argv limits.
+    /// Available for adapters that cannot accept a prompt through stdin or a
+    /// bounded command-line argument.
     File,
     /// Passed as the value of a command-line prompt flag.
     ///

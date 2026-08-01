@@ -526,12 +526,35 @@ fn draw_text_overlay(
 }
 
 fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let line_count = app.input_line_count();
     let hint = match app.activity_indicator() {
         Some(indicator) => format!(" {indicator} — Esc cancels "),
+        None if line_count > MAX_COMPOSER_LINES && app.has_multiline_paste() => {
+            format!(" pasted text · {} lines · Enter submits all ", line_count)
+        }
+        None if line_count > MAX_COMPOSER_LINES => {
+            format!(" ↑ {} lines · Enter submits all ", line_count)
+        }
         None => " message — / for commands ".to_string(),
     };
 
-    let paragraph = Paragraph::new(app.input.as_str())
+    // For large inputs, show only the lines around the cursor so the composer
+    // stays compact — similar to Claude Code and Codex paste behavior.
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let display_text = if line_count > inner_height && inner_height > 0 {
+        let (cursor_row, _) = app.caret_row_column();
+        // Show a window of lines centered on the cursor row.
+        let lines: Vec<&str> = app.input.split('\n').collect();
+        let half = inner_height / 2;
+        let start = cursor_row.saturating_sub(half);
+        let end = (start + inner_height).min(lines.len());
+        let start = end.saturating_sub(inner_height);
+        lines[start..end].join("\n")
+    } else {
+        app.input.clone()
+    };
+
+    let paragraph = Paragraph::new(display_text.as_str())
         .block(panel(hint, !app.is_busy()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -541,8 +564,18 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !app.has_overlay() {
         let inner_width = area.width.saturating_sub(2).max(1) as usize;
         let (row, column) = app.caret_row_column();
+        // When displaying a windowed view, adjust row relative to window start.
+        let display_row = if line_count > inner_height && inner_height > 0 {
+            let half = inner_height / 2;
+            let start = row.saturating_sub(half);
+            let end = (start + inner_height).min(line_count);
+            let start = end.saturating_sub(inner_height);
+            row - start
+        } else {
+            row
+        };
         // Account for wrapping within the caret's own line.
-        let wrapped_row = row + column / inner_width;
+        let wrapped_row = display_row + column / inner_width;
         let wrapped_column = column % inner_width;
         let max_row = area.height.saturating_sub(3) as usize;
         frame.set_cursor_position((

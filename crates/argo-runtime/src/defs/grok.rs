@@ -1,63 +1,38 @@
 //! Grok CLI adapter (xAI).
 //!
-//! Ported from OpenDesign's shipped `grok-build` definition. Three constraints
-//! shape this adapter, and all three are load-bearing:
+//! Verified against Grok CLI 1.1.7. The current headless interface accepts the
+//! composed prompt through `--prompt`, emits plain text with `--format text`, and
+//! uses `--no-sandbox` for Argo's full-authority mode. Earlier plan, approval,
+//! prompt-file, and effort flags no longer exist, so Argo does not advertise them.
 //!
-//! - Recent builds require the prompt as an argv value (`-p/--single`), but Argo's
-//!   composed prompts routinely exceed safe argv limits. The prompt is therefore
-//!   staged in a file and passed with `--prompt-file`.
-//! - Headless runs need `--no-plan --always-approve`; without auto-approval a
-//!   write is permission-cancelled while the CLI still exits successfully, which
-//!   would look like a silent no-op.
-//! - Output is plain text. Argo gets no tool or file events from this CLI and
-//!   reconciles filesystem changes after the run instead.
-//!
-//! Grok also has no durable session, so every turn is reseeded from Argo's
-//! canonical transcript. That is the clearest demonstration that Argo's store,
-//! not the CLI's, is the authority.
+//! The CLI accepts a session id but does not emit a stable new-session handle in
+//! plain output. Argo therefore reseeds every turn from canonical history rather
+//! than pretending native resume is reliable.
 
 use crate::def::{InvocationContext, ModelProbe, RuntimeDef};
-use argo_core::mode::{AgentMode, ModeSupport};
+use argo_core::mode::ModeSupport;
 use argo_core::runtime::{
     AgentCapabilities, McpInjection, ModelOption, PermissionPosture, PromptDelivery,
     PromptEncoding, StreamFormat,
 };
 
-/// True when a model id denotes a reasoning-capable variant.
-///
-/// `--effort` is only valid for those; passing it otherwise is rejected.
-fn supports_effort(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("reasoning")
-}
-
 fn build_args(ctx: &InvocationContext) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-
-    // The staged prompt file is mandatory for this adapter. An empty path here
-    // would silently send no prompt, so the engine must always supply one.
-    if let Some(path) = &ctx.prompt_file {
-        args.push("--prompt-file".into());
-        args.push(path.clone());
-    }
-
-    // Grok plans by default; Argo suppresses that unless plan mode is requested,
-    // and withholds auto-approval so the plan is not immediately executed.
-    if ctx.mode == AgentMode::Plan {
-        args.push("--plan".into());
-    } else {
-        args.push("--no-plan".into());
-        args.push("--always-approve".into());
-    }
+    let mut args: Vec<String> = vec![
+        "--format".into(),
+        "text".into(),
+        // Argo's full mode is intentionally unsandboxed; restrictive modes are
+        // not advertised because this Grok build exposes no enforceable analogue.
+        "--no-sandbox".into(),
+    ];
 
     if let Some(model) = ctx.concrete_model() {
         args.push("--model".into());
         args.push(model.to_string());
-        if let Some(effort) = &ctx.reasoning {
-            if supports_effort(model) {
-                args.push("--effort".into());
-                args.push(effort.clone());
-            }
-        }
+    }
+
+    if let Some(prompt) = &ctx.prompt {
+        args.push("--prompt".into());
+        args.push(prompt.clone());
     }
 
     args
@@ -99,7 +74,7 @@ pub const GROK: RuntimeDef = RuntimeDef {
     bin: "grok",
     fallback_bins: &[],
     version_args: &["--version"],
-    help_args: &["-p", "--help"],
+    help_args: &["--help"],
     model_probe: Some(ModelProbe {
         args: &["models"],
         timeout_ms: 10_000,
@@ -112,13 +87,7 @@ pub const GROK: RuntimeDef = RuntimeDef {
         ("grok-4.20-reasoning", "grok-4.20-reasoning (deep)"),
         ("grok-4.20-non-reasoning", "grok-4.20-non-reasoning (fast)"),
     ],
-    reasoning_options: &[
-        ("low", "low"),
-        ("medium", "medium"),
-        ("high", "high"),
-        ("xhigh", "xhigh"),
-        ("max", "max"),
-    ],
+    reasoning_options: &[],
     // Grok owns its own OAuth flow; Argo injects no credentials and does not
     // probe login state.
     auth_probe: None,
@@ -127,17 +96,13 @@ pub const GROK: RuntimeDef = RuntimeDef {
     capabilities: AgentCapabilities {
         stream_format: StreamFormat::Plain,
         prompt_encoding: PromptEncoding::Raw,
-        prompt_delivery: PromptDelivery::File,
+        prompt_delivery: PromptDelivery::Argument,
         native_resume: false,
         captures_session: false,
         mcp_injection: McpInjection::None,
         supports_images: false,
         permission: PermissionPosture::FullBypass,
-        modes: ModeSupport {
-            plan: true,
-            accept_edits: false,
-            read_only: false,
-        },
+        modes: ModeSupport::NONE,
     },
     install_url: "https://x.ai/cli",
 };
@@ -149,49 +114,37 @@ mod tests {
     fn ctx() -> InvocationContext {
         InvocationContext {
             cwd: "/repo".into(),
-            prompt_file: Some("/data/argo/staging/prompt.txt".into()),
+            prompt: Some("do the thing".into()),
             ..Default::default()
         }
     }
 
     #[test]
-    fn prompt_is_delivered_by_file_with_headless_flags() {
+    fn prompt_uses_the_current_headless_interface() {
         let args = GROK.args_for(&ctx());
+        assert!(args.windows(2).any(|w| w == ["--format", "text"]));
+        assert!(args.windows(2).any(|w| w == ["--prompt", "do the thing"]));
+        assert!(args.contains(&"--no-sandbox".to_string()));
+        for obsolete in [
+            "--prompt-file",
+            "--plan",
+            "--no-plan",
+            "--always-approve",
+            "--effort",
+        ] {
+            assert!(!args.contains(&obsolete.to_string()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn concrete_model_is_forwarded() {
+        let args = GROK.args_for(&InvocationContext {
+            model: Some("grok-4.20-reasoning".into()),
+            ..ctx()
+        });
         assert!(args
             .windows(2)
-            .any(|w| w == ["--prompt-file", "/data/argo/staging/prompt.txt"]));
-        // Without these, a write is permission-cancelled while the CLI still
-        // exits 0 — a silent no-op.
-        assert!(args.contains(&"--no-plan".to_string()));
-        assert!(args.contains(&"--always-approve".to_string()));
-    }
-
-    #[test]
-    fn plan_mode_asks_for_a_plan_and_withholds_approval() {
-        let args = GROK.args_for(&InvocationContext {
-            mode: AgentMode::Plan,
-            ..ctx()
-        });
-        assert!(args.contains(&"--plan".to_string()));
-        assert!(!args.contains(&"--always-approve".to_string()));
-        assert!(!args.contains(&"--no-plan".to_string()));
-    }
-
-    #[test]
-    fn effort_is_only_sent_for_reasoning_models() {
-        let non_reasoning = GROK.args_for(&InvocationContext {
-            model: Some("grok-4.3".into()),
-            reasoning: Some("high".into()),
-            ..ctx()
-        });
-        assert!(!non_reasoning.contains(&"--effort".to_string()));
-
-        let reasoning = GROK.args_for(&InvocationContext {
-            model: Some("grok-4.20-reasoning".into()),
-            reasoning: Some("high".into()),
-            ..ctx()
-        });
-        assert!(reasoning.windows(2).any(|w| w == ["--effort", "high"]));
+            .any(|w| w == ["--model", "grok-4.20-reasoning"]));
     }
 
     #[test]
@@ -228,6 +181,8 @@ mod tests {
         const {
             assert!(!GROK.capabilities.captures_session);
         }
+        assert!(!GROK.capabilities.modes.has_any());
+        assert_eq!(GROK.capabilities.prompt_delivery, PromptDelivery::Argument);
         // No MCP injection path, so Grok cannot host Argo's delegation tools and
         // therefore cannot spawn children — it can only be a delegation target.
         const {
@@ -241,13 +196,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_prompt_file_produces_no_prompt_flag() {
-        // The engine must always stage a file; this documents the failure shape
-        // if it ever does not.
+    fn missing_prompt_produces_no_prompt_flag() {
         let args = GROK.args_for(&InvocationContext {
-            prompt_file: None,
+            prompt: None,
             ..ctx()
         });
-        assert!(!args.contains(&"--prompt-file".to_string()));
+        assert!(!args.contains(&"--prompt".to_string()));
     }
 }
