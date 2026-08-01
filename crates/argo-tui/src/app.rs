@@ -127,11 +127,10 @@ pub struct App {
     pub should_quit: bool,
     /// Transcript scrollback offset from the bottom.
     pub scroll_back: usize,
-    /// Whether Argo's minimal mouse-wheel fallback is active.
+    /// Whether Argo's minimal mouse-wheel reporting is active.
     ///
-    /// Apple Terminal can ignore alternate-scroll mode according to its profile.
-    /// In fallback mode, wheel events are reported to Argo; F2 restores fully
-    /// terminal-owned mouse selection immediately.
+    /// Explicit wheel events keep transcript scrolling separate from physical
+    /// arrow keys. F2 restores fully terminal-owned mouse selection immediately.
     pub mouse_scroll_mode: bool,
     /// Width-aware maximum rendered-row scroll, refreshed by the renderer.
     scroll_limit: std::cell::Cell<usize>,
@@ -1389,9 +1388,14 @@ impl App {
     /// Rebuilds canonical history using the same visual vocabulary as live events.
     pub fn replace_transcript(&mut self, messages: Vec<MessageView>) {
         self.lines.clear();
+        self.history.clear();
+        self.history_cursor = None;
         for message in messages {
             match message.role.as_str() {
                 "user" => {
+                    if !message.text.trim().is_empty() {
+                        self.history.push(message.text.clone());
+                    }
                     if message.blocks.is_empty() {
                         self.push(LineKind::User, message.text);
                     } else {
@@ -2669,6 +2673,8 @@ mod tests {
         ]);
 
         assert_eq!(app.lines[0].kind, LineKind::User);
+        app.history_previous();
+        assert_eq!(app.input, "run it", "reopened user prompts enter history");
         assert!(app
             .lines
             .iter()

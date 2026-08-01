@@ -29,17 +29,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-/// Ask compatible terminals to translate wheel motion to Up/Down while the
-/// alternate screen is active. Unlike mouse tracking (1000/1002/1003), DEC 1007
-/// leaves clicks and drags owned by the terminal, so ordinary selection survives.
-const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
-const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
-
-/// Minimal wheel fallback: normal button reporting plus SGR coordinates.
+/// Minimal wheel reporting: normal button events plus SGR coordinates.
 ///
-/// Deliberately omit 1002/1003 motion tracking and crossterm's RXVT mode. Apple
-/// Terminal reports wheel buttons through 1000, while F2 (or Fn temporarily)
-/// restores native selection whenever it is needed.
+/// Deliberately omit 1002/1003 motion tracking and crossterm's RXVT mode. Explicit
+/// wheel events keep scrolling distinguishable from physical Up/Down keys. F2
+/// disables reporting whenever terminal-owned text selection is preferred.
 const ENABLE_MOUSE_WHEEL: &str = "\x1b[?1000h\x1b[?1006h";
 const DISABLE_MOUSE_WHEEL: &str = "\x1b[?1006l\x1b[?1000l";
 
@@ -57,10 +51,6 @@ fn set_mouse_wheel_reporting<W: std::io::Write>(
     )
 }
 
-fn needs_mouse_wheel_fallback(term_program: Option<&str>) -> bool {
-    term_program == Some("Apple_Terminal")
-}
-
 fn set_mouse_scroll_mode<W: std::io::Write>(
     writer: &mut W,
     app: &mut App,
@@ -69,7 +59,7 @@ fn set_mouse_scroll_mode<W: std::io::Write>(
     set_mouse_wheel_reporting(writer, enabled)?;
     app.mouse_scroll_mode = enabled;
     app.set_status(if enabled {
-        "mouse wheel enabled · F2 returns to normal selection · Fn-drag selects temporarily"
+        "mouse wheel enabled · F2 returns to terminal selection"
     } else {
         "selection mode · F2 enables mouse-wheel scrolling"
     });
@@ -77,16 +67,11 @@ fn set_mouse_scroll_mode<W: std::io::Write>(
 }
 
 fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(writer, EnterAlternateScreen, Print(ENABLE_ALTERNATE_SCROLL))
+    crossterm::execute!(writer, EnterAlternateScreen)
 }
 
 fn leave_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(
-        writer,
-        Print(DISABLE_MOUSE_WHEEL),
-        Print(DISABLE_ALTERNATE_SCROLL),
-        LeaveAlternateScreen
-    )
+    crossterm::execute!(writer, Print(DISABLE_MOUSE_WHEEL), LeaveAlternateScreen)
 }
 
 /// Restores the terminal, tolerating already-restored state.
@@ -155,19 +140,13 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     let mut terminal_guard = TerminalRestoreGuard(true);
     enable_raw_mode().map_err(|e| ArgoError::Io(format!("enable raw mode: {e}")))?;
     let mut stdout = std::io::stdout();
-    // Mouse capture prevents ordinary drag selection and cannot reliably report
-    // the macOS Command modifier. DEC alternate-scroll mode instead asks the
-    // terminal to translate wheel movement into the Up/Down keys Argo already
-    // handles, while native OSC 8 links and normal selection remain terminal-owned.
+    // Wheel motion and physical Up/Down keys must remain distinguishable: the
+    // wheel scrolls the transcript, while arrows recall user prompts. Request only
+    // button events (not motion tracking); F2 restores terminal-owned selection.
     enter_terminal_screen(&mut stdout)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
-    // Apple Terminal exposes alternate-screen wheel translation as a profile
-    // preference and may ignore DECSET 1007. Enable the smallest reporting mode
-    // that delivers wheel buttons; F2 immediately restores normal selection.
-    if needs_mouse_wheel_fallback(std::env::var("TERM_PROGRAM").ok().as_deref()) {
-        set_mouse_scroll_mode(&mut stdout, &mut app, true)
-            .map_err(|e| ArgoError::Io(format!("enable mouse wheel: {e}")))?;
-    }
+    set_mouse_scroll_mode(&mut stdout, &mut app, true)
+        .map_err(|e| ArgoError::Io(format!("enable mouse wheel: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
         Terminal::new(backend).map_err(|e| ArgoError::Io(format!("create terminal: {e}")))?;
@@ -447,6 +426,17 @@ fn handle_mouse(
     None
 }
 
+/// Moves through command completions or submitted user prompts.
+fn navigate_vertical(app: &mut App, previous: bool) {
+    if app.has_completions() {
+        app.completion_move(if previous { -1 } else { 1 });
+    } else if previous {
+        app.history_previous();
+    } else {
+        app.history_next();
+    }
+}
+
 /// Handles one key press.
 async fn handle_key(
     key: crossterm::event::KeyEvent,
@@ -563,33 +553,13 @@ async fn handle_key(
         }
         KeyCode::Home => app.move_home(),
         KeyCode::End => app.move_end(),
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_up(1),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_down(1),
-        // Ctrl+P/N retain explicit composer-history navigation now that bare
-        // arrows on an empty composer navigate the transcript (and also accept
-        // terminal wheel-to-arrow translation without enabling mouse capture).
+        // Ctrl+P/N remain aliases for composer-history navigation.
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.history_previous()
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.history_next(),
-        KeyCode::Up => {
-            if app.has_completions() {
-                app.completion_move(-1);
-            } else if app.input.is_empty() {
-                app.scroll_up(1);
-            } else {
-                app.history_previous();
-            }
-        }
-        KeyCode::Down => {
-            if app.has_completions() {
-                app.completion_move(1);
-            } else if app.scroll_back > 0 {
-                app.scroll_down(1);
-            } else {
-                app.history_next();
-            }
-        }
+        KeyCode::Up => navigate_vertical(app, true),
+        KeyCode::Down => navigate_vertical(app, false),
         KeyCode::PageUp => app.scroll_up(10),
         KeyCode::PageDown => app.scroll_down(10),
         // Shift+Tab cycles execution mode, matching the convention other coding
@@ -1721,25 +1691,14 @@ mod tests {
     }
 
     #[test]
-    fn alternate_scroll_mode_translates_wheel_without_mouse_capture() {
+    fn terminal_screen_never_translates_wheel_motion_into_arrow_keys() {
         let mut output = Vec::new();
         enter_terminal_screen(&mut output).expect("enter screen");
         leave_terminal_screen(&mut output).expect("leave screen");
 
         let output = String::from_utf8(output).expect("terminal output");
-        assert!(output.contains(ENABLE_ALTERNATE_SCROLL), "{output:?}");
-        assert!(output.contains(DISABLE_ALTERNATE_SCROLL), "{output:?}");
-        // Mouse tracking modes would steal ordinary click/drag selection.
-        for tracking in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h"] {
-            assert!(!output.contains(tracking), "{output:?}");
-        }
-    }
-
-    #[test]
-    fn apple_terminal_uses_the_minimal_wheel_fallback() {
-        assert!(needs_mouse_wheel_fallback(Some("Apple_Terminal")));
-        assert!(!needs_mouse_wheel_fallback(Some("iTerm.app")));
-        assert!(!needs_mouse_wheel_fallback(None));
+        assert!(!output.contains("\x1b[?1007h"), "{output:?}");
+        assert!(!output.contains("\x1b[?1007l"), "{output:?}");
     }
 
     #[test]
@@ -1768,6 +1727,29 @@ mod tests {
         set_mouse_scroll_mode(&mut output, &mut app, false).expect("selection mode");
         assert!(!app.mouse_scroll_mode);
         assert!(app.status.contains("selection mode"));
+    }
+
+    #[test]
+    fn arrows_recall_user_prompts_without_scrolling_the_transcript() {
+        let mut app = App::new("/repo");
+        for prompt in ["first", "second"] {
+            for ch in prompt.chars() {
+                app.insert(ch);
+            }
+            app.take_input();
+        }
+        app.set_scroll_limit(30);
+        app.scroll_up(10);
+
+        navigate_vertical(&mut app, true);
+        assert_eq!(app.input, "second");
+        assert_eq!(app.scroll_back, 10);
+        navigate_vertical(&mut app, true);
+        assert_eq!(app.input, "first");
+        assert_eq!(app.scroll_back, 10);
+        navigate_vertical(&mut app, false);
+        assert_eq!(app.input, "second");
+        assert_eq!(app.scroll_back, 10);
     }
 
     #[test]

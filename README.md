@@ -318,17 +318,14 @@ argo tui --root /path/to/project
 ### TUI keys
 
 - `Tab`: accept a command completion.
-- `↑` / `↓`: navigate suggestions and pickers; with an empty composer, scroll
-  through the transcript.
+- `↑` / `↓`: navigate suggestions and pickers; otherwise recall the previous or
+  next user message in the composer.
 - `Shift+Enter` or `Ctrl+J`: insert a newline.
-- `PageUp` / `PageDown` or `Shift+↑` / `Shift+↓`: scroll the transcript by
-  rendered rows; `Home` / `End` jump to the beginning/end when the composer is
-  empty. Bare `↑` / `↓` also scroll an empty composer. Argo requests terminal
-  alternate-scroll mode; on Apple Terminal it additionally enables minimal wheel
-  reporting because that profile setting can ignore the request.
-- `F2`: toggle between mouse-wheel mode and fully terminal-owned selection. Apple
-  Terminal starts in mouse-wheel mode; press `F2` for ordinary drag selection, or
-  hold `Fn` while dragging to bypass mouse reporting temporarily.
+- Mouse wheel or `PageUp` / `PageDown`: scroll the transcript by rendered rows;
+  `Home` / `End` jump to the beginning/end when the composer is empty.
+- `F2`: toggle between mouse-wheel mode and fully terminal-owned selection. Argo
+  starts in mouse-wheel mode so wheel events remain distinct from `↑` / `↓`;
+  press `F2` for ordinary terminal drag selection.
 - `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
 - Web links: `Cmd+click` uses terminal-native OSC 8 handling when available. In
   Apple Terminal mouse-wheel mode, clicking a rendered `http://` or `https://`

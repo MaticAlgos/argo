@@ -1568,6 +1568,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = ArgoPaths::with_root(dir.path().join("data"));
         let daemon = Daemon::bootstrap(paths).await.expect("bootstrap");
+
+        // Unit tests exercise daemon policy, not host CLI discovery. Seed every
+        // registered adapter as available so results do not depend on which coding
+        // agents happen to be installed on a developer machine or CI runner.
+        let test_bin = std::env::current_exe()
+            .expect("test executable")
+            .to_string_lossy()
+            .into_owned();
+        let agents = argo_runtime::ADAPTERS
+            .iter()
+            .map(|def| {
+                let mut info = AgentInfo::unavailable(def, "test fixture");
+                info.available = true;
+                info.path = Some(test_bin.clone());
+                info.version = Some("test".into());
+                info.diagnostics.clear();
+                info
+            })
+            .collect();
+        *daemon.agents.lock().await = Some(agents);
+
         (Arc::new(daemon), dir)
     }
 
