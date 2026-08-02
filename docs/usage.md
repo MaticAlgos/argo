@@ -200,9 +200,27 @@ not save ordinary implementation requests as permanent policy.
 `/instructions edit` temporarily restores the terminal and opens the file using
 `$VISUAL`, `$EDITOR`, or `vi`. It can be edited while disabled. Run
 `/instructions disable` to stop both capture and injection; the Markdown file is
-retained, but is not sent to any agent until re-enabled. The enablement marker is
-kept under the ignored `.argo/` runtime directory, so the default remains off
-even when a repository already contains the Markdown file.
+retained, but is not sent to any agent until re-enabled. Enablement is recorded in
+a small HTML comment inside that Markdown file, so no separate project `.argo`
+runtime directory is required. A repository containing an unmarked instruction
+file remains disabled by default.
+
+### Skill discovery and caching
+
+Argo discovers skills from project roots such as `.claude/skills`,
+`.agents/skills`, `.codex/skills`, `.kiro/skills`, and `.argo/skills`, then from
+the equivalent global CLI roots and Argo's user-level skills directory. A project
+skill with the same name takes precedence over a global one.
+
+The source remains where its CLI or the user installed it. Before a run, Argo
+copies the resolved skill into `<Argo data directory>/staging/skills` and gives
+the selected CLI that absolute protected path. It compares the complete source
+and cached trees on later turns, including scripts, references, assets, added
+files, and deleted files. Changed sources are refreshed automatically, and edits
+made to a cached copy by an agent are discarded in favor of the source. No skill
+cache is written inside the project. Argo v0.1.4 also removes the legacy
+`.argo/skills-staged` cache when it encounters one, while preserving user-authored
+`.argo/skills` and other custom files.
 
 ## Context across CLIs
 

@@ -29,10 +29,14 @@ const INSTRUCTION_FILES: &[&str] = &[
 /// Project-local instructions managed by the user through `/instructions`.
 pub const ARGO_INSTRUCTIONS_FILE: &str = ".argo-instructions.md";
 
-/// Presence of this ignored marker opts the project into automatic capture and injection.
+/// Legacy project-directory marker used through Argo v0.1.3.
 const ENABLED_MARKER: &str = "instructions-enabled";
 
-const INITIAL_BODY: &str = "# Argo project instructions\n\n<!-- Enabled with /instructions enable. Argo appends only prompts that clearly look like durable project instructions. Edit this file freely with /instructions edit. -->\n";
+/// Enablement now lives inside the one project file instead of a `.argo` folder.
+const ENABLED_STATE: &str = "<!-- argo-instructions: enabled -->";
+const DISABLED_STATE: &str = "<!-- argo-instructions: disabled -->";
+
+const INITIAL_BODY: &str = "<!-- argo-instructions: disabled -->\n# Argo project instructions\n\n<!-- Use /instructions enable to activate automatic capture and prompt injection. Argo appends only prompts that clearly look like durable project instructions. Edit this file freely with /instructions edit. -->\n";
 
 /// Largest instruction file Argo will inline.
 ///
@@ -61,6 +65,7 @@ pub struct Instructions {
 /// Walks upward until a repository root is reached, keeping the first file of each
 /// name so a nested `AGENTS.md` wins over the repository's.
 pub fn discover(workspace: &Path) -> Result<Vec<Instructions>> {
+    migrate_legacy_marker(workspace)?;
     let mut found: Vec<Instructions> = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
     let mut current = Some(workspace.to_path_buf());
@@ -72,6 +77,7 @@ pub fn discover(workspace: &Path) -> Result<Vec<Instructions>> {
     if is_enabled(workspace) {
         let candidate = instructions_path(workspace);
         if let Ok(raw) = std::fs::read_to_string(&candidate) {
+            let raw = without_state_marker(&raw);
             if has_meaningful_instructions(&raw) {
                 let (body, truncated) = bounded_body(raw);
                 seen_names.push(ARGO_INSTRUCTIONS_FILE.to_string());
@@ -170,7 +176,10 @@ fn marker_path(workspace: &Path) -> PathBuf {
 
 /// Whether automatic project instructions are active for this workspace.
 pub fn is_enabled(workspace: &Path) -> bool {
-    marker_path(workspace).is_file()
+    let embedded = std::fs::read_to_string(instructions_path(workspace))
+        .ok()
+        .and_then(|body| embedded_state(&body));
+    embedded == Some(true) || (embedded.is_none() && marker_path(workspace).is_file())
 }
 
 /// Creates the editable file when it does not exist.
@@ -186,34 +195,83 @@ pub fn ensure_file(workspace: &Path) -> Result<PathBuf> {
 /// Enables or disables automatic capture and prompt injection without deleting the file.
 pub fn set_enabled(workspace: &Path, enabled: bool) -> Result<PathBuf> {
     let path = ensure_file(workspace)?;
-    let marker = marker_path(workspace);
-    if enabled {
-        let argo_dir = marker.parent().expect("marker always has a parent");
-        std::fs::create_dir_all(argo_dir)?;
-        let ignore = argo_dir.join(".gitignore");
-        let mut ignore_body = std::fs::read_to_string(&ignore).unwrap_or_default();
-        let covers_marker = ignore_body.lines().any(|line| {
+    write_embedded_state(&path, enabled)?;
+    remove_legacy_marker(workspace)?;
+    Ok(path)
+}
+
+fn embedded_state(body: &str) -> Option<bool> {
+    body.lines().find_map(|line| match line.trim() {
+        ENABLED_STATE => Some(true),
+        DISABLED_STATE => Some(false),
+        _ => None,
+    })
+}
+
+fn without_state_marker(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
             let line = line.trim();
-            line == "*" || line == ENABLED_MARKER || line.strip_prefix('/') == Some(ENABLED_MARKER)
-        });
-        if !covers_marker {
-            if !ignore_body.is_empty() && !ignore_body.ends_with('\n') {
-                ignore_body.push('\n');
-            }
-            ignore_body.push_str("# Argo project-local runtime state.\n");
-            ignore_body.push_str(ENABLED_MARKER);
-            ignore_body.push('\n');
-            std::fs::write(ignore, ignore_body)?;
-        }
-        std::fs::write(marker, "enabled\n")?;
+            line != ENABLED_STATE && line != DISABLED_STATE
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn write_embedded_state(path: &Path, enabled: bool) -> Result<()> {
+    let body = std::fs::read_to_string(path)?;
+    let state = if enabled {
+        ENABLED_STATE
     } else {
-        match std::fs::remove_file(marker) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ArgoError::Io(format!("disable instructions: {error}"))),
+        DISABLED_STATE
+    };
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        if line.trim() == ENABLED_STATE || line.trim() == DISABLED_STATE {
+            if !replaced {
+                lines.push(state.to_string());
+                replaced = true;
+            }
+        } else {
+            lines.push(line.to_string());
         }
     }
-    Ok(path)
+    if !replaced {
+        lines.insert(0, state.to_string());
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    let temporary = path.with_extension("md.tmp");
+    std::fs::write(&temporary, updated)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+/// Moves v0.1.3 enablement into `.argo-instructions.md` on first access.
+fn migrate_legacy_marker(workspace: &Path) -> Result<()> {
+    if marker_path(workspace).is_file() {
+        let path = ensure_file(workspace)?;
+        // The legacy marker was authoritative in v0.1.3. `ensure_file` may have
+        // just created a disabled template, so the old marker must win here.
+        write_embedded_state(&path, true)?;
+        remove_legacy_marker(workspace)?;
+    }
+    Ok(())
+}
+
+fn remove_legacy_marker(workspace: &Path) -> Result<()> {
+    match std::fs::remove_file(marker_path(workspace)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ArgoError::Io(format!(
+                "remove legacy instruction state: {error}"
+            )))
+        }
+    }
+    crate::staging::cleanup_legacy_workspace_cache(workspace)?;
+    Ok(())
 }
 
 /// Appends durable directives found in a user prompt when the project opted in.
@@ -222,6 +280,7 @@ pub fn set_enabled(workspace: &Path, enabled: bool) -> Result<PathBuf> {
 /// capture is deterministic and limited to language that explicitly signals a
 /// lasting preference; `/instructions edit` remains authoritative.
 pub fn capture_user_directives(workspace: &Path, prompt: &str) -> Result<Vec<String>> {
+    migrate_legacy_marker(workspace)?;
     if !is_enabled(workspace) {
         return Ok(Vec::new());
     }
@@ -467,10 +526,13 @@ mod tests {
         // The initial comments and heading do not consume prompt context.
         assert!(discover(dir.path()).expect("discover").is_empty());
 
-        std::fs::write(&path, "# Rules\n\nAlways use pnpm.\n").expect("edit");
+        let mut body = std::fs::read_to_string(&path).expect("read");
+        body.push_str("\n# Rules\n\nAlways use pnpm.\n");
+        std::fs::write(&path, body).expect("edit");
         let found = discover(dir.path()).expect("discover");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, ARGO_INSTRUCTIONS_FILE);
+        assert!(!found[0].body.contains("argo-instructions: enabled"));
 
         set_enabled(dir.path(), false).expect("disable");
         assert!(!is_enabled(dir.path()));
@@ -482,17 +544,33 @@ mod tests {
     }
 
     #[test]
-    fn enabling_preserves_a_custom_argo_gitignore_and_ignores_only_the_marker() {
+    fn enablement_is_stored_only_in_the_instruction_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let argo_dir = dir.path().join(argo_core::ARGO_WORKSPACE_DIR);
-        std::fs::create_dir_all(&argo_dir).expect("argo dir");
-        let ignore = argo_dir.join(".gitignore");
-        std::fs::write(&ignore, "skills-staged/\n").expect("custom ignore");
+        let path = set_enabled(dir.path(), true).expect("enable");
+        let body = std::fs::read_to_string(path).expect("read");
+        assert!(body.lines().any(|line| line == ENABLED_STATE));
+        assert!(!dir.path().join(argo_core::ARGO_WORKSPACE_DIR).exists());
+    }
 
-        set_enabled(dir.path(), true).expect("enable");
-        let body = std::fs::read_to_string(ignore).expect("read");
-        assert!(body.contains("skills-staged/"));
-        assert!(body.lines().any(|line| line == ENABLED_MARKER));
+    #[test]
+    fn legacy_project_marker_migrates_into_the_instruction_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            ARGO_INSTRUCTIONS_FILE,
+            "# Rules\n\nAlways use pnpm.\n",
+        );
+        let marker = marker_path(dir.path());
+        std::fs::create_dir_all(marker.parent().expect("parent")).expect("argo dir");
+        std::fs::write(&marker, "enabled\n").expect("legacy marker");
+
+        let found = discover(dir.path()).expect("discover and migrate");
+        assert_eq!(found.len(), 1);
+        assert!(is_enabled(dir.path()));
+        assert!(!marker.exists());
+        assert!(std::fs::read_to_string(instructions_path(dir.path()))
+            .expect("instructions")
+            .contains(ENABLED_STATE));
     }
 
     #[test]

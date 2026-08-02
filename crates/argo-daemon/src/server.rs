@@ -77,6 +77,10 @@ fn resolve_resources_with(
     let workspace = std::path::Path::new(workspace_root);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
+    if let Err(error) = argo_resources::cleanup_legacy_workspace_cache(workspace) {
+        tracing::warn!(%error, "could not remove legacy project-local skill cache");
+    }
+
     let skills = match argo_resources::discover(workspace, &paths.user_skills(), home.as_deref()) {
         Ok(skills) => skills,
         Err(error) => {
@@ -85,7 +89,10 @@ fn resolve_resources_with(
         }
     };
 
-    let staged = match argo_resources::stage(workspace, &skills) {
+    // Skill copies are user-level cache data, not project state. Absolute paths
+    // let every adapter read the same protected copy without creating `.argo` in
+    // the workspace.
+    let staged = match argo_resources::stage(&paths.staging().join("skills"), &skills) {
         Ok(staged) => staged,
         Err(error) => {
             tracing::warn!(%error, "skill staging failed; continuing without skills");
@@ -108,8 +115,10 @@ fn resolve_resources_with(
                 .unwrap_or(description)
                 .trim();
             format!(
-                "{} — {} ({}/SKILL.md)",
-                entry.name, description, entry.relative
+                "{} — {} (instructions: {})",
+                entry.name,
+                description,
+                entry.instructions_path().display()
             )
         })
         .collect();

@@ -242,8 +242,7 @@ mod tests {
                 files_touched: vec!["src/lib.rs".into()],
             },
             active_skills: vec![
-                "pr-review — Review pull requests (.argo/skills-staged/pr-review-ab12/SKILL.md)"
-                    .into(),
+                "pr-review — Review pull requests (instructions: /argo-cache/skills/pr-review-ab12/SKILL.md)".into(),
             ],
             active_mcp_servers: vec!["argo-delegation".into()],
             project_instructions: Some(

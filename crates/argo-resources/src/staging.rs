@@ -1,16 +1,19 @@
 //! Skill staging.
 //!
-//! Selected skills are copied into a project-private directory before a run, and
-//! the agent is pointed at the copy. This is deliberately a real copy rather than
-//! a symlink, for two reasons OpenDesign learned the hard way: symlink semantics
-//! differ across filesystems, and an agent that edits a linked file would mutate
-//! the user's source skill.
+//! Selected skills are copied into Argo's user-level cache before a run, and the
+//! agent is pointed at the copy. This is deliberately a real copy rather than a
+//! symlink: symlink semantics differ across filesystems, and an agent that edits a
+//! linked file would mutate the user's source skill. Keeping the cache outside the
+//! workspace also avoids adding runtime-only `.argo` directories to every project.
 
 use argo_core::error::{ArgoError, Result};
 use argo_core::sha256_hex;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use crate::skills::Skill;
+
+const LEGACY_IGNORE: &str = "# Created by Argo. Staged run inputs, not source.\n*\n";
 
 /// A staged copy of one skill.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,42 +22,35 @@ pub struct StagedSkill {
     pub name: String,
     /// Absolute path of the staged copy.
     pub path: PathBuf,
-    /// Path relative to the workspace, for use in prompts.
-    pub relative: String,
 }
 
-/// Copies `skills` into `<workspace>/.argo/skills-staged/`.
+impl StagedSkill {
+    /// Absolute instructions file exposed to the selected CLI.
+    pub fn instructions_path(&self) -> PathBuf {
+        self.path.join("SKILL.md")
+    }
+}
+
+/// Copies `skills` into Argo's user-level `cache_root`.
 ///
 /// The destination name includes a hash of the source path so two skills sharing a
 /// name from different roots cannot collide in the staging tree.
-pub fn stage(workspace: &Path, skills: &[Skill]) -> Result<Vec<StagedSkill>> {
+pub fn stage(cache_root: &Path, skills: &[Skill]) -> Result<Vec<StagedSkill>> {
     if skills.is_empty() {
         return Ok(Vec::new());
     }
-    let argo_dir = workspace.join(argo_core::ARGO_WORKSPACE_DIR);
-    let root = argo_dir.join("skills-staged");
-    std::fs::create_dir_all(&root)?;
-
-    // Argo's working directory is build output, not source. Writing the ignore
-    // rule here keeps staged copies out of the user's commits and diffs.
-    let ignore = argo_dir.join(".gitignore");
-    if !ignore.exists() {
-        std::fs::write(
-            &ignore,
-            "# Created by Argo. Staged run inputs, not source.\n*\n",
-        )?;
-    }
+    std::fs::create_dir_all(cache_root)?;
 
     let mut staged = Vec::new();
     for skill in skills {
         let hash = sha256_hex(&skill.dir.to_string_lossy());
         let dir_name = format!("{}-{}", skill.name, &hash[..8]);
-        let destination = root.join(&dir_name);
+        let destination = cache_root.join(&dir_name);
 
-        // Copying every discovered skill on every turn is the difference between
-        // a fast turn and a slow one once a user has dozens installed, so an
-        // unchanged skill is left alone.
-        if needs_refresh(&skill.dir, &destination) {
+        // Compare the complete tree, not only SKILL.md: references, scripts, and
+        // assets are part of a skill too. This also restores a cached copy if an
+        // agent changed it during an earlier run.
+        if needs_refresh(&skill.dir, &destination)? {
             if destination.exists() {
                 std::fs::remove_dir_all(&destination)?;
             }
@@ -64,33 +60,93 @@ pub fn stage(workspace: &Path, skills: &[Skill]) -> Result<Vec<StagedSkill>> {
         staged.push(StagedSkill {
             name: skill.name.clone(),
             path: destination,
-            relative: format!("{}/skills-staged/{dir_name}", argo_core::ARGO_WORKSPACE_DIR),
         });
     }
     Ok(staged)
 }
 
-/// True when the staged copy is missing or older than its source manifest.
+/// Removes the project-local cache written by Argo v0.1.3 and earlier.
 ///
-/// Compares the manifest rather than walking the tree: it is the file that changes
-/// when a skill is edited, and stat-ing one path per skill keeps this cheap.
-fn needs_refresh(source: &Path, destination: &Path) -> bool {
-    let staged_manifest = destination.join("SKILL.md");
-    if !staged_manifest.exists() {
-        return true;
+/// User-authored `.argo/skills` and custom `.argo` files are never removed. The
+/// directory itself is deleted only when the legacy cache and Argo's exact
+/// generated ignore file were its final contents.
+pub fn cleanup_legacy_workspace_cache(workspace: &Path) -> Result<()> {
+    let argo_dir = workspace.join(argo_core::ARGO_WORKSPACE_DIR);
+    let legacy_cache = argo_dir.join("skills-staged");
+    if legacy_cache.is_dir() {
+        std::fs::remove_dir_all(&legacy_cache)?;
     }
-    let source_time = std::fs::metadata(source.join("SKILL.md"))
-        .and_then(|m| m.modified())
-        .ok();
-    let staged_time = std::fs::metadata(&staged_manifest)
-        .and_then(|m| m.modified())
-        .ok();
-    match (source_time, staged_time) {
-        (Some(source_time), Some(staged_time)) => source_time > staged_time,
-        // If either timestamp is unavailable, re-copy rather than risk serving a
-        // stale skill.
-        _ => true,
+
+    let ignore = argo_dir.join(".gitignore");
+    let only_generated_ignore = std::fs::read_to_string(&ignore)
+        .ok()
+        .is_some_and(|body| body == LEGACY_IGNORE)
+        && std::fs::read_dir(&argo_dir)
+            .ok()
+            .is_some_and(|mut entries| {
+                entries.all(|entry| entry.is_ok_and(|entry| entry.path() == ignore))
+            });
+    if only_generated_ignore {
+        std::fs::remove_file(&ignore)?;
+        std::fs::remove_dir(&argo_dir)?;
     }
+    Ok(())
+}
+
+/// True when any file, directory, script, reference, or asset differs.
+fn needs_refresh(source: &Path, destination: &Path) -> Result<bool> {
+    if !destination.is_dir() {
+        return Ok(true);
+    }
+    Ok(tree_fingerprint(source)? != tree_fingerprint(destination)?)
+}
+
+/// Content fingerprint for a complete skill tree, independent of traversal order.
+fn tree_fingerprint(root: &Path) -> Result<String> {
+    let mut entries = walkdir::WalkDir::new(root)
+        .max_depth(16)
+        .follow_links(true)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| ArgoError::Io(format!("walk skill tree: {error}")))?;
+    entries.retain(|entry| entry.path() != root);
+    entries.sort_by(|left, right| {
+        left.path()
+            .strip_prefix(root)
+            .unwrap_or(left.path())
+            .cmp(right.path().strip_prefix(root).unwrap_or(right.path()))
+    });
+
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| ArgoError::Io(format!("relativize skill path: {error}")))?;
+        let relative = relative.to_string_lossy();
+        hash_field(&mut hasher, relative.as_bytes());
+        if entry.file_type().is_dir() {
+            hash_field(&mut hasher, b"directory");
+        } else {
+            hash_field(&mut hasher, b"file");
+            let body = std::fs::read(entry.path()).map_err(|error| {
+                ArgoError::Io(format!(
+                    "read skill file {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            hash_field(&mut hasher, &body);
+        }
+    }
+
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Length-prefixing makes path/content boundaries unambiguous in the digest.
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 /// Recursively copies a directory, dereferencing symlinks.
@@ -144,12 +200,14 @@ pub fn render_prompt_section(staged: &[StagedSkill], skills: &[Skill]) -> String
             .map(|s| s.description.as_str())
             .unwrap_or_default();
         lines.push(format!(
-            "- {} — {}\n  instructions: {}/SKILL.md",
-            entry.name, description, entry.relative
+            "- {} — {}\n  instructions: {}",
+            entry.name,
+            description,
+            entry.instructions_path().display()
         ));
     }
     lines.push(
-        "Read a skill's SKILL.md before following it. Paths are relative to the workspace root."
+        "Read a skill's SKILL.md before following it. Instruction paths are absolute Argo cache paths."
             .to_string(),
     );
     lines.join("\n")
@@ -187,17 +245,16 @@ mod tests {
     fn stages_a_skill_with_its_side_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "pr-review");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("argo-data/staging/skills");
 
-        let staged = stage(&workspace, &[skill(source, "pr-review")]).expect("stage");
+        let staged = stage(&cache, &[skill(source, "pr-review")]).expect("stage");
         assert_eq!(staged.len(), 1);
         assert!(staged[0].path.join("SKILL.md").exists());
         assert!(
             staged[0].path.join("references/extra.md").exists(),
             "reference files must travel with the skill"
         );
-        assert!(staged[0].relative.starts_with(".argo/skills-staged/"));
+        assert!(staged[0].path.starts_with(cache));
     }
 
     #[test]
@@ -205,10 +262,9 @@ mod tests {
         // An agent that rewrites a staged file must not corrupt the user's skill.
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "deploy");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("cache");
 
-        let staged = stage(&workspace, &[skill(source.clone(), "deploy")]).expect("stage");
+        let staged = stage(&cache, &[skill(source.clone(), "deploy")]).expect("stage");
         std::fs::write(staged[0].path.join("SKILL.md"), "OVERWRITTEN").expect("write");
 
         let original = std::fs::read_to_string(source.join("SKILL.md")).expect("read");
@@ -221,24 +277,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let a = make_source(&dir.path().join("root-a"), "shared");
         let b = make_source(&dir.path().join("root-b"), "shared");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("cache");
 
-        let staged = stage(&workspace, &[skill(a, "shared"), skill(b, "shared")]).expect("stage");
+        let staged = stage(&cache, &[skill(a, "shared"), skill(b, "shared")]).expect("stage");
         assert_eq!(staged.len(), 2);
         assert_ne!(staged[0].path, staged[1].path);
     }
 
     #[test]
-    fn staging_writes_a_gitignore_so_copies_never_reach_a_commit() {
+    fn staging_never_writes_inside_the_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "ignored");
         let workspace = dir.path().join("repo");
         std::fs::create_dir_all(&workspace).expect("mkdir");
-        stage(&workspace, &[skill(source, "ignored")]).expect("stage");
-        let ignore = workspace.join(".argo/.gitignore");
-        assert!(ignore.exists());
-        assert!(std::fs::read_to_string(ignore).expect("read").contains('*'));
+        let cache = dir.path().join("argo-data/staging/skills");
+
+        stage(&cache, &[skill(source, "ignored")]).expect("stage");
+
+        assert!(!workspace.join(".argo").exists());
+        assert!(cache.is_dir());
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_legacy_generated_project_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argo_dir = dir.path().join(".argo");
+        std::fs::create_dir_all(argo_dir.join("skills-staged/old")).expect("legacy cache");
+        std::fs::write(argo_dir.join("skills-staged/old/SKILL.md"), "old").expect("old skill");
+        std::fs::write(argo_dir.join(".gitignore"), LEGACY_IGNORE).expect("ignore");
+
+        cleanup_legacy_workspace_cache(dir.path()).expect("cleanup");
+
+        assert!(!argo_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_user_authored_project_skills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argo_dir = dir.path().join(".argo");
+        std::fs::create_dir_all(argo_dir.join("skills-staged/old")).expect("legacy cache");
+        std::fs::create_dir_all(argo_dir.join("skills/custom")).expect("project skill");
+        std::fs::write(argo_dir.join("skills/custom/SKILL.md"), "custom").expect("skill");
+        std::fs::write(argo_dir.join(".gitignore"), LEGACY_IGNORE).expect("ignore");
+
+        cleanup_legacy_workspace_cache(dir.path()).expect("cleanup");
+
+        assert!(!argo_dir.join("skills-staged").exists());
+        assert!(argo_dir.join("skills/custom/SKILL.md").is_file());
+        assert!(argo_dir.join(".gitignore").is_file());
     }
 
     #[test]
@@ -247,58 +333,95 @@ mod tests {
         // between a responsive turn and a sluggish one.
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "stable");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("cache");
 
-        let first = stage(&workspace, &[skill(source.clone(), "stable")]).expect("first");
-        let marker = first[0].path.join("marker.txt");
-        std::fs::write(&marker, "untouched").expect("write");
+        let first = stage(&cache, &[skill(source.clone(), "stable")]).expect("first");
+        let manifest = first[0].instructions_path();
+        let modified = std::fs::metadata(&manifest)
+            .and_then(|metadata| metadata.modified())
+            .expect("modified");
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
-        stage(&workspace, &[skill(source, "stable")]).expect("second");
-        // A wholesale re-copy would have deleted the marker.
-        assert!(marker.exists(), "unchanged skill must not be recopied");
+        stage(&cache, &[skill(source, "stable")]).expect("second");
+        assert_eq!(
+            std::fs::metadata(manifest)
+                .and_then(|metadata| metadata.modified())
+                .expect("modified"),
+            modified,
+            "unchanged skill must not be recopied"
+        );
     }
 
     #[test]
     fn restaging_refreshes_an_edited_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "iterate");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("cache");
 
-        stage(&workspace, &[skill(source.clone(), "iterate")]).expect("first");
-        // Filesystem timestamps have coarse resolution; wait so the edit is
-        // unambiguously newer than the staged copy.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        stage(&cache, &[skill(source.clone(), "iterate")]).expect("first");
         std::fs::write(source.join("SKILL.md"), "---\nname: iterate\n---\nUPDATED").expect("write");
-        let staged = stage(&workspace, &[skill(source, "iterate")]).expect("second");
+        let staged = stage(&cache, &[skill(source, "iterate")]).expect("second");
 
         let content = std::fs::read_to_string(staged[0].path.join("SKILL.md")).expect("read");
         assert!(content.contains("UPDATED"));
     }
 
     #[test]
+    fn restaging_refreshes_changed_side_files_and_removes_deleted_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = make_source(&dir.path().join("src"), "complete-tree");
+        let cache = dir.path().join("cache");
+        let side_file = source.join("references/extra.md");
+
+        stage(&cache, &[skill(source.clone(), "complete-tree")]).expect("first");
+        std::fs::write(&side_file, "updated reference").expect("edit reference");
+        let staged = stage(&cache, &[skill(source.clone(), "complete-tree")]).expect("updated");
+        assert_eq!(
+            std::fs::read_to_string(staged[0].path.join("references/extra.md"))
+                .expect("staged reference"),
+            "updated reference"
+        );
+
+        std::fs::remove_file(side_file).expect("remove reference");
+        let staged = stage(&cache, &[skill(source, "complete-tree")]).expect("removed");
+        assert!(!staged[0].path.join("references/extra.md").exists());
+    }
+
+    #[test]
+    fn restaging_repairs_a_cache_modified_by_an_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = make_source(&dir.path().join("src"), "repair");
+        let cache = dir.path().join("cache");
+        let first = stage(&cache, &[skill(source.clone(), "repair")]).expect("first");
+        std::fs::write(first[0].instructions_path(), "MUTATED").expect("mutate cache");
+
+        let staged = stage(&cache, &[skill(source, "repair")]).expect("repair");
+        let body = std::fs::read_to_string(staged[0].instructions_path()).expect("read");
+        assert!(body.contains("name: repair"));
+        assert!(!body.contains("MUTATED"));
+    }
+
+    #[test]
     fn staging_nothing_creates_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
-        assert!(stage(&workspace, &[]).expect("stage").is_empty());
-        assert!(!workspace.join(".argo/skills-staged").exists());
+        let cache = dir.path().join("cache");
+        assert!(stage(&cache, &[]).expect("stage").is_empty());
+        assert!(!cache.exists());
     }
 
     #[test]
     fn prompt_section_lists_names_paths_and_descriptions_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = make_source(&dir.path().join("src"), "pr-review");
-        let workspace = dir.path().join("repo");
-        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let cache = dir.path().join("cache");
         let skills = vec![skill(source, "pr-review")];
-        let staged = stage(&workspace, &skills).expect("stage");
+        let staged = stage(&cache, &skills).expect("stage");
 
         let section = render_prompt_section(&staged, &skills);
         assert!(section.contains("## Available skills"));
         assert!(section.contains("pr-review — does pr-review"));
         assert!(section.contains("/SKILL.md"));
+        assert!(section.contains(&cache.display().to_string()));
         // The body is not inlined; the agent reads it on demand.
         assert!(!section.contains("body"));
     }

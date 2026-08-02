@@ -61,7 +61,10 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
   model is running.
 - Recognizes deliberate numbered choices and presents a keyboard picker.
 - Keeps mouse-wheel scrolling and drag-to-select/copy active at the same time.
-- Shares skills and MCP servers across compatible agents.
+- Discovers project and global skills for every compatible agent, while keeping
+  protected staged copies in Argo's user-level cache instead of each project.
+- Refreshes a staged skill whenever its instructions, scripts, references, or
+  assets change, and repairs cache copies modified by an earlier agent run.
 - Delegates work to another CLI while preserving parent/child lineage.
 - Updates the conversation title to the current request and keeps a short
   description of the conversation's starting point and current focus.
@@ -372,8 +375,9 @@ Default state locations:
 - override: `ARGO_DATA_DIR=/custom/path`
 
 SQLite uses WAL mode and a per-user daemon serializes writes. MCP secrets are
-written atomically with owner-only permissions. See [docs/usage.md](docs/usage.md)
-for context, queue, and recovery details.
+written atomically with owner-only permissions. Skill staging is stored below the
+same user-level data directory; Argo does not create a project `.argo` directory
+for it. See [docs/usage.md](docs/usage.md) for context, queue, and recovery details.
 
 ## Architecture
 

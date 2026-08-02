@@ -17,7 +17,7 @@ pub use mcp::{
     McpServer, McpTransport,
 };
 pub use skills::{discover, is_valid_name, Skill, SkillOrigin};
-pub use staging::{render_prompt_section, stage, StagedSkill};
+pub use staging::{cleanup_legacy_workspace_cache, render_prompt_section, stage, StagedSkill};
 
 /// Shortens a server's error body for inclusion in a message.
 ///
