@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 /// Most composer lines shown before it stops growing.
 const MAX_COMPOSER_LINES: usize = 8;
@@ -62,9 +63,14 @@ fn panel(title: impl Into<String>, focused: bool) -> Block<'static> {
 
 /// Draws one frame.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    // The composer grows with multi-line input, up to a cap so the transcript is
-    // never squeezed out.
-    let composer_rows = (app.input_line_count().min(MAX_COMPOSER_LINES) as u16) + 2;
+    // Size from visual rows, not just explicit newlines. A long prompt in a narrow
+    // terminal must grow the composer as it wraps instead of painting each new
+    // character over the only allocated content row.
+    let composer_width = frame.area().width.saturating_sub(2).max(1) as usize;
+    let visual_rows = wrap_composer(&app.input, app.cursor, composer_width)
+        .lines
+        .len();
+    let composer_rows = (visual_rows.min(MAX_COMPOSER_LINES) as u16) + 2;
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -662,62 +668,118 @@ fn draw_text_overlay(
 }
 
 fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let line_count = app.input_line_count();
+    let logical_line_count = app.input_line_count();
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let wrapped = wrap_composer(&app.input, app.cursor, inner_width);
+    let visual_row_count = wrapped.lines.len();
     let hint = match app.activity_indicator() {
         Some(indicator) => format!(" {indicator} — Esc cancels "),
-        None if line_count > MAX_COMPOSER_LINES && app.has_multiline_paste() => {
-            format!(" pasted text · {} lines · Enter submits all ", line_count)
+        None if visual_row_count > MAX_COMPOSER_LINES && app.has_multiline_paste() => {
+            format!(
+                " pasted text · {} lines · Enter submits all ",
+                logical_line_count
+            )
         }
-        None if line_count > MAX_COMPOSER_LINES => {
-            format!(" ↑ {} lines · Enter submits all ", line_count)
+        None if visual_row_count > MAX_COMPOSER_LINES => {
+            format!(" ↑ {} rows · Enter submits all ", visual_row_count)
         }
         None => " message — / for commands ".to_string(),
     };
 
-    // For large inputs, show only the lines around the cursor so the composer
-    // stays compact — similar to Claude Code and Codex paste behavior.
+    // For large inputs, show only the visual rows around the cursor so a long
+    // soft-wrapped line follows the caret just like an explicit multiline input.
     let inner_height = area.height.saturating_sub(2) as usize;
-    let display_text = if line_count > inner_height && inner_height > 0 {
-        let (cursor_row, _) = app.caret_row_column();
-        // Show a window of lines centered on the cursor row.
-        let lines: Vec<&str> = app.input.split('\n').collect();
+    let (window_start, window_end) = if visual_row_count > inner_height && inner_height > 0 {
         let half = inner_height / 2;
-        let start = cursor_row.saturating_sub(half);
-        let end = (start + inner_height).min(lines.len());
+        let start = wrapped.cursor_row.saturating_sub(half);
+        let end = (start + inner_height).min(visual_row_count);
         let start = end.saturating_sub(inner_height);
-        lines[start..end].join("\n")
+        (start, end)
     } else {
-        app.input.clone()
+        (0, visual_row_count)
     };
+    let display_text = wrapped.lines[window_start..window_end].join("\n");
 
-    let paragraph = Paragraph::new(display_text.as_str())
-        .block(panel(hint, !app.is_busy()))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(display_text.as_str()).block(panel(hint, !app.is_busy()));
     frame.render_widget(paragraph, area);
 
-    // Place the real terminal caret so editing feels native. Rows come from
-    // newlines, not from dividing the caret index, which breaks on multi-line input.
+    // Place the real terminal caret on the same visual row produced above.
     if !app.has_overlay() {
-        let inner_width = area.width.saturating_sub(2).max(1) as usize;
-        let (row, column) = app.caret_row_column();
-        // When displaying a windowed view, adjust row relative to window start.
-        let display_row = if line_count > inner_height && inner_height > 0 {
-            let half = inner_height / 2;
-            let start = row.saturating_sub(half);
-            let end = (start + inner_height).min(line_count);
-            let start = end.saturating_sub(inner_height);
-            row - start
-        } else {
-            row
-        };
-        // Account for wrapping within the caret's own line.
-        let wrapped_row = display_row + column / inner_width;
-        let wrapped_column = column % inner_width;
+        let display_row = wrapped.cursor_row.saturating_sub(window_start);
         let max_row = area.height.saturating_sub(3) as usize;
         frame.set_cursor_position((
-            area.x + 1 + wrapped_column as u16,
-            area.y + 1 + wrapped_row.min(max_row) as u16,
+            area.x + 1 + wrapped.cursor_column.min(inner_width) as u16,
+            area.y + 1 + display_row.min(max_row) as u16,
         ));
+    }
+}
+
+/// Soft-wraps composer text at terminal cell boundaries and records where the
+/// character-indexed caret lands. Keeping text and caret geometry in one pass
+/// prevents narrow terminals from rendering one while positioning the other as
+/// if the input were still a single line.
+#[derive(Debug, PartialEq, Eq)]
+struct WrappedComposer {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+fn wrap_composer(input: &str, cursor: usize, width: usize) -> WrappedComposer {
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut row = 0usize;
+    let mut column = 0usize;
+    let mut at_right_edge = false;
+    let mut caret = None;
+    let char_count = input.chars().count();
+    let cursor = cursor.min(char_count);
+
+    for (index, ch) in input.chars().enumerate() {
+        if index == cursor {
+            caret = Some(if at_right_edge {
+                (row + 1, 0)
+            } else {
+                (row, column)
+            });
+        }
+
+        if ch == '\n' {
+            lines.push(String::new());
+            row += 1;
+            column = 0;
+            at_right_edge = false;
+            continue;
+        }
+
+        let char_width = ch.width().unwrap_or(0);
+        if char_width > 0 && (at_right_edge || (column > 0 && column + char_width > width)) {
+            lines.push(String::new());
+            row += 1;
+            column = 0;
+            at_right_edge = false;
+        }
+
+        lines[row].push(ch);
+        column = column.saturating_add(char_width);
+        if char_width > 0 && column >= width {
+            at_right_edge = true;
+        }
+    }
+
+    let (cursor_row, cursor_column) = caret.unwrap_or_else(|| {
+        if at_right_edge {
+            lines.push(String::new());
+            (row + 1, 0)
+        } else {
+            (row, column)
+        }
+    });
+
+    WrappedComposer {
+        lines,
+        cursor_row,
+        cursor_column,
     }
 }
 
@@ -1432,6 +1494,55 @@ mod tests {
         let output = render(&app, 60, 16);
         assert!(output.contains("first line"));
         assert!(output.contains("second line"));
+    }
+
+    #[test]
+    fn a_long_composer_soft_wraps_and_grows_in_a_narrow_terminal() {
+        let mut app = App::new("/repo");
+        for ch in "abcdefghijklmnopqrstuvwxyz".chars() {
+            app.insert(ch);
+        }
+
+        let output = render(&app, 16, 14);
+        let rows = output.lines().collect::<Vec<_>>();
+        let first = rows
+            .iter()
+            .position(|row| row.contains("abcdefghijklmn"))
+            .expect("first wrapped composer row");
+        let second = rows
+            .iter()
+            .position(|row| row.contains("opqrstuvwxyz"))
+            .expect("second wrapped composer row");
+
+        assert_eq!(second, first + 1, "wrapped rows must not overlap: {output}");
+    }
+
+    #[test]
+    fn composer_wrapping_tracks_the_caret_and_terminal_cell_width() {
+        assert_eq!(
+            wrap_composer("abcdefghijkl", 12, 5),
+            WrappedComposer {
+                lines: vec!["abcde".into(), "fghij".into(), "kl".into()],
+                cursor_row: 2,
+                cursor_column: 2,
+            }
+        );
+        assert_eq!(
+            wrap_composer("abcde", 5, 5),
+            WrappedComposer {
+                lines: vec!["abcde".into(), "".into()],
+                cursor_row: 1,
+                cursor_column: 0,
+            }
+        );
+        assert_eq!(
+            wrap_composer("界界a", 3, 4),
+            WrappedComposer {
+                lines: vec!["界界".into(), "a".into()],
+                cursor_row: 1,
+                cursor_column: 1,
+            }
+        );
     }
 
     #[test]
