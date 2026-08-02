@@ -63,8 +63,8 @@ const AGENT_NAME_COLOR: Color = Color::Rgb(170, 180, 200);
 
 /// Builds the splash shown in an empty conversation.
 ///
-/// `agents` is the rendered detected-agent summary, and `version` identifies the
-/// build so a bug report can name it.
+/// `agents` contains CLI names with any detected versions, and `version`
+/// identifies the Argo build so a bug report can name it.
 pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'static>> {
     splash_with_selection(width, version, agents, None)
 }

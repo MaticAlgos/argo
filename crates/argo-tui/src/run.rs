@@ -258,6 +258,18 @@ async fn run_inner(
         app.agents = agents;
     }
 
+    // The opening picker promises the user's installed CLI versions. Keep the
+    // daemon's startup inventory lightweight, then run only the cheap `--version`
+    // command for every available adapter concurrently. Full model/auth probing
+    // remains deferred until the user chooses a CLI.
+    let versions =
+        futures::future::join_all(app.agents.iter().map(argo_runtime::detect_version)).await;
+    for (agent, version) in app.agents.iter_mut().zip(versions) {
+        if version.is_some() {
+            agent.version = version;
+        }
+    }
+
     match crate::preferences::load(paths) {
         Ok(selection) => app.default_selection = selection,
         Err(error) => app.set_status(format!("startup default ignored: {error}")),
@@ -2145,13 +2157,15 @@ fn open_agent_picker(app: &mut App, title: &str, action: PickerAction) {
     let items = available
         .iter()
         .map(|info| {
-            let detail = crate::app::agent_picker_detail(info);
             let is_default = app
                 .default_selection
                 .as_ref()
                 .is_some_and(|selection| selection.agent == info.id);
             let default_mark = if is_default { " ★ default" } else { "" };
-            format!("{:<18} {detail}{default_mark}", info.name)
+            match crate::app::agent_display_version(info) {
+                Some(version) => format!("{:<18} {version}{default_mark}", info.name),
+                None => format!("{}{default_mark}", info.name),
+            }
         })
         .collect();
     let values = available.iter().map(|info| info.id.clone()).collect();
@@ -2169,11 +2183,10 @@ fn open_agents_picker(app: &mut App) {
                 .is_some_and(|selection| selection.agent == info.id);
             let default_mark = if is_default { " ★ default" } else { "" };
             if info.available {
-                format!(
-                    "✓ {:<16} {}{default_mark}",
-                    info.name,
-                    crate::app::agent_picker_detail(info)
-                )
+                match crate::app::agent_display_version(info) {
+                    Some(version) => format!("✓ {:<16} {version}{default_mark}", info.name),
+                    None => format!("✓ {}{default_mark}", info.name),
+                }
             } else {
                 format!("· {:<16} not detected{default_mark}", info.name)
             }
@@ -4184,6 +4197,13 @@ mod tests {
             crate::app::Overlay::Picker { action, items, .. } => {
                 assert_eq!(*action, PickerAction::Agents);
                 assert!(items.iter().any(|item| item.contains("★ default")));
+                let codex = items
+                    .iter()
+                    .find(|item| item.contains("Codex"))
+                    .expect("Codex row");
+                assert!(codex.contains("1.2.3"), "{codex}");
+                assert!(!codex.contains("model"), "{codex}");
+                assert!(!codex.contains("delegation"), "{codex}");
                 assert!(items
                     .iter()
                     .any(|item| item.contains("Claude") && item.contains("not detected")));

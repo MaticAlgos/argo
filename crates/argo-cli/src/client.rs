@@ -239,6 +239,18 @@ pub async fn update(check_only: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stops the daemon and removes only the installed Argo executable.
+pub async fn uninstall(paths: &ArgoPaths) -> Result<()> {
+    stop(paths).await?;
+    let executable = argo_runtime::update::uninstall_current_executable()?;
+    println!("uninstalled Argo from {}", executable.display());
+    println!(
+        "conversations and configuration were preserved in {}",
+        paths.root().display()
+    );
+    Ok(())
+}
+
 /// Lists detected agents.
 pub async fn agents(paths: &ArgoPaths, refresh: bool) -> Result<()> {
     let mut client = Client::connect(paths).await?;

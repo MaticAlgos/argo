@@ -81,6 +81,13 @@ argo update --check
 argo update
 ```
 
+Uninstall the active Argo executable while preserving conversations and
+configuration:
+
+```bash
+argo --uninstall
+```
+
 ```bash
 cd /path/to/project
 argo doctor
@@ -91,6 +98,10 @@ argo
 
 With no saved default, Argo opens its CLI picker over the welcome screen. Pick a
 CLI, then a model, then an effort level only when that exact model supports one.
+Each CLI row shows only its friendly name and the version detected from that
+user's installed binary. These short version checks run concurrently; model
+counts and delegation internals are intentionally left for the later selection
+and diagnostic screens.
 
 - `Enter` chooses the highlighted CLI for this conversation.
 - `Space` chooses it and saves the completed CLI + model + optional effort as the

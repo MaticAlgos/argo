@@ -249,15 +249,16 @@ argo doctor
 
 ## Uninstall
 
-Stop the daemon and remove the executable:
+Stop the daemon and remove the currently running Argo executable:
 
 ```bash
-argo stop
-rm -f ~/.local/bin/argo
+argo --uninstall
 ```
 
-This intentionally preserves conversations and configuration. Default state
-locations are:
+This works for the default and custom installation directories because Argo
+removes the exact executable that handled the command. It refuses to remove a
+`target/debug` or `target/release` development build. Conversations and
+configuration are intentionally preserved. Default state locations are:
 
 - macOS: `~/Library/Application Support/dev.argo.argo`
 - Linux: `~/.local/share/argo`
@@ -275,6 +276,13 @@ rm -rf "$HOME/.local/share/argo"
 ```
 
 If `ARGO_DATA_DIR` was set, remove that custom directory instead.
+
+If an old build predates `--uninstall`, use the manual fallback:
+
+```bash
+argo stop
+rm -f ~/.local/bin/argo
+```
 
 ## Troubleshooting
 

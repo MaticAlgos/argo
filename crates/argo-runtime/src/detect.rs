@@ -23,6 +23,8 @@ use tokio::process::Command;
 
 /// Default timeout for the version probe.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Short startup-only timeout used when the TUI needs labels, not capabilities.
+const STARTUP_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default timeout for the help probe.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -98,7 +100,7 @@ pub fn discover_one(def: &'static RuntimeDef) -> AgentInfo {
                 capabilities: def.capabilities.clone(),
                 diagnostics: {
                     let mut diagnostics = vec![
-                        "installed; version, authentication, and live models load only when selected"
+                        "installed; authentication and live models load only when selected"
                             .to_string(),
                     ];
                     diagnostics.extend(crate::def::capability_diagnostics(def));
@@ -121,6 +123,23 @@ pub fn discover_one(def: &'static RuntimeDef) -> AgentInfo {
 /// Lightweight discovery for all registered adapters — filesystem only.
 pub fn discover_all_lightweight() -> Vec<AgentInfo> {
     ADAPTERS.iter().map(discover_one).collect()
+}
+
+/// Reads only an installed CLI's version for the TUI label.
+///
+/// This never probes authentication, help output, or models. Callers can launch
+/// it for every installed adapter concurrently; the short per-process timeout
+/// ensures one broken `--version` implementation cannot noticeably stall Argo's
+/// opening screen.
+pub async fn detect_version(info: &AgentInfo) -> Option<String> {
+    if !info.available {
+        return None;
+    }
+    let path = info.path.as_deref()?;
+    let definition = crate::find(&info.id)?;
+    run(path, definition.version_args, STARTUP_VERSION_TIMEOUT)
+        .await
+        .and_then(|output| extract_version(&output))
 }
 
 /// Output of one probe.
@@ -570,5 +589,12 @@ mod tests {
                 info.id
             );
         }
+    }
+
+    #[tokio::test]
+    async fn startup_version_probe_skips_an_unavailable_adapter() {
+        let definition = crate::find("codex").expect("Codex definition");
+        let info = AgentInfo::unavailable(definition, "test fixture");
+        assert_eq!(detect_version(&info).await, None);
     }
 }

@@ -289,9 +289,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .agents
             .iter()
             .filter(|info| info.available)
-            .map(|info| {
-                let detail = crate::app::agent_picker_detail(info);
-                format!("{:<10} {detail}", info.name)
+            .map(|info| match crate::app::agent_display_version(info) {
+                Some(version) => format!("{:<10} {version}", info.name),
+                None => info.name.clone(),
             })
             .collect();
         // `splash` returns owned lines, so they coerce into the borrowed vector.

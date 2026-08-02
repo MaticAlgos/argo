@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<String>,
 
+    /// Stop Argo and remove this installed executable; conversations are preserved.
+    #[arg(long)]
+    uninstall: bool,
+
     /// Resume a conversation directly by its full id.
     #[arg(long)]
     resume: Option<String>,
@@ -255,6 +259,15 @@ fn exit_code(error: &ArgoError) -> i32 {
 async fn run(cli: Cli) -> Result<()> {
     let paths = ArgoPaths::resolve()?;
 
+    if cli.uninstall {
+        if cli.resume.is_some() || cli.command.is_some() {
+            return Err(ArgoError::Invalid(
+                "--uninstall cannot be combined with --resume or a subcommand".into(),
+            ));
+        }
+        return client::uninstall(&paths).await;
+    }
+
     // --resume takes priority over a subcommand when no subcommand is given.
     if let Some(resume_id) = cli.resume {
         if cli.command.is_some() {
@@ -459,6 +472,13 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["argo", "update", "--check", "--force"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_is_an_explicit_top_level_flag() {
+        let cli = Cli::try_parse_from(["argo", "--uninstall"]).expect("uninstall parse");
+        assert!(cli.uninstall);
+        assert!(cli.command.is_none());
     }
 
     #[test]

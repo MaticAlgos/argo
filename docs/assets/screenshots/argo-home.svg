@@ -37,21 +37,17 @@
 
     <rect x="122" y="574" width="1156" height="45" rx="5" fill="#91d8db"/>
     <text x="145" y="604" fill="#173647" font-size="22" font-weight="700">Claude Code</text>
-    <text x="420" y="604" fill="#294a59" font-size="19">model presets · native resume · Argo MCP delegation</text>
+    <text x="420" y="604" fill="#294a59" font-size="19">2.1.220</text>
 
     <g fill="#e4e9f1" font-size="21">
       <text x="145" y="651">Codex CLI</text>
-      <text x="420" y="651" fill="#aab4c5" font-size="19">model presets · native resume · Argo MCP delegation</text>
+      <text x="420" y="651" fill="#aab4c5" font-size="19">0.146.0</text>
       <text x="145" y="693">OpenCode</text>
-      <text x="420" y="693" fill="#aab4c5" font-size="19">model presets · native resume · Argo command delegation</text>
       <text x="145" y="735">Kiro CLI</text>
-      <text x="420" y="735" fill="#aab4c5" font-size="19">live models · native resume · Argo MCP delegation</text>
+      <text x="420" y="735" fill="#aab4c5" font-size="19">2.16.0</text>
       <text x="145" y="777">Command Code</text>
-      <text x="420" y="777" fill="#aab4c5" font-size="19">live models · native resume · Argo command delegation</text>
       <text x="145" y="819">Antigravity</text>
-      <text x="420" y="819" fill="#aab4c5" font-size="19">live models · native resume · Argo command delegation</text>
       <text x="145" y="861">Grok CLI</text>
-      <text x="420" y="861" fill="#aab4c5" font-size="19">live models · context replay · Argo command delegation</text>
     </g>
 
     <text x="1255" y="929" fill="#667187" text-anchor="end" font-size="16">↑↓ move · Esc close</text>

@@ -102,6 +102,33 @@ pub async fn install_latest() -> Result<()> {
     Ok(())
 }
 
+/// Removes the currently running installed Argo executable.
+///
+/// Conversation data and configuration live outside the executable and are
+/// deliberately preserved. Development binaries are rejected so running a test
+/// or a workspace build can never delete Cargo output unexpectedly.
+pub fn uninstall_current_executable() -> Result<PathBuf> {
+    let executable = std::env::current_exe()
+        .map_err(|error| ArgoError::Io(format!("locate current Argo executable: {error}")))?;
+    uninstall_executable_at(&executable)?;
+    Ok(executable)
+}
+
+fn uninstall_executable_at(executable: &Path) -> Result<()> {
+    if is_development_binary(executable) {
+        return Err(ArgoError::Invalid(
+            "self-uninstall is disabled for a target/debug or target/release build; run the installed Argo binary instead".into(),
+        ));
+    }
+    std::fs::remove_file(executable).map_err(|error| {
+        ArgoError::Io(format!(
+            "remove installed executable {}: {error}",
+            executable.display()
+        ))
+    })?;
+    Ok(())
+}
+
 async fn fetch_text(url: &str) -> Result<String> {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
@@ -231,5 +258,20 @@ edition = "2021"
         assert!(!is_development_binary(Path::new(
             "/Users/me/.local/bin/argo"
         )));
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_selected_executable() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let executable = temporary.path().join("bin").join("argo");
+        std::fs::create_dir_all(executable.parent().expect("bin parent")).expect("create bin");
+        std::fs::write(&executable, b"test binary").expect("write executable");
+        let state = temporary.path().join("state.sqlite");
+        std::fs::write(&state, b"conversation").expect("write state");
+
+        uninstall_executable_at(&executable).expect("uninstall executable");
+
+        assert!(!executable.exists());
+        assert!(state.exists(), "uninstall must preserve unrelated state");
     }
 }

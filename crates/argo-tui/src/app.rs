@@ -11,53 +11,40 @@ use argo_core::message::{ContentBlock, ToolStatus};
 use argo_daemon::protocol::{ConversationSummary, MessageView};
 use argo_runtime::AgentInfo;
 
-/// Honest, compact capability text for an agent picker row.
+/// Returns only the detected version number for a CLI picker row.
 ///
-/// Lightweight startup detection intentionally does not launch every CLI. Until
-/// a deep probe succeeds, the listed model values are adapter-maintained presets,
-/// not a live inventory, and the UI must not describe them as discovered models.
-pub fn agent_capability_summary(info: &AgentInfo) -> String {
-    let model_count = info
-        .models
-        .iter()
-        .filter(|model| model.id != argo_runtime::DEFAULT_MODEL_ID)
-        .count();
-    let models = if info.models_live {
-        format!(
-            "{model_count} live model{}",
-            if model_count == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "{model_count} model preset{}",
-            if model_count == 1 { "" } else { "s" }
-        )
-    };
-    let session = if info.capabilities.native_resume {
-        "native resume"
-    } else {
-        "context replay"
-    };
-    let delegation = if info.capabilities.delegates_via_mcp() {
-        "Argo MCP delegation"
-    } else {
-        "Argo command delegation"
-    };
-    format!("{models} · {session} · {delegation}")
+/// Version commands often repeat the product name (`codex-cli 0.146.0`) or add
+/// it after the number (`2.1.220 (Claude Code)`). The picker already displays
+/// the friendly CLI name, so retaining that decoration would be noisy and can
+/// look like two different products. If no version-shaped token was detected,
+/// the row simply shows the CLI name instead of substituting model/capability
+/// metadata that may be stale before a deep probe.
+pub fn agent_display_version(info: &AgentInfo) -> Option<String> {
+    info.version
+        .as_deref()
+        .and_then(|raw| raw.split_whitespace().find_map(version_token))
 }
 
-/// Includes a probed CLI version without hiding its actual Argo capabilities.
-pub fn agent_picker_detail(info: &AgentInfo) -> String {
-    let capabilities = agent_capability_summary(info);
-    match info
-        .version
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(version) => format!("{version} · {capabilities}"),
-        None => capabilities,
-    }
+fn version_token(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '\'' | '"'
+        )
+    });
+    let normalized = match trimmed.as_bytes() {
+        [b'v' | b'V', next, ..] if next.is_ascii_digit() => &trimmed[1..],
+        _ => trimmed,
+    };
+    let starts_with_digit = normalized
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_digit);
+    let version_characters_only = normalized
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'));
+    (starts_with_digit && normalized.contains('.') && version_characters_only)
+        .then(|| normalized.to_string())
 }
 
 /// A rendered transcript line.
@@ -2388,30 +2375,26 @@ mod tests {
     }
 
     #[test]
-    fn startup_capabilities_distinguish_presets_and_delegation_mechanisms() {
+    fn picker_versions_remove_repeated_product_names() {
         let claude = argo_runtime::find("claude").expect("claude definition");
-        let claude = AgentInfo::unavailable(claude, "test fixture");
-        let summary = agent_capability_summary(&claude);
-        assert!(summary.contains("7 model presets"), "{summary}");
-        assert!(summary.contains("native resume"), "{summary}");
-        assert!(summary.contains("Argo MCP delegation"), "{summary}");
-        assert!(!summary.contains("agent tools"), "{summary}");
+        let mut claude = AgentInfo::unavailable(claude, "test fixture");
+        claude.version = Some("2.1.220 (Claude Code)".into());
+        assert_eq!(agent_display_version(&claude).as_deref(), Some("2.1.220"));
 
-        let grok = argo_runtime::find("grok").expect("grok definition");
-        let grok = AgentInfo::unavailable(grok, "test fixture");
-        let summary = agent_capability_summary(&grok);
-        assert!(summary.contains("context replay"), "{summary}");
-        assert!(summary.contains("Argo command delegation"), "{summary}");
+        let codex = argo_runtime::find("codex").expect("codex definition");
+        let mut codex = AgentInfo::unavailable(codex, "test fixture");
+        codex.version = Some("codex-cli v0.146.0".into());
+        assert_eq!(agent_display_version(&codex).as_deref(), Some("0.146.0"));
     }
 
     #[test]
-    fn a_successful_model_probe_is_labeled_as_live() {
-        let codex = argo_runtime::find("codex").expect("codex definition");
-        let mut codex = AgentInfo::unavailable(codex, "test fixture");
-        codex.models_live = true;
-        let summary = agent_capability_summary(&codex);
-        assert!(summary.contains("2 live models"), "{summary}");
-        assert!(!summary.contains("presets"), "{summary}");
+    fn picker_omits_detail_when_no_version_was_detected() {
+        let opencode = argo_runtime::find("opencode").expect("opencode definition");
+        let mut opencode = AgentInfo::unavailable(opencode, "test fixture");
+        assert_eq!(agent_display_version(&opencode), None);
+
+        opencode.version = Some("OpenCode development build".into());
+        assert_eq!(agent_display_version(&opencode), None);
     }
 
     #[test]
