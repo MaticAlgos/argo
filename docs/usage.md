@@ -47,6 +47,7 @@ Argo removes the stale preference and returns to the startup picker.
 | `Cmd+Backspace` or `Ctrl+U` | Delete to the start of the current line |
 | `Backspace` / `Delete` | Delete around the cursor |
 | `Ctrl+Y` | Restore the most recent composer edit |
+| `Ctrl+T` | Show or collapse CLI-emitted thinking immediately |
 | `Ctrl+P` / `Ctrl+N` | Previous/next submitted user prompt |
 | `↑` / `↓` | Navigate a visible picker/completion, otherwise composer history |
 | `Tab` | Accept the highlighted slash-command completion |
@@ -126,10 +127,11 @@ needed.
 |---|---|
 | `/usage` | Last-turn token fields plus provider allowance/local history |
 | `/skills` | List cross-agent skills |
+| `/instructions [enable\|disable\|edit]` | Manage opt-in project instructions |
 | `/mcp list` | Show configured MCP servers and state |
 | `/mcp add` | Open guided local/remote/import/auth setup |
 | `/mcp check [name]` | Check all servers or one server |
-| `/mcp reconnect <name>` | Reconnect a server |
+| `/mcp reconnect <name>` | Recheck a server; use `argo` for built-in delegation |
 | `/mcp login <name>` or `/mcp reauth <name>` | Authenticate again |
 | `/mcp logout <name>` | Clear Argo-held authentication |
 | `/mcp remove <name>` or `/mcp delete <name>` | Delete a server |
@@ -180,6 +182,20 @@ surface:
 Provider CLIs change. A failed or unavailable command is shown as unavailable;
 Argo does not convert context tokens into account allowance.
 
+### Automatic project instructions
+
+`/instructions enable` creates `.argo-instructions.md` in the active workspace
+and enables its prompt injection. Argo then appends clearly durable user
+directives from later prompts, deduplicating exact repeats. It deliberately does
+not save ordinary implementation requests as permanent policy.
+
+`/instructions edit` temporarily restores the terminal and opens the file using
+`$VISUAL`, `$EDITOR`, or `vi`. It can be edited while disabled. Run
+`/instructions disable` to stop both capture and injection; the Markdown file is
+retained, but is not sent to any agent until re-enabled. The enablement marker is
+kept under the ignored `.argo/` runtime directory, so the default remains off
+even when a repository already contains the Markdown file.
+
 ## Context across CLIs
 
 Argo stores the complete canonical transcript in SQLite. It reuses a native CLI
@@ -212,6 +228,11 @@ be inspected the same way.
 ## Recovery
 
 - Run `argo doctor` when a CLI, database, or daemon is not responding.
+- Run `/mcp reconnect argo` when delegation reports a connection problem. Argo
+  verifies the built-in MCP transport and restarts a missing compatible daemon.
+- Every agent turn receives a fresh per-turn delegation configuration. Codex uses
+  a native inline-table config override rather than modifying
+  `~/.codex/config.toml`.
 - Run `argo agents --refresh` after installing or updating a vendor CLI.
 - Use `/context` if a model switch appears to have lost context.
 - Use `argo --resume <conversation-id>` after closing the TUI.

@@ -71,10 +71,12 @@ fn build_args(ctx: &InvocationContext) -> Vec<String> {
         args.push(format!("model_reasoning_effort=\"{effort}\""));
     }
 
-    if let Some(config) = &ctx.mcp_config {
-        // Codex reads MCP servers from config; point it at Argo's generated file.
+    // Codex accepts MCP servers only through its normal TOML configuration
+    // hierarchy. Argo supplies one inline-table override so nothing is
+    // persisted into the user's ~/.codex/config.toml.
+    for config in &ctx.mcp_overrides {
         args.push("-c".into());
-        args.push(format!("mcp_servers_file={config}"));
+        args.push(config.clone());
     }
 
     // The resume target is a positional argument and must come last.
@@ -347,6 +349,20 @@ mod tests {
     fn no_config_override_when_no_effort_is_selected() {
         let args = CODEX.args_for(&ctx());
         assert!(!args.iter().any(|a| a.contains("model_reasoning_effort")));
+    }
+
+    #[test]
+    fn native_mcp_overrides_are_forwarded_to_codex() {
+        let override_value =
+            "mcp_servers={\"argo\"={command=\"/usr/bin/argo\",args=[\"mcp-server\"]}}";
+        let args = CODEX.args_for(&InvocationContext {
+            mcp_overrides: vec![override_value.into()],
+            ..ctx()
+        });
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-c", override_value]));
+        assert!(!args.iter().any(|arg| arg.contains("mcp_servers_file")));
     }
 
     #[test]

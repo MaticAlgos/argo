@@ -840,6 +840,9 @@ async fn handle_key(
                 app.set_status("restored previous composer edit");
             }
         }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.set_thinking_visible(!app.thinking_visible);
+        }
         KeyCode::Char('c')
             if key.modifiers.contains(KeyModifiers::SUPER)
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1535,6 +1538,10 @@ async fn run_command(
             }
         }
 
+        Command::Instructions(action) => {
+            run_instructions_command(app, action)?;
+        }
+
         Command::Thinking(action) => {
             let visible = match action {
                 commands::ThinkingCommand::Show => true,
@@ -1787,6 +1794,20 @@ async fn run_command(
                     format!("database      {}", paths.database().display()),
                     format!("socket        {}", paths.socket().display()),
                     format!("mcp registry  {}", paths.root().join("mcp.json").display()),
+                    format!(
+                        "instructions  {} · {}",
+                        if argo_resources::instructions::is_enabled(std::path::Path::new(
+                            &app.workspace
+                        )) {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        argo_resources::instructions::instructions_path(std::path::Path::new(
+                            &app.workspace
+                        ))
+                        .display()
+                    ),
                     format!(
                         "startup       {}",
                         app.default_selection
@@ -2090,7 +2111,127 @@ async fn apply_choice(
             import_mcp_choice(app, paths, &value)?;
             Ok(())
         }
+        PickerAction::Instructions => {
+            let action = match value.as_str() {
+                "enable" => commands::InstructionsCommand::Enable,
+                "disable" => commands::InstructionsCommand::Disable,
+                "edit" => commands::InstructionsCommand::Edit,
+                _ => {
+                    app.report_error("unknown instructions action");
+                    return Ok(());
+                }
+            };
+            run_instructions_command(app, action)
+        }
     }
+}
+
+fn run_instructions_command(app: &mut App, action: commands::InstructionsCommand) -> Result<()> {
+    let workspace = std::path::Path::new(&app.workspace);
+    match action {
+        commands::InstructionsCommand::Menu => {
+            let enabled = argo_resources::instructions::is_enabled(workspace);
+            app.open_picker(
+                "project instructions",
+                vec![
+                    format!(
+                        "Enable automatic capture and injection{}",
+                        if enabled { " · active" } else { "" }
+                    ),
+                    format!(
+                        "Disable automatic capture and injection{}",
+                        if enabled { "" } else { " · active" }
+                    ),
+                    "Edit .argo-instructions.md in your editor".into(),
+                ],
+                vec!["enable".into(), "disable".into(), "edit".into()],
+                PickerAction::Instructions,
+            );
+        }
+        commands::InstructionsCommand::Enable => {
+            let path = argo_resources::instructions::set_enabled(workspace, true)?;
+            let existing_prompts = app
+                .lines
+                .iter()
+                .filter(|line| line.kind == LineKind::User)
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let captured = argo_resources::instructions::capture_user_directives(
+                workspace,
+                &existing_prompts,
+            )?;
+            app.push(
+                LineKind::Notice,
+                format!(
+                    "project instructions enabled · {} existing directive(s) captured · durable directives will be saved to {}",
+                    captured.len(), path.display()
+                ),
+            );
+            app.set_status("project instructions enabled · /instructions edit to review");
+        }
+        commands::InstructionsCommand::Disable => {
+            let path = argo_resources::instructions::set_enabled(workspace, false)?;
+            app.push(
+                LineKind::Notice,
+                format!(
+                    "project instructions disabled · retained {} but it will not be sent",
+                    path.display()
+                ),
+            );
+            app.set_status("project instructions disabled · existing file retained");
+        }
+        commands::InstructionsCommand::Edit => edit_project_instructions(app)?,
+    }
+    Ok(())
+}
+
+fn edit_project_instructions(app: &mut App) -> Result<()> {
+    let path = argo_resources::instructions::ensure_file(std::path::Path::new(&app.workspace))?;
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".into());
+    let parts = shlex::split(&editor)
+        .filter(|parts| !parts.is_empty())
+        .ok_or_else(|| ArgoError::Invalid("VISUAL/EDITOR contains invalid quoting".into()))?;
+    let restore_mouse = app.mouse_scroll_mode;
+
+    restore_terminal();
+    let editor_result = std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .arg(&path)
+        .status();
+
+    enable_raw_mode().map_err(|error| ArgoError::Io(format!("restore raw mode: {error}")))?;
+    let mut stdout = std::io::stdout();
+    enter_terminal_screen(&mut stdout)
+        .map_err(|error| ArgoError::Io(format!("restore terminal screen: {error}")))?;
+    set_mouse_scroll_mode(&mut stdout, app, restore_mouse)
+        .map_err(|error| ArgoError::Io(format!("restore mouse mode: {error}")))?;
+
+    let status =
+        editor_result.map_err(|error| ArgoError::Process(format!("open {editor}: {error}")))?;
+    if !status.success() {
+        return Err(ArgoError::Process(format!(
+            "{editor} exited with status {status}"
+        )));
+    }
+    app.set_status(format!(
+        "saved {} · {}",
+        path.display(),
+        if argo_resources::instructions::is_enabled(std::path::Path::new(&app.workspace)) {
+            "active for future turns"
+        } else {
+            "currently disabled"
+        }
+    ));
+    Ok(())
 }
 
 fn open_mcp_import_picker(app: &mut App) -> Result<()> {
@@ -2812,23 +2953,21 @@ async fn run_mcp_command(
     match action {
         commands::McpCommand::List => {
             let registry = argo_resources::McpRegistry::load(&registry_path)?;
-            if registry.servers.is_empty() {
-                app.open_text(
-                    "mcp servers",
-                    vec![
-                        "No MCP servers configured.".into(),
-                        format!("Registry: {}", registry_path.display()),
-                        "Run /mcp add for guided local, remote, auth, or import setup.".into(),
-                    ],
-                );
-                return Ok(());
-            }
             let token_path = argo_resources::oauth::token_store_path(paths.root());
             let tokens = argo_resources::oauth::TokenStore::load(&token_path)?;
             let mut lines = vec![
                 "Commands: /mcp add · check [name] · reconnect · reauth · logout · delete".into(),
                 String::new(),
+                "argo                 built-in  delegation · injected safely per turn".into(),
             ];
+            if registry.servers.is_empty() {
+                lines.extend([
+                    String::new(),
+                    "No additional MCP servers configured.".into(),
+                    format!("Registry: {}", registry_path.display()),
+                    "Run /mcp add for guided local, remote, auth, or import setup.".into(),
+                ]);
+            }
             for server in &registry.servers {
                 let auth = if tokens.tokens.contains_key(&server.name) {
                     "authenticated"
@@ -3174,6 +3313,17 @@ fn start_mcp_login(
 
 async fn check_mcp_servers(paths: &ArgoPaths, only: Option<&str>) -> Result<Vec<String>> {
     let registry = argo_resources::McpRegistry::load(&paths.root().join("mcp.json"))?;
+    let mut lines = Vec::new();
+    if only.is_none_or(|name| name == "argo") {
+        let verdict = match argo_daemon::mcp::delegation_health(paths).await {
+            Ok(()) => "ok · daemon connected · configuration refreshed every turn".into(),
+            Err(error) => format!("unavailable · automatic repair failed: {error}"),
+        };
+        lines.push(format!("{:<20} {verdict}", "argo (delegation)"));
+        if only == Some("argo") {
+            return Ok(lines);
+        }
+    }
     let selected: Vec<_> = registry
         .servers
         .iter()
@@ -3183,11 +3333,10 @@ async fn check_mcp_servers(paths: &ArgoPaths, only: Option<&str>) -> Result<Vec<
         return if let Some(name) = only {
             Err(ArgoError::not_found("mcp server", name))
         } else {
-            Ok(vec!["No MCP servers configured.".into()])
+            Ok(lines)
         };
     }
 
-    let mut lines = Vec::new();
     for server in selected {
         let verdict = match &server.transport {
             argo_resources::McpTransport::Local { command, .. } => {
@@ -4217,5 +4366,37 @@ mod tests {
         // Both the normal exit path and the panic hook call this.
         restore_terminal();
         restore_terminal();
+    }
+
+    #[test]
+    fn project_instructions_menu_enables_and_disables_without_deleting_the_file() {
+        let root = std::env::temp_dir().join(format!(
+            "argo-instructions-ui-{}-{}",
+            std::process::id(),
+            argo_core::now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let mut app = App::new(root.to_string_lossy());
+
+        run_instructions_command(&mut app, commands::InstructionsCommand::Menu).expect("menu");
+        assert!(matches!(
+            app.overlay,
+            crate::app::Overlay::Picker {
+                action: PickerAction::Instructions,
+                ..
+            }
+        ));
+        app.close_overlay();
+
+        run_instructions_command(&mut app, commands::InstructionsCommand::Enable).expect("enable");
+        let file = argo_resources::instructions::instructions_path(&root);
+        assert!(file.is_file());
+        assert!(argo_resources::instructions::is_enabled(&root));
+
+        run_instructions_command(&mut app, commands::InstructionsCommand::Disable)
+            .expect("disable");
+        assert!(!argo_resources::instructions::is_enabled(&root));
+        assert!(file.is_file());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

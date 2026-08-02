@@ -1284,6 +1284,8 @@ async fn preview_context(
             .config_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
+        mcp_overrides: mcp_plan.config_overrides.clone(),
+        mcp_environment: mcp_plan.environment.clone(),
         timeout_ms: turn_timeout_ms(),
         mode: conversation
             .selected_mode
@@ -1461,6 +1463,8 @@ async fn delegate(
             .config_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
+        mcp_overrides: mcp_plan.config_overrides.clone(),
+        mcp_environment: mcp_plan.environment.clone(),
         timeout_ms: timeout_ms.or_else(turn_timeout_ms),
         // A subagent inherits full authority: it was asked to do work, not plan.
         mode: argo_core::mode::AgentMode::Full,
@@ -1599,6 +1603,17 @@ async fn send_message(
         .map(|reason| reason.detail().to_string());
 
     let workspace_root = daemon.store()?.workspace_root(&conversation.workspace_id)?;
+    let captured = argo_resources::instructions::capture_user_directives(
+        std::path::Path::new(&workspace_root),
+        &prompt,
+    )?;
+    if !captured.is_empty() {
+        tracing::info!(
+            count = captured.len(),
+            workspace = %workspace_root,
+            "captured durable project instructions"
+        );
+    }
     let (skill_names, mcp_plan, descriptors) = resolve_resources(
         &daemon.paths,
         &workspace_root,
@@ -1625,6 +1640,8 @@ async fn send_message(
             .config_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
+        mcp_overrides: mcp_plan.config_overrides.clone(),
+        mcp_environment: mcp_plan.environment.clone(),
         timeout_ms: turn_timeout_ms(),
         mode: conversation
             .selected_mode

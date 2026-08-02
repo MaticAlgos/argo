@@ -37,6 +37,11 @@ pub const BINARY_ENV: &str = "ARGO_BIN";
 pub fn tools() -> Value {
     json!([
         {
+            "name": "argo_health",
+            "description": "Check that Argo delegation is connected to its daemon and repair a missing daemon connection when possible.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
             "name": "argo_list_agents",
             "description": "List the coding-agent CLIs Argo can delegate to on this machine, \
                             with their models and limitations. Call this before delegating if you \
@@ -134,9 +139,47 @@ async fn call_tool(paths: &ArgoPaths, params: Option<&Value>) -> Result<Value> {
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     match name {
+        "argo_health" => delegation_health_result(paths).await,
         "argo_list_agents" => list_agents(paths).await,
         "argo_delegate" => run_delegation(paths, &arguments).await,
         other => Err(ArgoError::Invalid(format!("unknown tool: {other}"))),
+    }
+}
+
+async fn delegation_health_result(paths: &ArgoPaths) -> Result<Value> {
+    delegation_health(paths).await?;
+    let conversation = std::env::var(CONVERSATION_ENV).ok();
+    let run = std::env::var(RUN_ENV).ok();
+    let lineage = match (conversation, run) {
+        (Some(conversation), Some(run)) => {
+            format!("parent conversation {conversation} · run {run}")
+        }
+        (Some(conversation), None) => format!("parent conversation {conversation}"),
+        (None, _) => "no parent lineage in this diagnostic process".to_string(),
+    };
+    Ok(text_result(
+        format!("Argo delegation is connected · {lineage}"),
+        false,
+    ))
+}
+
+/// Verifies the built-in delegation transport.
+///
+/// MCP servers are short-lived children of the selected coding CLI. If the
+/// daemon disappeared between turns, connecting here transparently starts the
+/// current Argo daemon and waits for its socket before returning.
+pub async fn delegation_health(paths: &ArgoPaths) -> Result<()> {
+    let mut client = DaemonClient::connect(paths).await?;
+    match client.request(Request::Ping).await? {
+        Response::Ok => Ok(()),
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!(
+            "unexpected delegation health reply: {other:?}"
+        ))),
     }
 }
 
@@ -234,6 +277,31 @@ struct DaemonClient {
 
 impl DaemonClient {
     async fn connect(paths: &ArgoPaths) -> Result<Self> {
+        match Self::try_connect(paths).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                if let Some(protocol) = crate::mismatched_daemon_protocol(&error) {
+                    crate::stop_older_daemon(paths, protocol, "argo-mcp").await?;
+                }
+            }
+        }
+
+        spawn_daemon(paths)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8_000);
+        let mut last_error = None;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            match Self::try_connect(paths).await {
+                Ok(client) => return Ok(client),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            ArgoError::Process("the Argo daemon did not recover in time".into())
+        }))
+    }
+
+    async fn try_connect(paths: &ArgoPaths) -> Result<Self> {
         use tokio::io::AsyncBufReadExt;
         let stream = tokio::net::UnixStream::connect(paths.socket())
             .await
@@ -251,7 +319,11 @@ impl DaemonClient {
             .await?
         {
             Response::Welcome { .. } => Ok(client),
-            Response::Error { message, .. } => Err(ArgoError::Invalid(message)),
+            Response::Error {
+                code,
+                message,
+                retryable,
+            } => Err(ArgoError::remote(code, message, retryable)),
             other => Err(ArgoError::Protocol(format!("bad handshake: {other:?}"))),
         }
     }
@@ -272,6 +344,35 @@ impl DaemonClient {
         serde_json::from_str(&reply)
             .map_err(|e| ArgoError::Protocol(format!("malformed reply: {e}")))
     }
+}
+
+fn spawn_daemon(paths: &ArgoPaths) -> Result<()> {
+    let executable = std::env::current_exe()
+        .map_err(|error| ArgoError::Process(format!("locate Argo: {error}")))?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("--data-dir")
+        .arg(paths.root())
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    command
+        .spawn()
+        .map_err(|error| ArgoError::Process(format!("restart the Argo daemon: {error}")))?;
+    Ok(())
 }
 
 /// Runs the MCP server over stdio until stdin closes.
@@ -336,6 +437,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"argo_delegate"));
         assert!(names.contains(&"argo_list_agents"));
+        assert!(names.contains(&"argo_health"));
 
         let delegate = tools
             .iter()

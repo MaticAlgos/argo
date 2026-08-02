@@ -33,6 +33,8 @@ pub enum Command {
     Agents,
     /// List discovered skills.
     Skills,
+    /// Manage project-local automatic instructions.
+    Instructions(InstructionsCommand),
     /// Show or change whether agent thinking is rendered.
     Thinking(ThinkingCommand),
     /// Inspect or manage configured MCP servers.
@@ -76,6 +78,19 @@ pub enum ThinkingCommand {
     Hide,
     /// Invert the current visibility setting.
     Toggle,
+}
+
+/// An operation requested through `/instructions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionsCommand {
+    /// Open the enable/disable/edit picker.
+    Menu,
+    /// Capture and inject durable project instructions.
+    Enable,
+    /// Stop capture and injection while retaining the file.
+    Disable,
+    /// Open the project instruction file in the user's editor.
+    Edit,
 }
 
 /// An operation requested through `/default`.
@@ -194,6 +209,7 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "update" | "upgrade" => parse_update(rest),
         "agents" => Ok(Command::Agents),
         "skills" => Ok(Command::Skills),
+        "instructions" => parse_instructions(rest),
         "thinking" => parse_thinking(rest),
         "mcp" => parse_mcp(rest),
         "context" => Ok(Command::Context),
@@ -268,6 +284,23 @@ fn parse_thinking(rest: &str) -> std::result::Result<Command, ParseError> {
     }
 }
 
+fn parse_instructions(rest: &str) -> std::result::Result<Command, ParseError> {
+    let action = match rest.to_ascii_lowercase().as_str() {
+        "" => InstructionsCommand::Menu,
+        "enable" => InstructionsCommand::Enable,
+        "disable" => InstructionsCommand::Disable,
+        "edit" => InstructionsCommand::Edit,
+        _ => {
+            return Err(ParseError::InvalidArgument {
+                command: "instructions",
+                value: rest.to_string(),
+                expected: "enable, disable, or edit",
+            })
+        }
+    };
+    Ok(Command::Instructions(action))
+}
+
 fn parse_mcp(rest: &str) -> std::result::Result<Command, ParseError> {
     let (action, target) = match rest.split_once(char::is_whitespace) {
         Some((action, target)) => (action, target.trim()),
@@ -323,6 +356,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/update",
     "/agents",
     "/skills",
+    "/instructions",
     "/thinking",
     "/mcp",
     "/context",
@@ -358,6 +392,9 @@ const SUBCOMMAND_COMPLETIONS: &[&str] = &[
     "/thinking hide",
     "/thinking show",
     "/thinking toggle",
+    "/instructions disable",
+    "/instructions edit",
+    "/instructions enable",
 ];
 
 /// Completion candidates for a partially typed command.
@@ -444,6 +481,10 @@ pub fn help() -> Vec<HelpEntry> {
         HelpEntry {
             usage: "/skills",
             detail: "list skills available to every agent",
+        },
+        HelpEntry {
+            usage: "/instructions [enable|disable|edit]",
+            detail: "manage opt-in project instructions captured from durable user directives",
         },
         HelpEntry {
             usage: "/thinking [show|hide|toggle]",
@@ -620,6 +661,27 @@ mod tests {
             parse("/thinking hide").expect("parse"),
             Command::Thinking(ThinkingCommand::Hide)
         );
+    }
+
+    #[test]
+    fn instructions_are_opt_in_and_expose_only_enable_disable_and_edit() {
+        assert_eq!(
+            parse("/instructions").expect("parse"),
+            Command::Instructions(InstructionsCommand::Menu)
+        );
+        assert_eq!(
+            parse("/instructions enable").expect("parse"),
+            Command::Instructions(InstructionsCommand::Enable)
+        );
+        assert_eq!(
+            parse("/instructions disable").expect("parse"),
+            Command::Instructions(InstructionsCommand::Disable)
+        );
+        assert_eq!(
+            parse("/instructions edit").expect("parse"),
+            Command::Instructions(InstructionsCommand::Edit)
+        );
+        assert!(parse("/instructions show").is_err());
     }
 
     #[test]

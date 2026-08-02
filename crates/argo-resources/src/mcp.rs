@@ -403,6 +403,14 @@ fn claude_config(servers: &[&McpServer]) -> serde_json::Value {
 pub struct McpInjectionPlan {
     /// Path to a generated config file, when the adapter takes one.
     pub config_path: Option<PathBuf>,
+    /// Native CLI configuration overrides, when an adapter accepts settings on argv.
+    ///
+    /// Values are complete `key=value` expressions. Secrets must never be placed
+    /// here because process arguments are observable by other processes owned by
+    /// the same user; use [`Self::environment`] and an environment reference.
+    pub config_overrides: Vec<String>,
+    /// Environment supplied to the host CLI for injected MCP configuration.
+    pub environment: Vec<(String, String)>,
     /// Inline descriptors, for protocol adapters.
     pub descriptors: Vec<serde_json::Value>,
     /// Names exposed, for the prompt's working-context section.
@@ -429,10 +437,12 @@ pub fn plan_injection(
     match injection {
         McpInjection::AcpSessionNew => Ok(McpInjectionPlan {
             config_path: None,
+            config_overrides: vec![],
+            environment: vec![],
             descriptors: active.iter().map(|s| acp_descriptor(s)).collect(),
             names,
         }),
-        McpInjection::ClaudeMcpJson | McpInjection::CodexConfig => {
+        McpInjection::ClaudeMcpJson => {
             std::fs::create_dir_all(staging_dir)?;
             let path = staging_dir.join(format!("mcp-{run_id}.json"));
             write_private(
@@ -441,6 +451,18 @@ pub fn plan_injection(
             )?;
             Ok(McpInjectionPlan {
                 config_path: Some(path),
+                config_overrides: vec![],
+                environment: vec![],
+                descriptors: vec![],
+                names,
+            })
+        }
+        McpInjection::CodexConfig => {
+            let codex = codex_overrides(&active, run_id)?;
+            Ok(McpInjectionPlan {
+                config_path: None,
+                config_overrides: codex.config,
+                environment: codex.environment,
                 descriptors: vec![],
                 names,
             })
@@ -450,6 +472,8 @@ pub fn plan_injection(
             merge_shared_config(&path, "mcp", &active, opencode_entry, true)?;
             Ok(McpInjectionPlan {
                 config_path: None,
+                config_overrides: vec![],
+                environment: vec![],
                 descriptors: vec![],
                 names,
             })
@@ -459,6 +483,8 @@ pub fn plan_injection(
             merge_shared_config(&path, "mcpServers", &active, command_code_entry, false)?;
             Ok(McpInjectionPlan {
                 config_path: None,
+                config_overrides: vec![],
+                environment: vec![],
                 descriptors: vec![],
                 names,
             })
@@ -472,12 +498,123 @@ pub fn plan_injection(
                 // Reported for transparency, but not passed as an argument: the CLI
                 // reads this path itself.
                 config_path: None,
+                config_overrides: vec![],
+                environment: vec![],
                 descriptors: vec![],
                 names,
             })
         }
         McpInjection::None => Ok(McpInjectionPlan::default()),
     }
+}
+
+/// Renders Codex's real TOML config override shape.
+///
+/// Codex has no `mcp_servers_file` setting. Its supported non-persistent route is
+/// an inline `-c mcp_servers={<name>=<inline table>}` override. Header and
+/// local-environment values travel through the host process environment so
+/// credentials do not appear in `ps` output.
+struct CodexOverrides {
+    config: Vec<String>,
+    environment: Vec<(String, String)>,
+}
+
+fn codex_overrides(servers: &[&McpServer], run_id: &str) -> Result<CodexOverrides> {
+    let mut entries = Vec::with_capacity(servers.len());
+    let mut process_env = std::collections::BTreeMap::<String, String>::new();
+
+    for (server_index, server) in servers.iter().enumerate() {
+        let table = match &server.transport {
+            McpTransport::Local {
+                command,
+                environment,
+            } => {
+                let executable = command.first().ok_or_else(|| {
+                    ArgoError::Invalid(format!("mcp server '{}' has no command", server.name))
+                })?;
+                let mut inherited: Vec<String> = environment
+                    .iter()
+                    .map(|(name, value)| {
+                        process_env.insert(name.clone(), expand_env(value));
+                        name.clone()
+                    })
+                    .collect();
+                // These are supplied by the turn executor. Naming them
+                // explicitly prevents Codex's environment policy from stripping
+                // the exact run lineage or the command fallback from Argo's own
+                // delegation server.
+                if server.name == "argo" {
+                    for name in ["ARGO_PARENT_RUN", "ARGO_BIN"] {
+                        if !inherited.iter().any(|existing| existing == name) {
+                            inherited.push(name.to_string());
+                        }
+                    }
+                }
+                format!(
+                    "{{command={},args={},env_vars={}}}",
+                    toml_string(executable),
+                    toml_string_array(command.iter().skip(1)),
+                    toml_string_array(inherited.iter())
+                )
+            }
+            McpTransport::Remote { url, headers } => {
+                let mut references = Vec::with_capacity(headers.len());
+                for (header_index, (header, value)) in headers.iter().enumerate() {
+                    let env_name = codex_header_env(run_id, server_index, header_index);
+                    process_env.insert(env_name.clone(), expand_env(value));
+                    references.push((header.clone(), env_name));
+                }
+                format!(
+                    "{{url={},env_http_headers={}}}",
+                    toml_string(url),
+                    toml_string_map(&references)
+                )
+            }
+        };
+        entries.push(format!("{}={table}", toml_string(&server.name)));
+    }
+
+    // Codex's dotted override parser treats quoted path segments literally, so
+    // `mcp_servers.\"name\"=...` is ignored. An inline table supports every
+    // server name and Codex merges it with the user's existing MCP table.
+    let override_value = format!("mcp_servers={{{}}}", entries.join(","));
+    Ok(CodexOverrides {
+        config: vec![override_value],
+        environment: process_env.into_iter().collect(),
+    })
+}
+
+fn toml_string(value: &str) -> String {
+    // JSON and TOML basic strings share the escaping needed for valid Rust UTF-8.
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn toml_string_array<'a>(values: impl IntoIterator<Item = &'a String>) -> String {
+    let values: Vec<String> = values.into_iter().map(|value| toml_string(value)).collect();
+    format!("[{}]", values.join(","))
+}
+
+fn toml_string_map(values: &[(String, String)]) -> String {
+    let entries: Vec<String> = values
+        .iter()
+        .map(|(key, value)| format!("{}={}", toml_string(key), toml_string(value)))
+        .collect();
+    format!("{{{}}}", entries.join(","))
+}
+
+fn codex_header_env(run_id: &str, server_index: usize, header_index: usize) -> String {
+    let safe_run: String = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .take(24)
+        .collect();
+    format!("ARGO_MCP_{safe_run}_{server_index}_{header_index}")
 }
 
 fn home_dir() -> PathBuf {
@@ -1267,6 +1404,58 @@ mod tests {
             serde_json::json!("http")
         );
         assert!(plan.descriptors.is_empty());
+    }
+
+    #[test]
+    fn codex_receives_native_toml_overrides_without_argv_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut registry = McpRegistry::default();
+        registry
+            .upsert(McpServer {
+                name: "local.tools".into(),
+                transport: McpTransport::Local {
+                    command: vec!["node".into(), "server.js".into()],
+                    environment: vec![("LOCAL_TOKEN".into(), "local-secret".into())],
+                },
+                enabled: true,
+            })
+            .expect("local");
+        registry
+            .upsert(McpServer {
+                name: "remote-tools".into(),
+                transport: McpTransport::Remote {
+                    url: "https://mcp.example/mcp".into(),
+                    headers: vec![("Authorization".into(), "Bearer remote-secret".into())],
+                },
+                enabled: true,
+            })
+            .expect("remote");
+
+        let plan = plan_injection(&registry, McpInjection::CodexConfig, dir.path(), "run-abc")
+            .expect("plan");
+
+        assert!(plan.config_path.is_none());
+        assert!(plan.descriptors.is_empty());
+        assert_eq!(plan.config_overrides.len(), 1);
+        assert!(plan.config_overrides[0].starts_with("mcp_servers={\"local.tools\"="));
+        assert!(plan.config_overrides[0].contains("command=\"node\""));
+        assert!(plan.config_overrides[0].contains("args=[\"server.js\"]"));
+        assert!(plan.config_overrides[0].contains("env_vars=[\"LOCAL_TOKEN\"]"));
+        assert!(plan.config_overrides[0].contains("url=\"https://mcp.example/mcp\""));
+        assert!(plan.config_overrides[0].contains("env_http_headers="));
+
+        let argv = plan.config_overrides.join(" ");
+        assert!(!argv.contains("local-secret"));
+        assert!(!argv.contains("remote-secret"));
+        assert!(plan
+            .environment
+            .iter()
+            .any(|(key, value)| key == "LOCAL_TOKEN" && value == "local-secret"));
+        assert!(plan
+            .environment
+            .iter()
+            .any(|(key, value)| key.starts_with("ARGO_MCP_RUN_ABC_")
+                && value == "Bearer remote-secret"));
     }
 
     #[cfg(unix)]

@@ -204,6 +204,8 @@ pub enum PickerAction {
     McpLocalConfig,
     /// Select an MCP server discovered in another CLI config.
     McpImport,
+    /// Enable, disable, or edit project instructions.
+    Instructions,
 }
 
 /// One terminal cell used by Argo-owned drag selection.
@@ -570,7 +572,7 @@ impl App {
             "Ctrl+Y restores the last edit",
             "F2 toggles wheel/selection mode",
             "Shift+Tab cycles the agent mode",
-            "/thinking hides or shows reasoning",
+            "Ctrl+T hides or shows reasoning",
             "/usage shows reported token data",
             "Esc cancels the active turn",
         ];
@@ -1764,10 +1766,15 @@ impl App {
     /// Changes whether reasoning lines are drawn without deleting canonical data.
     pub fn set_thinking_visible(&mut self, visible: bool) {
         self.thinking_visible = visible;
+        // Filtering reasoning changes the rendered row count. Following the live
+        // tail prevents the old scroll offset from making the toggle appear to do
+        // nothing or from leaving the viewport on unrelated earlier content.
+        self.scroll_back = 0;
+        self.clear_mouse_selection();
         self.set_status(if visible {
-            "thinking is visible · /thinking hide to collapse it"
+            "thinking is visible · Ctrl+T or /thinking hide to collapse it"
         } else {
-            "thinking is hidden · /thinking show to reveal it"
+            "thinking is hidden · Ctrl+T or /thinking show to reveal it"
         });
     }
 
@@ -4246,8 +4253,10 @@ mod new_feature_tests {
     fn thinking_visibility_does_not_delete_reasoning() {
         let mut app = new_app();
         app.push(LineKind::Thinking, "retained reasoning");
+        app.scroll_back = 12;
         app.set_thinking_visible(false);
         assert!(!app.thinking_visible);
+        assert_eq!(app.scroll_back, 0, "toggle must return to the live tail");
         assert!(app
             .lines
             .iter()

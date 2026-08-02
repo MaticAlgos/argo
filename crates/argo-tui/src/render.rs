@@ -252,11 +252,20 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
 
     let mut rendered: Vec<TextLine<'_>> = Vec::new();
-    for line in app
-        .lines
-        .iter()
-        .filter(|line| app.thinking_visible || line.kind != LineKind::Thinking)
-    {
+    let mut collapsed_thinking = false;
+    for line in &app.lines {
+        if !app.thinking_visible && line.kind == LineKind::Thinking {
+            if !collapsed_thinking {
+                let marker = crate::app::Line {
+                    kind: LineKind::Activity,
+                    text: "◌ thinking hidden · Ctrl+T or /thinking show".into(),
+                };
+                rendered.extend(render_line(&marker, inner_width));
+            }
+            collapsed_thinking = true;
+            continue;
+        }
+        collapsed_thinking = false;
         rendered.extend(render_line(line, inner_width));
     }
 
@@ -1702,7 +1711,13 @@ mod tests {
         app.set_thinking_visible(false);
         let output = render(&app, 70, 12);
         assert!(!output.contains("private-visible-reasoning"));
+        assert!(output.contains("thinking hidden"));
         assert!(output.contains("final answer"));
         assert!(app.lines.iter().any(|line| line.kind == LineKind::Thinking));
+
+        app.set_thinking_visible(true);
+        let shown = render(&app, 70, 12);
+        assert!(shown.contains("private-visible-reasoning"));
+        assert!(!shown.contains("thinking hidden"));
     }
 }

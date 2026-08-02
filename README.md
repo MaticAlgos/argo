@@ -51,7 +51,8 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
   Gemini/GPT model IDs whose level is already part of the model choice.
 - Streams responses, CLI-emitted thinking, tools, file changes, plans, usage,
   and delegated-agent activity without inventing hidden reasoning.
-- Lets you show or hide thinking with `/thinking`.
+- Lets you show or hide thinking with `/thinking` or `Ctrl+T`, including while a
+  model is running.
 - Recognizes deliberate numbered choices and presents a keyboard picker.
 - Keeps mouse-wheel scrolling and drag-to-select/copy active at the same time.
 - Shares skills and MCP servers across compatible agents.
@@ -135,6 +136,7 @@ a different agent or applies an effort value to an incompatible model.
 | `Option+Backspace` / `Ctrl+W` | Delete the previous word |
 | `Cmd+Backspace` / `Ctrl+U` | Delete to the start of the line |
 | `Ctrl+Y` | Restore the last composer edit |
+| `Ctrl+T` | Show or collapse CLI-emitted thinking, including during a run |
 | Mouse wheel / `PageUp` / `PageDown` | Scroll rendered transcript rows |
 | Drag with the left mouse button | Select visible text and copy it on release |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy the selection, or the latest response if none is selected |
@@ -162,12 +164,13 @@ details and queue behavior.
 | `/effort [level]` | Set effort only when the current model supports it |
 | `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
 | `/mode [id]` | Set an execution mode directly, for example `/mode plan`; `Shift+Tab` cycles it |
-| `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility |
+| `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility (`Ctrl+T`) |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
 | `/status` | Show conversation, selection, context, run, and queue state |
 | `/update [check\|install\|force]` | Check for updates or exit and update Argo directly |
 | `/agents` | Browse CLIs; Enter switches, Space configures default, Delete clears it |
 | `/skills` | Show skills available to every agent |
+| `/instructions [enable\|disable\|edit]` | Manage opt-in `.argo-instructions.md` project memory |
 | `/context` | Preview exactly what the next CLI receives |
 | `/resume [n\|id]` | List or reopen conversations (`/open` is an alias) |
 | `/new [title]` | Start a new conversation |
@@ -224,9 +227,11 @@ shows the authorization URL so it can be copied manually.
 ```
 
 Existing non-Argo vendor configuration is preserved. Argo can project MCP
-servers through generated Claude/Codex configuration, Kiro ACP descriptors, and
-the supported shared configuration formats for OpenCode, Command Code, and
-Antigravity. Grok currently has no verified MCP injection mechanism.
+servers through generated Claude configuration, non-persistent native Codex
+config overrides, Kiro ACP descriptors, and the supported shared configuration
+formats for OpenCode, Command Code, and Antigravity. Grok currently has no
+verified MCP injection mechanism. `/mcp list` always shows the built-in `argo`
+delegation server separately from servers you added.
 
 ## Delegation and child agents
 
@@ -235,10 +240,38 @@ Other compatible hosts can use the daemon-backed command supplied in their turn
 environment. Each delegated task gets its own conversation, run, session, and
 events, linked to its parent.
 
+Run `/mcp check argo` or `/mcp reconnect argo` to verify delegation. MCP calls
+reconnect for each operation and automatically restart a missing compatible Argo
+daemon. A newer installed Argo also replaces an older protocol-compatible daemon
+before retrying. If the coding CLI itself drops its MCP child process, the next
+agent turn receives a freshly generated connection; command delegation remains
+available as a fallback.
+
 The parent and children keep running when you inspect another conversation or
 leave the TUI. Child completion is never mistaken for parent completion and does
 not incorrectly advance the parent's message queue. Argo reports only child
 identity exposed by a verified stream; it does not invent subagent frames.
+
+## Project instructions
+
+Automatic project instructions are disabled by default. Run `/instructions` for
+the three available actions, or use them directly:
+
+```text
+/instructions enable
+/instructions disable
+/instructions edit
+```
+
+Enabling creates `.argo-instructions.md` in the active workspace. Prompts that
+clearly express a durable rule—such as “from now on”, “always”, “never”, or “for
+this project”—are deduplicated into that file and included in future context.
+Ordinary one-off tasks are not made permanent. `edit` opens the file with
+`$VISUAL`, `$EDITOR`, or `vi`; manual edits remain authoritative.
+
+Disabling retains the Markdown file but stops both automatic capture and context
+injection. Therefore merely having `.argo-instructions.md` in a repository does
+not enable the feature.
 
 ## How context is managed
 

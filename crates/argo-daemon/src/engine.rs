@@ -97,6 +97,10 @@ pub struct TurnRequest {
     pub mcp_descriptors: Vec<serde_json::Value>,
     /// Generated MCP config path, for adapters that take a file.
     pub mcp_config: Option<String>,
+    /// Adapter-native MCP configuration overrides.
+    pub mcp_overrides: Vec<String>,
+    /// Environment required by the injected MCP configuration.
+    pub mcp_environment: Vec<(String, String)>,
     /// Hard ceiling on the turn.
     pub timeout_ms: Option<u64>,
     /// Execution mode for this turn.
@@ -363,6 +367,7 @@ pub async fn run_turn(
             cwd: cwd.clone(),
             extra_dirs: vec![],
             mcp_config: request.mcp_config.clone(),
+            mcp_overrides: request.mcp_overrides.clone(),
             help_flags: request.help_flags.clone(),
             mode: request.mode,
         };
@@ -373,19 +378,23 @@ pub async fn run_turn(
                 bin: request.bin.clone(),
                 prompt: body,
                 context,
-                env: vec![
-                    (
-                        crate::mcp::CONVERSATION_ENV.to_string(),
-                        request.conversation_id.to_string(),
-                    ),
-                    (crate::mcp::RUN_ENV.to_string(), run_id.to_string()),
-                    (
-                        crate::mcp::BINARY_ENV.to_string(),
-                        std::env::current_exe()
-                            .map(|path| path.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| "argo".to_string()),
-                    ),
-                ],
+                env: {
+                    let mut env = request.mcp_environment.clone();
+                    env.extend([
+                        (
+                            crate::mcp::CONVERSATION_ENV.to_string(),
+                            request.conversation_id.to_string(),
+                        ),
+                        (crate::mcp::RUN_ENV.to_string(), run_id.to_string()),
+                        (
+                            crate::mcp::BINARY_ENV.to_string(),
+                            std::env::current_exe()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "argo".to_string()),
+                        ),
+                    ]);
+                    env
+                },
                 mcp_servers: request.mcp_descriptors.clone(),
                 timeout_ms: request.timeout_ms,
             },
@@ -631,12 +640,22 @@ pub fn compose_body(
 
     // Per-turn directives lead the turn: restrictions and delegation availability
     // must also reach resumed native sessions that skip canonical context.
-    let mut directives = Vec::new();
+    let mut directives: Vec<String> = Vec::new();
     if let Some(mode) = request.mode.directive() {
-        directives.push(mode);
+        directives.push(mode.to_string());
+    }
+    if plan.skip_transcript() {
+        let current = request
+            .project_instructions
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("No Argo-supplied project instructions are currently active.");
+        directives.push(format!(
+            "## Current project instructions\nTreat this section as the complete current Argo-supplied instruction set. It replaces any Argo-supplied project instructions from earlier turns.\n\n{current}"
+        ));
     }
     if request.delegation_allowed {
-        directives.push(DELEGATION_DIRECTIVE);
+        directives.push(DELEGATION_DIRECTIVE.to_string());
     }
     if directives.is_empty() {
         Ok(body)
@@ -787,6 +806,8 @@ mod tests {
             active_mcp_servers: vec![],
             mcp_descriptors: vec![],
             mcp_config: None,
+            mcp_overrides: vec![],
+            mcp_environment: vec![],
             project_instructions: None,
             timeout_ms: Some(5_000),
             mode: argo_core::mode::AgentMode::Full,
@@ -897,9 +918,36 @@ mod tests {
             "/repo",
         )
         .expect("body");
-        assert!(body.starts_with(DELEGATION_DIRECTIVE));
+        assert!(body.starts_with("## Current project instructions"));
+        assert!(body.contains("No Argo-supplied project instructions are currently active."));
+        assert!(body.contains(DELEGATION_DIRECTIVE));
         assert!(body.ends_with("next thing"));
         assert!(!body.contains(argo_context::TRANSCRIPT_HEADING));
+    }
+
+    #[test]
+    fn resumed_turns_replace_their_project_instruction_state() {
+        let (store, _paths, conv, _ws, _dir) = setup();
+        let plan = ResumePlan {
+            decision: argo_core::session::ResumeDecision::Resume,
+            resume_session_id: Some(SessionId::new("s1")),
+            stored_session_id: Some(SessionId::new("s1")),
+            invalidation: None,
+            stored_stable_hash: None,
+        };
+        let mut request = request(&conv, "codex", "continue");
+        request.project_instructions =
+            Some("## Project instructions\n\n### .argo-instructions.md\nAlways use pnpm.".into());
+        let enabled = compose_body(&store, &request, &plan, &MessageId::new("pending"), "/repo")
+            .expect("enabled");
+        assert!(enabled.contains("It replaces any Argo-supplied project instructions"));
+        assert!(enabled.contains("Always use pnpm."));
+
+        request.project_instructions = None;
+        let disabled = compose_body(&store, &request, &plan, &MessageId::new("pending"), "/repo")
+            .expect("disabled");
+        assert!(disabled.contains("No Argo-supplied project instructions are currently active."));
+        assert!(!disabled.contains("Always use pnpm."));
     }
 
     #[test]

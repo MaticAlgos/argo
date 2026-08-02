@@ -35,6 +35,8 @@ pub struct InvocationContext {
     pub extra_dirs: Vec<String>,
     /// Path to a generated MCP configuration file, when injection uses one.
     pub mcp_config: Option<String>,
+    /// Adapter-native MCP configuration overrides.
+    pub mcp_overrides: Vec<String>,
     /// Capability flags observed in the installed binary's help output.
     ///
     /// Lets an arg builder avoid passing a flag an older build would reject.

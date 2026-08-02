@@ -466,14 +466,18 @@ fn mcp_path(paths: &ArgoPaths) -> std::path::PathBuf {
 /// Runs in-process: the registry is a file, so this works with the daemon down.
 pub async fn mcp_list(paths: &ArgoPaths) -> Result<()> {
     let registry = argo_resources::McpRegistry::load(&mcp_path(paths))?;
+    println!("built-in server:");
+    println!("  {:<20} enabled   delegation (injected per turn)", "argo");
     if registry.servers.is_empty() {
-        println!("no MCP servers configured");
+        println!();
+        println!("no additional MCP servers configured");
         println!("add one:    argo mcp add <name> --url <endpoint>");
         println!("or import:  argo mcp import");
         return Ok(());
     }
+    println!();
     println!(
-        "{} server(s), shared with every agent that supports MCP:",
+        "{} additional server(s), shared with every agent that supports MCP:",
         registry.servers.len()
     );
     for server in &registry.servers {
@@ -638,8 +642,18 @@ pub async fn mcp_logout(paths: &ArgoPaths, name: &str) -> Result<()> {
 /// alternative is a TLS dependency for the whole workspace for one command.
 pub async fn mcp_check(paths: &ArgoPaths) -> Result<()> {
     let registry = argo_resources::McpRegistry::load(&mcp_path(paths))?;
+    match argo_daemon::mcp::delegation_health(paths).await {
+        Ok(()) => println!(
+            "  {:<18} ok — daemon connected; refreshed for every agent turn",
+            "argo (delegation)"
+        ),
+        Err(error) => println!(
+            "  {:<18} UNAVAILABLE — automatic repair failed: {error}",
+            "argo (delegation)"
+        ),
+    }
     if registry.servers.is_empty() {
-        println!("no MCP servers configured");
+        println!("no additional MCP servers configured");
         return Ok(());
     }
 
