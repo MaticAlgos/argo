@@ -1137,7 +1137,7 @@ impl App {
                     || code == "ACP_METHOD_UNSUPPORTED"
                     || code == "ACP_UPDATE"
                     || code == "THINKING_UNAVAILABLE"
-                    || code == "NATIVE_SUBAGENT_UNAVAILABLE"
+                    || code == "NATIVE_SUBAGENT_ACTIVITY"
                 {
                     self.push(LineKind::Notice, format!("· {detail}"));
                     self.streaming.clear();
@@ -1336,7 +1336,7 @@ impl App {
                         | "ACP_METHOD_UNSUPPORTED"
                         | "ACP_UPDATE"
                         | "THINKING_UNAVAILABLE"
-                        | "NATIVE_SUBAGENT_UNAVAILABLE"
+                        | "NATIVE_SUBAGENT_ACTIVITY"
                 ) =>
             {
                 self.push(
@@ -1696,6 +1696,7 @@ impl App {
             .and_then(argo_runtime::find)
             .map(|def| def.capabilities.modes)
             .unwrap_or(argo_core::mode::ModeSupport::NONE)
+            .with_argo_plan()
     }
 
     /// Next mode the selected adapter supports.

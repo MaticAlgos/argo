@@ -328,6 +328,7 @@ async fn drive_acp(
         request.prompt.clone(),
         request.context.resume_session.clone(),
         request.context.concrete_model().map(|m| m.to_string()),
+        request.context.mode,
         request.mcp_servers.clone(),
     );
 

@@ -2732,16 +2732,39 @@ async fn opencode_local_stats() -> Result<Vec<String>> {
 }
 
 async fn kiro_usage() -> Result<Vec<String>> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::process::Command::new("kiro-cli")
-            .args(["chat", "--no-interactive", "/usage"])
-            .stdin(std::process::Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| ArgoError::Timeout(15_000))?
-    .map_err(|error| ArgoError::Process(format!("run Kiro /usage: {error}")))?;
+    // Use the same candidate binaries as detection. Some installations expose
+    // only the historical `kiro` symlink, so hardcoding `kiro-cli` made Argo say
+    // usage was unavailable even though the selected adapter was working.
+    let candidates = argo_runtime::find("kiro")
+        .map(argo_runtime::RuntimeDef::candidate_bins)
+        .unwrap_or_else(|| vec!["kiro-cli", "kiro"]);
+    let mut output = None;
+    for binary in candidates {
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new(binary)
+                .args(["chat", "--no-interactive", "/usage"])
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| ArgoError::Timeout(15_000))?;
+        match attempt {
+            Ok(found) => {
+                output = Some(found);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ArgoError::Process(format!(
+                    "run Kiro /usage with {binary}: {error}"
+                )))
+            }
+        }
+    }
+    let output = output.ok_or_else(|| {
+        ArgoError::Process("run Kiro /usage: neither kiro-cli nor kiro was found".into())
+    })?;
     if !output.status.success() {
         return Err(ArgoError::Process(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -2749,7 +2772,10 @@ async fn kiro_usage() -> Result<Vec<String>> {
     }
     let clean = strip_terminal_sequences(&String::from_utf8_lossy(&output.stdout));
     let lines = useful_usage_lines(&clean, "Kiro");
-    if lines.iter().any(|line| line.contains("Estimated Usage")) {
+    if lines.iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("estimated usage") || (lower.contains("credits") && lower.contains("plan"))
+    }) {
         Ok(lines)
     } else {
         Err(ArgoError::Protocol(

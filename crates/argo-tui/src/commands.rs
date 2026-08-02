@@ -224,7 +224,7 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "delegate" => {
             let rest = argument.ok_or(ParseError::MissingArgument {
                 command: "delegate",
-                expected: "an agent and a task, for example /delegate codex review my changes",
+                expected: "an explicit target and task: /delegate <agent> <task>",
             })?;
             let (agent, task) =
                 rest.split_once(char::is_whitespace)
@@ -822,9 +822,9 @@ mod tests {
     #[test]
     fn parses_delegate_into_agent_and_task() {
         assert_eq!(
-            parse("/delegate codex review my changes").expect("parse"),
+            parse("/delegate example-agent review my changes").expect("parse"),
             Command::Delegate {
-                agent: "codex".into(),
+                agent: "example-agent".into(),
                 task: "review my changes".into()
             }
         );
@@ -833,8 +833,8 @@ mod tests {
     #[test]
     fn delegate_without_a_task_is_rejected_with_guidance() {
         let error = parse("/delegate").expect_err("must fail");
-        assert!(error.to_string().contains("/delegate codex"));
-        let error = parse("/delegate codex").expect_err("must fail");
+        assert!(error.to_string().contains("/delegate <agent> <task>"));
+        let error = parse("/delegate example-agent").expect_err("must fail");
         assert!(error.to_string().contains("task after the agent"));
     }
 
@@ -920,7 +920,7 @@ mod tests {
         // does not accept.
         for name in COMMAND_NAMES {
             let line = match *name {
-                "/delegate" => "/delegate codex do it".to_string(),
+                "/delegate" => "/delegate example-agent do it".to_string(),
                 other => other.to_string(),
             };
             assert!(parse(&line).is_ok(), "{name} must parse");

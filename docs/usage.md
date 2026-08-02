@@ -157,7 +157,15 @@ Effort is separate from visibility. The effort picker appears only if Argo has a
 verified adjustable-effort mapping for the selected model. Choosing another
 model clears an incompatible stale effort value. Model IDs that encode their
 level—such as fixed `...-high` or `...-medium` variants—do not get a redundant
-effort screen.
+effort screen. Kiro CLI exposes session-wide `low`, `medium`, `high`, `xhigh`,
+and `max` levels; Argo forwards the selected value to its ACP process.
+
+Plan mode belongs to Argo rather than to the selected CLI. `/mode plan` or
+Shift+Tab stores the mode on the conversation and prepends a no-write planning
+boundary to every turn. If an adapter also advertises a verified native planning
+mode, Argo mirrors the selection as a second enforcement layer. Kiro's ACP
+`kiro_default`/`kiro_planner` modes are handled this way on fresh and resumed
+sessions.
 
 When a response deliberately asks the user to select among numbered alternatives,
 Argo opens a simple choice picker. Ordinary numbered prose and procedural lists
@@ -215,6 +223,12 @@ cancellation advances the queue; failure pauses it. Press empty `Enter` to retry
 or `Esc` while idle to discard the paused items.
 
 ## Delegated conversations
+
+For ordinary delegation, the active CLI uses its own native subagents and keeps
+the work in the current upstream session. Argo's `argo_delegate` tool is an
+explicit cross-CLI escape hatch only. It should be called only when the user asks
+for Argo-managed or cross-CLI delegation, not automatically for exploration,
+parallelism, or a second opinion.
 
 Every Argo delegation creates a linked child conversation and child run. The TUI
 subscribes to child events and labels their messages, tools, files, plans, and

@@ -59,10 +59,13 @@ pub const STABLE_INSTRUCTIONS: &str = "\
 You are working inside Argo, which orchestrates multiple coding-agent CLIs over one shared conversation. \
 The transcript below may include turns produced by a different agent or model; treat it as authoritative \
 history of this conversation. Continue the work rather than restarting it, and do not re-answer earlier turns. \
+For ordinary delegation, use the active CLI's native subagent mechanism when available so the work remains \
+inside its current session. Use Argo cross-CLI delegation only when the user explicitly asks for Argo-managed \
+or cross-CLI delegation; never initiate it merely for parallelism, exploration, or a second opinion. \
 Only describe reasoning, tools, or child activity that Argo or the underlying CLI actually emits.";
 
 /// Per-turn fallback available even when the upstream session is resumed.
-const DELEGATION_DIRECTIVE: &str = "Argo delegation is available for exploratory work or a second opinion: run \"$ARGO_BIN\" delegate <agent> <self-contained task>, wait for its report, and incorporate the result.";
+const DELEGATION_DIRECTIVE: &str = "## Delegation policy (current; supersedes earlier Argo delegation instructions)\nUse the active CLI's native subagent mechanism for ordinary delegation so work stays in the current running session. Do not initiate Argo cross-CLI delegation merely for parallelism, exploratory work, a second opinion, or because another CLI might be better. Use `argo_delegate` or \"$ARGO_BIN\" delegate only when the user explicitly asks for Argo-managed or cross-CLI delegation.";
 
 /// How many recent messages are considered before budgeting trims further.
 const MAX_RECENT_MESSAGES: usize = 200;
@@ -923,6 +926,15 @@ mod tests {
         assert!(body.contains(DELEGATION_DIRECTIVE));
         assert!(body.ends_with("next thing"));
         assert!(!body.contains(argo_context::TRANSCRIPT_HEADING));
+    }
+
+    #[test]
+    fn delegation_prompt_prefers_native_subagents_and_supersedes_old_advice() {
+        assert!(DELEGATION_DIRECTIVE.contains("supersedes earlier"));
+        assert!(DELEGATION_DIRECTIVE.contains("native subagent"));
+        assert!(DELEGATION_DIRECTIVE.contains("explicitly asks"));
+        assert!(DELEGATION_DIRECTIVE.contains("Do not initiate Argo cross-CLI delegation"));
+        assert!(!DELEGATION_DIRECTIVE.contains("Argo delegation is available for exploratory"));
     }
 
     #[test]

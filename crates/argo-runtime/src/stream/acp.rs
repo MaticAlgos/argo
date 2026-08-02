@@ -7,8 +7,9 @@
 //! 2. `session/new` or `session/load` — create, or resume when Argo holds a
 //!    handle and the agent advertises `loadSession`.
 //! 3. `session/set_model` — only when a concrete model was selected.
-//! 4. `session/prompt` — send the composed turn; the response ends the turn.
-//! 5. `session/cancel` — notification, on user cancellation.
+//! 4. `session/set_mode` — when the agent advertises a matching native mode.
+//! 5. `session/prompt` — send the composed turn; the response ends the turn.
+//! 6. `session/cancel` — notification, on user cancellation.
 //!
 //! The agent streams `session/update` notifications in between. Kiro also sends
 //! `_kiro.dev/*` extension messages, which are optional by spec and ignored here
@@ -17,6 +18,7 @@
 use super::{truncate, StreamSink, TerminalOutcome};
 use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
 use argo_core::ids::SessionId;
+use argo_core::mode::AgentMode;
 use serde_json::json;
 
 /// ACP protocol version Argo speaks.
@@ -49,6 +51,8 @@ pub struct AcpSession {
     session_id: Option<String>,
     resume_target: Option<String>,
     model: Option<String>,
+    requested_mode: AgentMode,
+    native_mode_id: Option<String>,
     prompt: String,
     mcp_servers: Vec<serde_json::Value>,
     cwd: String,
@@ -57,6 +61,7 @@ pub struct AcpSession {
     initialize_id: Option<i64>,
     session_id_request: Option<i64>,
     set_model_id: Option<i64>,
+    set_mode_id: Option<i64>,
     prompt_id: Option<i64>,
 }
 
@@ -66,6 +71,7 @@ enum State {
     AwaitingInitialize,
     AwaitingSession,
     AwaitingSetModel,
+    AwaitingSetMode,
     AwaitingPrompt,
     Done,
 }
@@ -77,6 +83,7 @@ impl AcpSession {
         prompt: impl Into<String>,
         resume_target: Option<String>,
         model: Option<String>,
+        requested_mode: AgentMode,
         mcp_servers: Vec<serde_json::Value>,
     ) -> Self {
         Self {
@@ -85,6 +92,8 @@ impl AcpSession {
             session_id: None,
             resume_target,
             model,
+            requested_mode,
+            native_mode_id: None,
             prompt: prompt.into(),
             mcp_servers,
             cwd: cwd.into(),
@@ -93,6 +102,7 @@ impl AcpSession {
             initialize_id: None,
             session_id_request: None,
             set_model_id: None,
+            set_mode_id: None,
             prompt_id: None,
         }
     }
@@ -199,8 +209,8 @@ impl AcpSession {
             }
             "_kiro.dev/subagent/list_update" => {
                 sink.emit(RunEventKind::Diagnostic {
-                    code: "NATIVE_SUBAGENT_UNAVAILABLE".into(),
-                    detail: "Kiro emitted a native-subagent update, but its vendor extension does not expose a verified child event schema; use Argo delegation for inspectable child activity".into(),
+                    code: "NATIVE_SUBAGENT_ACTIVITY".into(),
+                    detail: "Kiro native-subagent activity detected; detailed child events are not available through the current ACP extension, but the native subagent remains in Kiro's running session".into(),
                 });
                 AcpAction::Idle
             }
@@ -258,6 +268,23 @@ impl AcpSession {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("acp error");
+            // Model and mode selection are optional ACP capabilities. Continue
+            // with the agent's current setting when an older peer rejects them;
+            // Argo's own mode directive still protects a planning turn.
+            if id.is_some() && id == self.set_model_id {
+                sink.emit(RunEventKind::Diagnostic {
+                    code: "ACP_MODEL_SELECTION_REJECTED".into(),
+                    detail: truncate(message, 300),
+                });
+                return self.select_mode_or_prompt();
+            }
+            if id.is_some() && id == self.set_mode_id {
+                sink.emit(RunEventKind::Diagnostic {
+                    code: "ACP_MODE_SELECTION_REJECTED".into(),
+                    detail: truncate(message, 300),
+                });
+                return self.send_prompt();
+            }
             // A failed `session/load` means the stored handle is dead. Report it
             // so the engine can clear the handle and reseed in the same turn.
             let loading =
@@ -299,6 +326,7 @@ impl AcpSession {
         }
 
         if id == self.session_id_request {
+            self.native_mode_id = matching_native_mode(result, self.requested_mode);
             if let Some(session) = result
                 .and_then(|r| r.get("sessionId"))
                 .and_then(|v| v.as_str())
@@ -312,11 +340,18 @@ impl AcpSession {
                 // still the live session.
                 self.session_id = Some(existing.clone());
             }
-            return self.select_model_or_prompt();
+            return self.select_model_or_mode();
         }
 
         if id == self.set_model_id {
             // A rejected model selection is not fatal; the CLI keeps its default.
+            return self.select_mode_or_prompt();
+        }
+
+        if id == self.set_mode_id {
+            // The prompt also carries Argo's restrictive mode directive, so an
+            // older ACP peer rejecting the native switch does not remove the
+            // safety boundary or prevent the turn from continuing.
             return self.send_prompt();
         }
 
@@ -365,9 +400,9 @@ impl AcpSession {
         }
     }
 
-    fn select_model_or_prompt(&mut self) -> AcpAction {
+    fn select_model_or_mode(&mut self) -> AcpAction {
         let Some(model) = self.model.clone() else {
-            return self.send_prompt();
+            return self.select_mode_or_prompt();
         };
         let id = self.allocate_id();
         self.set_model_id = Some(id);
@@ -377,6 +412,21 @@ impl AcpSession {
             "id": id,
             "method": "session/set_model",
             "params": { "sessionId": self.session_id, "modelId": model }
+        }))
+    }
+
+    fn select_mode_or_prompt(&mut self) -> AcpAction {
+        let Some(mode) = self.native_mode_id.clone() else {
+            return self.send_prompt();
+        };
+        let id = self.allocate_id();
+        self.set_mode_id = Some(id);
+        self.state = State::AwaitingSetMode;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/set_mode",
+            "params": { "sessionId": self.session_id, "modeId": mode }
         }))
     }
 
@@ -525,6 +575,36 @@ impl AcpSession {
     }
 }
 
+/// Maps Argo's portable modes onto identifiers advertised by an ACP session.
+///
+/// ACP mode ids are agent-owned (Kiro currently reports `kiro_default` and
+/// `kiro_planner`), so matching the advertised metadata is safer than hardcoding
+/// a vendor id. Unsupported Argo modes remain prompt-enforced and are not sent.
+fn matching_native_mode(
+    result: Option<&serde_json::Value>,
+    requested: AgentMode,
+) -> Option<String> {
+    let modes = result?.get("modes")?;
+    let available = modes.get("availableModes")?.as_array()?;
+    let needle = match requested {
+        AgentMode::Full => "default",
+        AgentMode::Plan => "plan",
+        AgentMode::AcceptEdits | AgentMode::ReadOnly => return None,
+    };
+    let selected = available.iter().find(|mode| {
+        ["id", "name", "description"].iter().any(|field| {
+            mode.get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
+        })
+    })?;
+    let id = selected.get("id")?.as_str()?;
+    let current = modes
+        .get("currentModeId")
+        .and_then(serde_json::Value::as_str);
+    (current != Some(id)).then(|| id.to_string())
+}
+
 /// Extracts text from an ACP content chunk.
 fn chunk_text(update: &serde_json::Value) -> Option<String> {
     let content = update.get("content")?;
@@ -611,8 +691,13 @@ mod tests {
             "do the thing",
             resume.map(String::from),
             model.map(String::from),
+            AgentMode::Full,
             vec![],
         )
+    }
+
+    fn session_in_mode(mode: AgentMode) -> AcpSession {
+        AcpSession::new("/repo", "do the thing", None, None, mode, vec![])
     }
 
     #[test]
@@ -719,6 +804,110 @@ mod tests {
             &mut sink,
         );
         assert_eq!(method_of(&prompt), "session/prompt");
+    }
+
+    #[test]
+    fn advertised_plan_mode_is_selected_natively_before_prompting() {
+        let mut sink = CollectingSink::default();
+        let mut s = session_in_mode(AgentMode::Plan);
+        let init = s.start();
+        let new_session = s.handle_line(
+            &json!({"jsonrpc":"2.0","id":id_of(&init),"result":{"agentCapabilities":{}}})
+                .to_string(),
+            &mut sink,
+        );
+        let set_mode = s.handle_line(
+            &json!({
+                "jsonrpc":"2.0",
+                "id":id_of(&new_session),
+                "result":{
+                    "sessionId":"s1",
+                    "modes":{
+                        "currentModeId":"kiro_default",
+                        "availableModes":[
+                            {"id":"kiro_default","name":"kiro_default"},
+                            {"id":"kiro_planner","name":"kiro_planner","description":"planning agent"}
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+            &mut sink,
+        );
+        assert_eq!(method_of(&set_mode), "session/set_mode");
+        assert_eq!(params_of(&set_mode)["modeId"], json!("kiro_planner"));
+
+        let prompt = s.handle_line(
+            &json!({"jsonrpc":"2.0","id":id_of(&set_mode),"result":{}}).to_string(),
+            &mut sink,
+        );
+        assert_eq!(method_of(&prompt), "session/prompt");
+    }
+
+    #[test]
+    fn switching_a_resumed_plan_session_back_to_full_selects_default_mode() {
+        let result = json!({
+            "modes": {
+                "currentModeId": "kiro_planner",
+                "availableModes": [
+                    {"id":"kiro_default","name":"kiro_default","description":"default agent"},
+                    {"id":"kiro_planner","name":"kiro_planner","description":"planning agent"}
+                ]
+            }
+        });
+        assert_eq!(
+            matching_native_mode(Some(&result), AgentMode::Full).as_deref(),
+            Some("kiro_default")
+        );
+    }
+
+    #[test]
+    fn native_mode_switch_is_skipped_when_the_session_is_already_in_that_mode() {
+        let result = json!({
+            "modes": {
+                "currentModeId": "kiro_planner",
+                "availableModes": [
+                    {"id":"kiro_default","name":"kiro_default"},
+                    {"id":"kiro_planner","name":"kiro_planner"}
+                ]
+            }
+        });
+        assert_eq!(matching_native_mode(Some(&result), AgentMode::Plan), None);
+    }
+
+    #[test]
+    fn rejected_native_mode_still_prompts_with_argos_boundary() {
+        let mut sink = CollectingSink::default();
+        let mut s = session_in_mode(AgentMode::Plan);
+        let init = s.start();
+        let new_session = s.handle_line(
+            &json!({"jsonrpc":"2.0","id":id_of(&init),"result":{}}).to_string(),
+            &mut sink,
+        );
+        let set_mode = s.handle_line(
+            &json!({
+                "jsonrpc":"2.0",
+                "id":id_of(&new_session),
+                "result":{
+                    "sessionId":"s1",
+                    "modes":{
+                        "currentModeId":"kiro_default",
+                        "availableModes":[{"id":"kiro_planner","name":"planner"}]
+                    }
+                }
+            })
+            .to_string(),
+            &mut sink,
+        );
+        let prompt = s.handle_line(
+            &json!({"jsonrpc":"2.0","id":id_of(&set_mode),"error":{"code":-32601,"message":"not supported"}}).to_string(),
+            &mut sink,
+        );
+        assert_eq!(method_of(&prompt), "session/prompt");
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            RunEventKind::Diagnostic { code, .. } if code == "ACP_MODE_SELECTION_REJECTED"
+        )));
     }
 
     #[test]
@@ -938,8 +1127,9 @@ mod tests {
         assert_eq!(action, AcpAction::Idle);
         assert!(sink.events.iter().any(|event| matches!(
             event,
-            RunEventKind::Diagnostic { code, .. }
-                if code == "NATIVE_SUBAGENT_UNAVAILABLE"
+            RunEventKind::Diagnostic { code, detail }
+                if code == "NATIVE_SUBAGENT_ACTIVITY"
+                    && !detail.contains("Argo delegation")
         )));
         assert!(!sink
             .events

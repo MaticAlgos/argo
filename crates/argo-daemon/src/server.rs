@@ -1031,8 +1031,8 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             conversation_id,
             mode,
         } => {
-            // Reject a mode the selected adapter cannot enforce, rather than
-            // displaying a restriction that is not actually in force.
+            // Plan is owned by Argo and enforced through the composed turn. More
+            // permissive/specialized modes still require verified adapter support.
             if let Some(requested) = &mode {
                 let parsed = argo_core::mode::AgentMode::parse(requested).ok_or_else(|| {
                     ArgoError::Invalid(format!(
@@ -1042,18 +1042,20 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
                 let conversation = daemon.store()?.get_conversation(&conversation_id)?;
                 let (agent, _, _) = daemon.resolve_selection(&conversation).await?;
                 let def = argo_runtime::require(&agent.id)?;
-                if !def.capabilities.modes.supports(parsed) {
+                let support = def.capabilities.modes.with_argo_plan();
+                if !support.supports(parsed) {
                     let available: Vec<&str> = def
                         .capabilities
                         .modes
+                        .with_argo_plan()
                         .available()
                         .iter()
                         .map(|m| m.id())
                         .collect();
                     return Err(ArgoError::Invalid(format!(
-                        "{} cannot enforce '{}' mode. Available: {}",
-                        def.name,
+                        "Argo cannot enforce '{}' with {}. Available: {}",
                         parsed.id(),
+                        def.name,
                         available.join(", ")
                     )));
                 }
@@ -1988,8 +1990,8 @@ mod tests {
 
     #[tokio::test]
     async fn reasoning_is_rejected_for_an_agent_without_levels() {
-        // Kiro exposes no reasoning levels. Claude does (`--effort`), so it is not
-        // the right example here.
+        // OpenCode exposes no independent effort control. Kiro and Claude do, so
+        // neither is the right example here.
         let (daemon, dir) = daemon().await;
         let conversation = new_conversation(&daemon, dir.path()).await;
         handle(
@@ -1997,13 +1999,13 @@ mod tests {
             Request::Select {
                 conversation_id: conversation.clone(),
                 change: SelectionChange {
-                    agent_id: Some(AgentId::new("kiro")),
+                    agent_id: Some(AgentId::new("opencode")),
                     ..Default::default()
                 },
             },
         )
         .await
-        .expect("select kiro");
+        .expect("select opencode");
 
         let error = handle(
             &daemon,
@@ -2018,6 +2020,40 @@ mod tests {
         .await
         .expect_err("must reject");
         assert!(error.to_string().contains("does not expose reasoning"));
+    }
+
+    #[tokio::test]
+    async fn argo_plan_mode_is_available_without_a_native_cli_mode() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+        handle(
+            &daemon,
+            Request::Select {
+                conversation_id: conversation.clone(),
+                change: SelectionChange {
+                    agent_id: Some(AgentId::new("grok")),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .expect("select grok");
+
+        let response = handle(
+            &daemon,
+            Request::SetMode {
+                conversation_id: conversation,
+                mode: Some("plan".into()),
+            },
+        )
+        .await
+        .expect("Argo-owned plan mode");
+        match response {
+            Response::Conversation { summary, .. } => {
+                assert_eq!(summary.selected_mode.as_deref(), Some("plan"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]

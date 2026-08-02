@@ -48,7 +48,11 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
   it does not.
 - Offers reasoning effort only for the selected models that support it. For
   example, Antigravity exposes effort for adjustable Claude models, not for
-  Gemini/GPT model IDs whose level is already part of the model choice.
+  Gemini/GPT model IDs whose level is already part of the model choice. Kiro's
+  verified `low`, `medium`, `high`, `xhigh`, and `max` levels are supported.
+- Owns a portable Plan mode for every CLI. Shift+Tab changes Argo's conversation
+  mode and prompt boundary; verified native plan controls are mirrored as an
+  additional enforcement layer.
 - Streams responses, CLI-emitted thinking, tools, file changes, plans, usage,
   and delegated-agent activity without inventing hidden reasoning.
 - Lets you show or hide thinking with `/thinking` or `Ctrl+T`, including while a
@@ -163,7 +167,7 @@ details and queue behavior.
 | `/model [id]` | Choose a model from the selected CLI's inventory |
 | `/effort [level]` | Set effort only when the current model supports it |
 | `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
-| `/mode [id]` | Set an execution mode directly, for example `/mode plan`; `Shift+Tab` cycles it |
+| `/mode [id]` | Set Argo's execution mode directly; Plan works with every CLI and `Shift+Tab` cycles it |
 | `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility (`Ctrl+T`) |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
 | `/status` | Show conversation, selection, context, run, and queue state |
@@ -235,6 +239,12 @@ delegation server separately from servers you added.
 
 ## Delegation and child agents
 
+Ordinary subagent work stays inside the CLI currently running the conversation.
+Argo tells that CLI to use its native subagent mechanism when one is available.
+The `argo_delegate` MCP tool is reserved for explicit cross-CLI requests: Argo
+does not initiate cross-CLI work merely for exploration, parallelism, or a second
+opinion.
+
 Claude, Codex, and Kiro can receive Argo's native delegation tools through MCP.
 Other compatible hosts can use the daemon-backed command supplied in their turn
 environment. Each delegated task gets its own conversation, run, session, and
@@ -296,15 +306,18 @@ Capabilities below describe Argo's adapter, not every feature of the vendor UI.
 Model inventories may be discovered live and therefore change by installed CLI
 version.
 
-| Agent | Output transport | Native resume | Structured activity | Argo delegation host | Modes |
+| Agent | Output transport | Native resume | Structured activity | Argo delegation host | Verified native modes |
 |---|---|:---:|:---:|---|---|
 | Claude Code | stream JSON | yes | yes | MCP | plan, accept-edits |
 | Codex CLI | JSONL | yes | yes | MCP | accept-edits, read-only |
 | OpenCode | JSONL | yes | yes | command | plan |
-| Kiro CLI | ACP | yes | yes | MCP | — |
+| Kiro CLI | ACP | yes | yes | MCP | plan |
 | Command Code | plain text | yes | no | command | plan, accept-edits |
 | Antigravity | stream JSON | yes | yes | command | plan, accept-edits |
 | Grok CLI | plain text | context replay | no | command target only | — |
+
+Argo-managed Plan mode is available for every row, including CLIs without a
+native mode. Native modes in the table are mirrored for defense-in-depth.
 
 Plain-text adapters can return final prose but cannot expose structured tool
 events. `argo agents --refresh` reports the exact detected version and current
@@ -326,7 +339,7 @@ argo send --conversation-id <id> --agent codex --model <model> "optimize it"
 argo select <id> --agent claude --model <model> --reasoning high
 argo mode <id> plan
 argo context <id> "the next question"
-argo delegate codex "inspect this failure and report likely causes"
+argo delegate <agent> "inspect this failure and report likely causes"
 
 argo skills --root /path/to/project
 argo mcp list

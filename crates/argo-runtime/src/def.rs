@@ -283,12 +283,12 @@ pub fn capability_diagnostics(def: &RuntimeDef) -> Vec<String> {
         );
     } else if def.id == "kiro" {
         out.push(
-            "Kiro's emitted reasoning is visible, but its undocumented native subagent extension is not implemented; use Argo delegation for inspectable children"
+            "Kiro's emitted reasoning is visible; native subagents stay in Kiro's running session, while its ACP extension currently exposes only limited child detail"
                 .to_string(),
         );
     } else {
         out.push(
-            "this CLI stream exposes no stable native-subagent lifecycle; Argo-managed delegated children remain fully linked and inspectable"
+            "this CLI stream exposes no stable native-subagent lifecycle events to Argo"
                 .to_string(),
         );
     }

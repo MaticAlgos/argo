@@ -123,8 +123,7 @@ pub enum Request {
     ///
     /// This is what Argo's delegation MCP tool calls. The child gets its own
     /// conversation, its own upstream session, and a bounded capsule of the
-    /// parent's context — so a Claude turn can hand work to Codex without either
-    /// one inheriting the other's session state.
+    /// parent's context, without either CLI inheriting the other's session state.
     Delegate {
         /// Conversation whose agent is delegating.
         parent_conversation_id: ConversationId,

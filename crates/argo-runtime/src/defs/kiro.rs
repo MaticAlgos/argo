@@ -5,9 +5,9 @@
 //! `session/load`, `session/prompt`, `session/cancel`, `session/set_mode`, and
 //! `session/set_model`, advertising `loadSession: true`.
 //!
-//! Because the session lifecycle is protocol-level, argv is nearly empty: the
-//! model, the prompt, the MCP descriptors, and the resume target are all carried
-//! in JSON-RPC messages rather than command-line flags.
+//! Because the session lifecycle is protocol-level, argv is nearly empty: only
+//! the session-wide effort starts on argv; model, mode, prompt, MCP descriptors,
+//! and the resume target are carried in JSON-RPC messages.
 
 use crate::def::{InvocationContext, ModelProbe, RuntimeDef};
 use argo_core::mode::ModeSupport;
@@ -16,9 +16,15 @@ use argo_core::runtime::{
     PromptEncoding, StreamFormat,
 };
 
-fn build_args(_ctx: &InvocationContext) -> Vec<String> {
-    // Everything else is negotiated over the protocol; see the ACP transport.
-    vec!["acp".into()]
+fn build_args(ctx: &InvocationContext) -> Vec<String> {
+    let mut args = vec!["acp".into()];
+    // Kiro exposes effort as process-wide ACP session configuration. Model and
+    // mode remain protocol concerns because both may change on a resumed session.
+    if let Some(effort) = &ctx.reasoning {
+        args.push("--effort".into());
+        args.push(effort.clone());
+    }
+    args
 }
 
 /// Parses `kiro-cli chat --list-models --format json`.
@@ -97,7 +103,15 @@ pub const KIRO: RuntimeDef = RuntimeDef {
         ("claude-sonnet-5", "claude-sonnet-5"),
         ("gpt-5.6-sol", "gpt-5.6-sol"),
     ],
-    reasoning_options: &[],
+    // Verified against `kiro-cli acp --help` in 2.16.0. Kiro exposes the same
+    // session-wide levels for every selectable model.
+    reasoning_options: &[
+        ("low", "low — faster, lighter thinking"),
+        ("medium", "medium — balanced thinking"),
+        ("high", "high — deeper thinking"),
+        ("xhigh", "xhigh — extended thinking"),
+        ("max", "max — maximum thinking"),
+    ],
     auth_probe: None,
     build_args,
     capture_session: None,
@@ -111,7 +125,7 @@ pub const KIRO: RuntimeDef = RuntimeDef {
         supports_images: true,
         permission: PermissionPosture::FullBypass,
         modes: ModeSupport {
-            plan: false,
+            plan: true,
             accept_edits: false,
             read_only: false,
         },
@@ -134,6 +148,25 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(args, vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn effort_is_forwarded_to_the_acp_session() {
+        let args = KIRO.args_for(&InvocationContext {
+            reasoning: Some("xhigh".into()),
+            ..Default::default()
+        });
+        assert_eq!(args, vec!["acp", "--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn all_documented_effort_levels_are_offered() {
+        let levels: Vec<&str> = KIRO
+            .reasoning_options
+            .iter()
+            .map(|(level, _)| *level)
+            .collect();
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
     }
 
     /// A trimmed copy of the real `--list-models --format json` output.
@@ -196,6 +229,12 @@ mod tests {
         }
         const {
             assert!(KIRO.capabilities.can_delegate());
+        }
+        const {
+            assert!(KIRO.capabilities.modes.plan);
+        }
+        const {
+            assert!(!KIRO.capabilities.modes.accept_edits);
         }
     }
 }

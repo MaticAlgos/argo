@@ -145,6 +145,15 @@ impl ModeSupport {
         read_only: false,
     };
 
+    /// Adds Argo's portable prompt-enforced planning mode to native adapter
+    /// capabilities. The conversation state and boundary directive belong to
+    /// Argo; a verified CLI-native plan switch is an additional enforcement
+    /// layer, not a prerequisite for using Shift+Tab.
+    pub const fn with_argo_plan(mut self) -> Self {
+        self.plan = true;
+        self
+    }
+
     /// True when `mode` can be honored.
     pub const fn supports(&self, mode: AgentMode) -> bool {
         match mode {
@@ -252,6 +261,14 @@ mod tests {
         );
         assert!(!ModeSupport::NONE.has_any());
         assert_eq!(ModeSupport::NONE.available(), vec![AgentMode::Full]);
+    }
+
+    #[test]
+    fn argo_managed_plan_can_wrap_an_adapter_without_native_modes() {
+        let support = ModeSupport::NONE.with_argo_plan();
+        assert!(support.plan);
+        assert!(!support.accept_edits);
+        assert_eq!(support.available(), vec![AgentMode::Full, AgentMode::Plan]);
     }
 
     #[test]

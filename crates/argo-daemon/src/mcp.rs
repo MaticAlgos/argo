@@ -1,9 +1,9 @@
 //! Argo's delegation MCP server.
 //!
-//! Injected into agents that support MCP, this is how one CLI hands work to a
-//! different CLI. The agent calls `argo_delegate`; this server relays the request
-//! to the Argo daemon, which runs the child in its own conversation and session,
-//! then returns the child's reply as the tool result.
+//! Injected into agents that support MCP, this is the explicit cross-CLI path.
+//! Ordinary delegation stays inside the active CLI's native subagent system. If
+//! the user requests cross-CLI delegation, `argo_delegate` relays that request to Argo,
+//! which runs the child in its own conversation and returns its reply.
 //!
 //! It speaks MCP over stdio as newline-delimited JSON-RPC, because that is the
 //! transport every supported CLI can launch.
@@ -44,23 +44,25 @@ pub fn tools() -> Value {
         {
             "name": "argo_list_agents",
             "description": "List the coding-agent CLIs Argo can delegate to on this machine, \
-                            with their models and limitations. Call this before delegating if you \
-                            are unsure which agent to choose.",
+                            with their models and limitations. Use only for an explicitly requested \
+                            cross-CLI delegation; do not use it to replace the active CLI's native \
+                            subagents or to choose a different CLI without the user's request.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "argo_delegate",
-            "description": "Hand a self-contained task to a different coding-agent CLI and wait \
-                            for its answer. The subagent runs in the same workspace with its own \
-                            session and receives a summary of this conversation. Use this when \
-                            another agent is better suited to the task, or for a second opinion. \
-                            Returns the subagent's reply.",
+            "description": "Explicit cross-CLI delegation only. For ordinary delegation, use the \
+                            active CLI's native subagent mechanism so work remains in the current \
+                            running session. Call this tool only when the user explicitly asks for \
+                            Argo-managed or cross-CLI delegation. Never call it merely for parallelism, \
+                            exploratory work, a second opinion, or because another CLI might be better. \
+                            The child runs in the same workspace with its own session and returns its reply.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "Adapter id, for example 'codex', 'claude', 'opencode'."
+                        "description": "Target adapter id for the explicitly requested cross-CLI delegation."
                     },
                     "task": {
                         "type": "string",
@@ -450,6 +452,10 @@ mod tests {
         );
         let description = delegate["description"].as_str().unwrap_or_default();
         assert!(description.contains("own session"));
+        assert!(description.contains("native subagent"));
+        assert!(description.contains("explicitly asks"));
+        assert!(description.contains("Never call it merely"));
+        assert!(!delegate.to_string().to_ascii_lowercase().contains("codex"));
     }
 
     #[tokio::test]
@@ -493,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn delegation_requires_agent_and_task() {
         let value = reply(
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"argo_delegate","arguments":{"agent":"codex"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"argo_delegate","arguments":{"agent":"example-agent"}}}"#,
         )
         .await;
         assert!(value["error"]["message"]
@@ -507,7 +513,7 @@ mod tests {
         // Otherwise the child's transcript would be unreachable from the TUI.
         std::env::remove_var(CONVERSATION_ENV);
         let value = reply(
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"argo_delegate","arguments":{"agent":"codex","task":"review"}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"argo_delegate","arguments":{"agent":"example-agent","task":"review"}}}"#,
         )
         .await;
         assert!(value["error"]["message"]
