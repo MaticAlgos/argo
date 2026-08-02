@@ -21,7 +21,7 @@ const SANDBOX_MODE: &str = "danger-full-access";
 /// Sandbox mode for the requested execution mode.
 ///
 /// Codex expresses authority through its sandbox rather than a permission flag,
-/// so the mode maps onto that. It has no plan mode, which `ModeSupport` declares.
+/// so Argo's plan directive is enforced with Codex's read-only sandbox.
 fn sandbox_for(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::ReadOnly | AgentMode::Plan => "read-only",
@@ -223,7 +223,7 @@ pub const CODEX: RuntimeDef = RuntimeDef {
         supports_images: true,
         permission: PermissionPosture::FullBypass,
         modes: ModeSupport {
-            plan: false,
+            plan: true,
             accept_edits: true,
             read_only: true,
         },
@@ -275,11 +275,12 @@ mod tests {
     fn the_mode_selects_the_sandbox() {
         // Codex expresses authority through the sandbox, not a permission flag.
         assert_eq!(sandbox_for(AgentMode::Full), SANDBOX_MODE);
+        assert_eq!(sandbox_for(AgentMode::Plan), "read-only");
         assert_eq!(sandbox_for(AgentMode::AcceptEdits), "workspace-write");
         assert_eq!(sandbox_for(AgentMode::ReadOnly), "read-only");
 
         let args = CODEX.args_for(&InvocationContext {
-            mode: AgentMode::ReadOnly,
+            mode: AgentMode::Plan,
             ..ctx()
         });
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
@@ -289,12 +290,19 @@ mod tests {
     fn the_mode_survives_a_resume_turn_via_config() {
         // Create-only flags are invalid on resume, so the sandbox moves to -c.
         let args = CODEX.args_for(&InvocationContext {
-            mode: AgentMode::ReadOnly,
+            mode: AgentMode::Plan,
             resume_session: Some("t-1".into()),
             ..ctx()
         });
         assert!(args.contains(&"sandbox_mode=read-only".to_string()));
         assert!(!args.contains(&"--sandbox".to_string()));
+    }
+
+    #[test]
+    fn shift_tab_cycle_can_enter_codex_plan_mode() {
+        let support = CODEX.capabilities.modes;
+        assert!(support.plan);
+        assert_eq!(support.next_supported(AgentMode::Full), AgentMode::Plan);
     }
 
     #[test]

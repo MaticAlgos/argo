@@ -19,7 +19,7 @@ does best.
 
 </div>
 
-![Argo home screen](docs/assets/screenshots/argo-home.svg)
+![Argo home screen](docs/assets/screenshots/argo-home.png)
 
 <table>
   <tr align="center">
@@ -128,7 +128,7 @@ a different agent or applies an effort value to an incompatible model.
 | `Enter` | Send a message or choose the highlighted item |
 | `Shift+Enter` | Insert a new line; includes an Apple Terminal modifier fallback |
 | `Alt+Enter` / `Ctrl+J` | Portable alternate newline shortcuts |
-| `Shift+Tab` | Cycle modes supported by the selected CLI |
+| `Shift+Tab` | Cycle modes supported by the selected CLI (`full` → `plan` first where supported) |
 | `Tab` | Accept the highlighted slash-command completion |
 | `↑` / `↓` | Move in a picker/completion list, or navigate composer history |
 | `Ctrl+P` / `Ctrl+N` | Navigate composer history explicitly |
@@ -161,7 +161,7 @@ details and queue behavior.
 | `/model [id]` | Choose a model from the selected CLI's inventory |
 | `/effort [level]` | Set effort only when the current model supports it |
 | `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
-| `/mode [id]` | Choose an execution mode; `Shift+Tab` cycles it |
+| `/mode [id]` | Set an execution mode directly, for example `/mode plan`; `Shift+Tab` cycles it |
 | `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
 | `/status` | Show conversation, selection, context, run, and queue state |

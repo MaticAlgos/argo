@@ -18,7 +18,6 @@ The source images were resized only where a smaller README payload was useful.
 Light and dark variants are selected with HTML `<picture>` elements when the
 owner publishes both.
 
-[`screenshots/argo-home.svg`](screenshots/argo-home.svg) is a deterministic
-screenshot-style rendering of the current Ratatui launch layout. Keeping it as
-SVG makes the text sharp on HiDPI displays and lets contributors update the
-version and capability labels without a machine-specific terminal theme.
+[`screenshots/argo-home.png`](screenshots/argo-home.png) is a real capture of the
+Ratatui launch layout with all supported CLIs and their locally detected
+versions visible.

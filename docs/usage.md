@@ -79,7 +79,7 @@ Apple Terminal does not forward the Command modifier to the application.
 
 | Shortcut | Result |
 |---|---|
-| `Shift+Tab` | Cycle only modes supported by the selected adapter |
+| `Shift+Tab` | Cycle supported modes; from `full`, enter `plan` first when available |
 | `Esc` | Close an overlay; cancel an active turn; or discard a paused queue |
 | `Ctrl+C` twice within 3 seconds | Exit the TUI; the first press warns |
 | `Ctrl+D` with empty input | Exit immediately |
@@ -97,7 +97,7 @@ prints a copyable `argo --resume <conversation-id>` command when applicable.
 | `/model [id]` | Pick or set a model |
 | `/effort [level]` | Set supported reasoning effort |
 | `/default [configure\|current\|clear]` | Manage launch selection |
-| `/mode [full\|plan\|accept-edits\|read-only]` | Set a supported execution mode |
+| `/mode [full\|plan\|accept-edits\|read-only]` | Set a supported mode directly; use `/mode plan` to plan without cycling |
 | `/thinking [show\|hide\|toggle]` | Control rendered CLI-emitted thinking |
 | `/status` | Show selection, context, active run, and queue |
 | `/update [check\|install\|force]` | Check for updates, or exit and update directly |
