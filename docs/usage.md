@@ -28,6 +28,12 @@ selection, or `/default clear` to remove it. A valid default is shown under the
 Argo logo on later launches; you can type immediately or use `/agent` to change
 the current conversation.
 
+`/agents` opens the full supported-CLI inventory. `Enter` switches the current
+conversation, `Space` starts the model/effort flow and saves the result as the
+default, and `Delete` clears the default. Missing CLIs remain visible but cannot
+be selected. If the saved default CLI is no longer detected on a later launch,
+Argo removes the stale preference and returns to the startup picker.
+
 ## Keyboard and mouse reference
 
 ### Writing and editing
@@ -94,7 +100,8 @@ prints a copyable `argo --resume <conversation-id>` command when applicable.
 | `/mode [full\|plan\|accept-edits\|read-only]` | Set a supported execution mode |
 | `/thinking [show\|hide\|toggle]` | Control rendered CLI-emitted thinking |
 | `/status` | Show selection, context, active run, and queue |
-| `/agents` | Show detected versions and adapter limits |
+| `/update [check\|install\|force]` | Check for updates, or exit and update directly |
+| `/agents` | Browse/switch CLIs and set or clear the startup default |
 
 ### Conversations and work
 
@@ -130,6 +137,13 @@ needed.
 | `/doctor` | Run diagnostics |
 | `/help` | Show all commands |
 | `/quit` | Leave the TUI |
+
+Argo performs a lightweight background version check at startup. It reads only
+the published workspace manifest; it never runs downloaded code automatically.
+When a newer version exists, the header shows an update badge. `/update install`
+restores the normal terminal, exits the running TUI, and then invokes the public
+installer. The scriptable equivalents are `argo update --check`, `argo update`,
+and `argo update --force`.
 
 ## Thinking and model choices
 

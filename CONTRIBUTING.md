@@ -125,6 +125,12 @@ Keep README command tables, [`docs/usage.md`](docs/usage.md), and adapter
 capability labels synchronized with behavior. If README logos change, retain
 source attribution in [`docs/assets/README.md`](docs/assets/README.md).
 
+Argo's update checker compares the installed semantic version with
+`[workspace.package].version` on `main`. Any published user-facing build must bump
+that version in `Cargo.toml`; otherwise existing installations correctly treat it
+as the same release. Run the locked workspace checks after regenerating
+`Cargo.lock` for the version bump.
+
 CI checks formatting, Clippy, the workspace tests, and the release build. A green
 CI result is required but does not replace manual terminal testing for keyboard,
 mouse, clipboard, OAuth browser, or pseudo-terminal behavior.

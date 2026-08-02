@@ -73,6 +73,14 @@ Inspect the script first, pin a tag or commit, install from a Git clone, update,
 or uninstall using the [complete installation guide](docs/installation.md).
 Argo does not install or authenticate vendor CLIs for you.
 
+Existing installations can check and update themselves without copying the
+installer command again:
+
+```bash
+argo update --check
+argo update
+```
+
 ```bash
 cd /path/to/project
 argo doctor
@@ -92,6 +100,12 @@ CLI, then a model, then an effort level only when that exact model supports one.
   use `/agent` to change it for the current chat, or `/default` to reconfigure it.
 - `/default current` saves the current exact selection; `/default clear` restores
   the startup picker.
+- `/agents` opens the complete CLI inventory. `Enter` switches to a detected CLI,
+  `Space` configures it as the exact CLI/model/effort default, and `Delete` clears
+  the saved default.
+- If a saved default CLI is later uninstalled or disappears from `PATH`, Argo
+  clears that stale preference and reopens the CLI picker instead of failing or
+  silently choosing another agent.
 
 Argo always displays the effective CLI and model. It never silently substitutes
 a different agent or applies an effort value to an incompatible model.
@@ -140,7 +154,8 @@ details and queue behavior.
 | `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
 | `/status` | Show conversation, selection, context, run, and queue state |
-| `/agents` | Show detected CLIs, versions, and verified limitations |
+| `/update [check\|install\|force]` | Check for updates or exit and update Argo directly |
+| `/agents` | Browse CLIs; Enter switches, Space configures default, Delete clears it |
 | `/skills` | Show skills available to every agent |
 | `/context` | Preview exactly what the next CLI receives |
 | `/resume [n\|id]` | List or reopen conversations (`/open` is an alias) |

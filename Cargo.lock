@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "argo-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-core",
  "argo-daemon",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "argo-context"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-core",
  "serde",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "argo-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "serde",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "argo-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-context",
  "argo-core",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "argo-resources"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-core",
  "serde",
@@ -153,11 +153,12 @@ dependencies = [
 
 [[package]]
 name = "argo-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-core",
  "futures",
  "libc",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -167,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "argo-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-context",
  "argo-core",
@@ -180,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "argo-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argo-core",
  "argo-daemon",
@@ -1033,6 +1034,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

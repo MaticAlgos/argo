@@ -11,6 +11,7 @@ pub mod exec;
 pub mod registry;
 pub mod staging;
 pub mod stream;
+pub mod update;
 
 pub use def::{AgentInfo, AuthProbe, InvocationContext, ModelProbe, RuntimeDef, DEFAULT_MODEL_ID};
 pub use detect::{detect_all, detect_one, discover_all_lightweight, discover_one};

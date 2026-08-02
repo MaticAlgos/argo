@@ -262,10 +262,15 @@ async fn run_inner(
         Ok(selection) => app.default_selection = selection,
         Err(error) => app.set_status(format!("startup default ignored: {error}")),
     }
+    if let Some(missing) = clear_default_if_agent_missing(paths, &mut app)? {
+        app.set_status(format!(
+            "saved default {missing} is no longer detected · default cleared"
+        ));
+    }
 
     if app.conversation.is_none() {
         // Default launch remains a fresh conversation; resume is always explicit.
-        new_conversation(&mut connection, &mut app, None).await?;
+        new_conversation(&mut connection, &mut app, paths, None).await?;
     }
 
     // Any panic must not leave the terminal unusable.
@@ -289,10 +294,17 @@ async fn run_inner(
         Terminal::new(backend).map_err(|e| ArgoError::Io(format!("create terminal: {e}")))?;
 
     let result = event_loop(&mut terminal, &mut connection, &mut app, paths).await;
+    let update_on_exit = app.update_on_exit;
 
     restore_terminal();
     terminal_guard.0 = false;
     let _ = terminal.show_cursor();
+
+    if result.is_ok() {
+        if let Some(force) = update_on_exit {
+            return update_after_exit(force).await;
+        }
+    }
 
     // The alternate screen is gone by now, so the transcript is no longer visible.
     // Leaving the id behind is the difference between a session the user can return
@@ -313,6 +325,10 @@ async fn event_loop(
     let mut keys = EventStream::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RunEvent>();
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<McpAuthEvent>();
+    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _ = update_tx.send(argo_runtime::update::check().await);
+    });
     let mut screen = ScreenSnapshot::default();
 
     loop {
@@ -341,6 +357,17 @@ async fn event_loop(
         };
 
         tokio::select! {
+            Some(update) = update_rx.recv() => {
+                if let Ok(status) = update {
+                    if status.available() {
+                        app.available_update = Some(status.latest.to_string());
+                        app.set_status(format!(
+                            "Argo v{} is available · /update to review",
+                            status.latest
+                        ));
+                    }
+                }
+            }
             Some(first) = event_rx.recv() => {
                 // ACP adapters may emit one event per token. Drain the ready burst
                 // before redrawing so a 600-token answer does not trigger 600
@@ -724,19 +751,51 @@ async fn handle_key(
             // Typing narrows a picker, which is the only practical way through a
             // list of several hundred models.
             KeyCode::Backspace => app.picker_filter_pop(),
-            KeyCode::Char(' ')
+            KeyCode::Char(' ') => {
+                let space_action = match &app.overlay {
+                    crate::app::Overlay::Picker {
+                        action: PickerAction::StartupAgent,
+                        ..
+                    } => Some(PickerAction::StartupAgent),
+                    crate::app::Overlay::Picker {
+                        action: PickerAction::Agents,
+                        ..
+                    } => Some(PickerAction::DefaultAgent),
+                    _ => None,
+                };
+                if let Some(space_action) = space_action {
+                    if space_action == PickerAction::StartupAgent {
+                        app.startup_save_default = true;
+                    }
+                    if let Some((_, value)) = app.overlay_choose() {
+                        apply_choice(
+                            connection,
+                            app,
+                            paths,
+                            event_tx,
+                            auth_tx,
+                            space_action,
+                            value,
+                        )
+                        .await?;
+                    }
+                } else {
+                    app.picker_filter_push(' ');
+                }
+            }
+            KeyCode::Delete
                 if matches!(
                     &app.overlay,
                     crate::app::Overlay::Picker {
-                        action: PickerAction::StartupAgent,
+                        action: PickerAction::Agents,
                         ..
                     }
                 ) =>
             {
-                app.startup_save_default = true;
-                if let Some((action, value)) = app.overlay_choose() {
-                    apply_choice(connection, app, paths, event_tx, auth_tx, action, value).await?;
-                }
+                crate::preferences::save(paths, None)?;
+                app.default_selection = None;
+                app.set_status("startup default cleared · new chats will ask for a CLI");
+                open_agents_picker(app);
             }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -1375,29 +1434,54 @@ async fn run_command(
             app.open_text("Argo status", lines);
         }
 
-        Command::Agents => {
-            let mut lines = Vec::new();
-            for info in &app.agents {
-                let mark = if info.available { "✓" } else { "·" };
-                lines.push(format!(
-                    "{mark} {} {}",
-                    info.id,
-                    info.version.clone().unwrap_or_else(|| if info.available {
-                        "installed".into()
-                    } else {
-                        "not installed".into()
-                    })
-                ));
-                if info.available {
-                    let models: Vec<&str> =
-                        info.models.iter().map(|m| m.id.as_str()).take(8).collect();
-                    lines.push(format!("    models: {}", models.join(", ")));
+        Command::Update(action) => {
+            let status = match argo_runtime::update::check().await {
+                Ok(status) => status,
+                Err(error) => {
+                    app.report_error(format!("could not check for updates: {error}"));
+                    return Ok(None);
                 }
-                for diagnostic in &info.diagnostics {
-                    lines.push(format!("    {diagnostic}"));
+            };
+            if status.available() {
+                app.available_update = Some(status.latest.to_string());
+            } else {
+                app.available_update = None;
+            }
+            match action {
+                commands::UpdateCommand::Check => {
+                    let mut lines = vec![
+                        format!("current: v{}", status.current),
+                        format!("latest:  v{}", status.latest),
+                        String::new(),
+                    ];
+                    if status.available() {
+                        lines.extend([
+                            "A newer Argo build is available.".into(),
+                            "Run /update install to exit, update, and return to your shell.".into(),
+                        ]);
+                    } else {
+                        lines.push("Argo is up to date.".into());
+                    }
+                    app.open_text("Argo update", lines);
+                }
+                commands::UpdateCommand::Install | commands::UpdateCommand::Force => {
+                    let force = action == commands::UpdateCommand::Force;
+                    if app.is_busy() {
+                        app.report_error(
+                            "wait for the active agent or use /cancel before updating Argo",
+                        );
+                    } else if status.available() || force {
+                        app.update_on_exit = Some(force);
+                        app.should_quit = true;
+                    } else {
+                        app.set_status(format!("Argo v{} is already up to date", status.current));
+                    }
                 }
             }
-            app.open_text("detected agents", lines);
+        }
+
+        Command::Agents => {
+            open_agents_picker(app);
         }
 
         Command::Skills => {
@@ -1528,7 +1612,7 @@ async fn run_command(
             load_conversation(connection, app, &resolved).await?;
         }
 
-        Command::New(title) => new_conversation(connection, app, title).await?,
+        Command::New(title) => new_conversation(connection, app, paths, title).await?,
 
         Command::ClearHistory => {
             match connection
@@ -1539,7 +1623,7 @@ async fn run_command(
             {
                 Response::Cleared { count } => {
                     app.conversations.clear();
-                    new_conversation(connection, app, None).await?;
+                    new_conversation(connection, app, paths, None).await?;
                     app.push(
                         LineKind::Notice,
                         format!("cleared {count} stored conversation(s) in this workspace"),
@@ -1746,6 +1830,24 @@ async fn run_command(
     Ok(None)
 }
 
+/// Runs only after the alternate screen and raw mode have been restored, so the
+/// installer can show normal build progress without corrupting the TUI.
+async fn update_after_exit(force: bool) -> Result<()> {
+    let status = argo_runtime::update::check().await?;
+    if !status.available() && !force {
+        println!("Argo v{} is already up to date", status.current);
+        return Ok(());
+    }
+    if force && !status.available() {
+        println!("reinstalling Argo v{}…", status.latest);
+    } else {
+        println!("updating Argo v{} → v{}…", status.current, status.latest);
+    }
+    argo_runtime::update::install_latest().await?;
+    println!("update complete · restart Argo to use v{}", status.latest);
+    Ok(())
+}
+
 /// Advances to the next mode the adapter supports.
 async fn cycle_mode(connection: &mut Connection, app: &mut App) -> Result<()> {
     if !app.mode_support().has_any() {
@@ -1822,6 +1924,13 @@ async fn apply_choice(
             }
         },
         PickerAction::Agent => match commands::resolve_agent(&value) {
+            Ok(agent) => start_agent_flow(connection, app, agent, PickerAction::Model, true).await,
+            Err(message) => {
+                app.report_error(message);
+                Ok(())
+            }
+        },
+        PickerAction::Agents => match commands::resolve_agent(&value) {
             Ok(agent) => start_agent_flow(connection, app, agent, PickerAction::Model, true).await,
             Err(message) => {
                 app.report_error(message);
@@ -2047,6 +2156,31 @@ fn open_agent_picker(app: &mut App, title: &str, action: PickerAction) {
         .collect();
     let values = available.iter().map(|info| info.id.clone()).collect();
     app.open_picker(title, items, values, action);
+}
+
+fn open_agents_picker(app: &mut App) {
+    let items = app
+        .agents
+        .iter()
+        .map(|info| {
+            let is_default = app
+                .default_selection
+                .as_ref()
+                .is_some_and(|selection| selection.agent == info.id);
+            let default_mark = if is_default { " ★ default" } else { "" };
+            if info.available {
+                format!(
+                    "✓ {:<16} {}{default_mark}",
+                    info.name,
+                    crate::app::agent_picker_detail(info)
+                )
+            } else {
+                format!("· {:<16} not detected{default_mark}", info.name)
+            }
+        })
+        .collect();
+    let values = app.agents.iter().map(|info| info.id.clone()).collect();
+    app.open_picker("coding CLIs", items, values, PickerAction::Agents);
 }
 
 async fn start_agent_flow(
@@ -3212,6 +3346,7 @@ async fn cancel_active(connection: &mut Connection, app: &mut App) -> Result<()>
 async fn new_conversation(
     connection: &mut Connection,
     app: &mut App,
+    paths: &ArgoPaths,
     title: Option<String>,
 ) -> Result<()> {
     match connection
@@ -3224,31 +3359,32 @@ async fn new_conversation(
         Response::Conversation { summary, .. } => {
             app.replace_transcript(Vec::new());
             app.set_conversation_summary(summary);
-            if let Some(configured) = app.default_selection.clone() {
-                let available = app
-                    .agents
-                    .iter()
-                    .any(|agent| agent.available && agent.id == configured.agent);
-                if available
-                    && select_with_visibility(
-                        connection,
-                        app,
-                        argo_core::session::SelectionChange {
-                            agent_id: Some(argo_core::AgentId::new(configured.agent.clone())),
-                            model: Some(configured.model.clone()),
-                            reasoning: configured.effort.clone(),
-                        },
-                        false,
-                    )
-                    .await?
+            if let Some(missing) = clear_default_if_agent_missing(paths, app)? {
+                app.set_status(format!(
+                    "saved default {missing} is no longer detected · default cleared"
+                ));
+                open_agent_picker(app, "choose a coding CLI", PickerAction::StartupAgent);
+            } else if let Some(configured) = app.default_selection.clone() {
+                if select_with_visibility(
+                    connection,
+                    app,
+                    argo_core::session::SelectionChange {
+                        agent_id: Some(argo_core::AgentId::new(configured.agent.clone())),
+                        model: Some(configured.model.clone()),
+                        reasoning: configured.effort.clone(),
+                    },
+                    false,
+                )
+                .await?
                 {
                     app.set_status(format!(
                         "default selected · {} · /agent to change",
                         configured.label()
                     ));
                 } else {
+                    crate::preferences::save(paths, None)?;
                     app.default_selection = None;
-                    app.set_status("saved default is unavailable · choose a CLI");
+                    app.set_status("saved default could not be applied · default cleared");
                     open_agent_picker(app, "choose a coding CLI", PickerAction::StartupAgent);
                 }
             } else if app.agents.iter().any(|agent| agent.available) {
@@ -3261,6 +3397,25 @@ async fn new_conversation(
         other => app.report_error(format!("unexpected reply: {other:?}")),
     }
     Ok(())
+}
+
+/// Clears a persisted default when its executable disappeared between launches.
+/// Returning the missing id lets startup explain why it reopened the picker.
+fn clear_default_if_agent_missing(paths: &ArgoPaths, app: &mut App) -> Result<Option<String>> {
+    let Some(configured) = app.default_selection.as_ref() else {
+        return Ok(None);
+    };
+    if app
+        .agents
+        .iter()
+        .any(|agent| agent.available && agent.id == configured.agent)
+    {
+        return Ok(None);
+    }
+    let missing = configured.agent.clone();
+    crate::preferences::save(paths, None)?;
+    app.default_selection = None;
+    Ok(Some(missing))
 }
 
 /// Loads a conversation's transcript into the view.
@@ -3967,6 +4122,74 @@ mod tests {
         assert!(second.is_terminal());
         server.await.expect("server task");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_default_agent_is_cleared_from_memory_and_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "argo-missing-default-{}-{}",
+            std::process::id(),
+            argo_core::now_millis()
+        ));
+        let paths = ArgoPaths::with_root(&root);
+        let selection = crate::preferences::DefaultSelection {
+            agent: "codex".into(),
+            model: "gpt-test".into(),
+            effort: Some("high".into()),
+        };
+        crate::preferences::save(&paths, Some(selection.clone())).expect("save default");
+
+        let mut app = App::new("/repo");
+        app.default_selection = Some(selection);
+        app.agents.push(argo_runtime::AgentInfo::unavailable(
+            argo_runtime::require("codex").expect("codex definition"),
+            "not found",
+        ));
+
+        assert_eq!(
+            clear_default_if_agent_missing(&paths, &mut app).expect("validate default"),
+            Some("codex".into())
+        );
+        assert!(app.default_selection.is_none());
+        assert_eq!(
+            crate::preferences::load(&paths).expect("load default"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agents_picker_marks_the_default_and_keeps_missing_clis_visible() {
+        let mut codex = argo_runtime::AgentInfo::unavailable(
+            argo_runtime::require("codex").expect("codex definition"),
+            "not found",
+        );
+        codex.available = true;
+        codex.version = Some("codex 1.2.3".into());
+        let claude = argo_runtime::AgentInfo::unavailable(
+            argo_runtime::require("claude").expect("claude definition"),
+            "not found",
+        );
+
+        let mut app = App::new("/repo");
+        app.agents = vec![codex, claude];
+        app.default_selection = Some(crate::preferences::DefaultSelection {
+            agent: "codex".into(),
+            model: "gpt-test".into(),
+            effort: None,
+        });
+        open_agents_picker(&mut app);
+
+        match &app.overlay {
+            crate::app::Overlay::Picker { action, items, .. } => {
+                assert_eq!(*action, PickerAction::Agents);
+                assert!(items.iter().any(|item| item.contains("★ default")));
+                assert!(items
+                    .iter()
+                    .any(|item| item.contains("Claude") && item.contains("not detected")));
+            }
+            other => panic!("unexpected overlay: {other:?}"),
+        }
     }
 
     #[test]

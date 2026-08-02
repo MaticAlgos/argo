@@ -27,6 +27,8 @@ pub enum Command {
     Usage,
     /// Show current Argo conversation/run state.
     Status,
+    /// Check for or install a newer Argo build.
+    Update(UpdateCommand),
     /// Show the detected agent inventory.
     Agents,
     /// List discovered skills.
@@ -85,6 +87,17 @@ pub enum DefaultCommand {
     Current,
     /// Remove the startup selection.
     Clear,
+}
+
+/// An operation requested through `/update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateCommand {
+    /// Compare this build with the version published on GitHub.
+    Check,
+    /// Exit the TUI and install a newer published build when available.
+    Install,
+    /// Exit and reinstall the published build even at the same version.
+    Force,
 }
 
 /// An operation requested through `/mcp`.
@@ -178,6 +191,7 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "mode" | "plan" => Ok(Command::Mode(argument)),
         "usage" => Ok(Command::Usage),
         "status" => Ok(Command::Status),
+        "update" | "upgrade" => parse_update(rest),
         "agents" => Ok(Command::Agents),
         "skills" => Ok(Command::Skills),
         "thinking" => parse_thinking(rest),
@@ -224,6 +238,19 @@ fn parse_default(rest: &str) -> std::result::Result<Command, ParseError> {
             command: "default",
             value: rest.to_string(),
             expected: "configure, current, or clear",
+        }),
+    }
+}
+
+fn parse_update(rest: &str) -> std::result::Result<Command, ParseError> {
+    match rest.to_ascii_lowercase().as_str() {
+        "" | "check" => Ok(Command::Update(UpdateCommand::Check)),
+        "install" | "now" => Ok(Command::Update(UpdateCommand::Install)),
+        "force" | "reinstall" => Ok(Command::Update(UpdateCommand::Force)),
+        _ => Err(ParseError::InvalidArgument {
+            command: "update",
+            value: rest.to_string(),
+            expected: "check, install, or force",
         }),
     }
 }
@@ -293,6 +320,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/mode",
     "/usage",
     "/status",
+    "/update",
     "/agents",
     "/skills",
     "/thinking",
@@ -315,6 +343,9 @@ const SUBCOMMAND_COMPLETIONS: &[&str] = &[
     "/default clear",
     "/default configure",
     "/default current",
+    "/update check",
+    "/update force",
+    "/update install",
     "/mcp check",
     "/mcp add",
     "/mcp delete",
@@ -336,7 +367,9 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     if prefix.contains('\n') {
         return Vec::new();
     }
-    let prefix = prefix.trim();
+    // Preserve a trailing space: it is the signal that the user has finished the
+    // command name and wants its fixed subcommands (for example `/update `).
+    let prefix = prefix.trim_start();
     if !prefix.starts_with('/') {
         return Vec::new();
     }
@@ -401,8 +434,12 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "show current conversation, selection, context, run, and queue state",
         },
         HelpEntry {
+            usage: "/update [check|install|force]",
+            detail: "check for updates, or exit and update Argo directly",
+        },
+        HelpEntry {
             usage: "/agents",
-            detail: "show detected CLIs, versions, and limitations",
+            detail: "browse CLIs; Enter switches, Space sets default, Delete clears it",
         },
         HelpEntry {
             usage: "/skills",
@@ -600,6 +637,24 @@ mod tests {
             Command::Default(DefaultCommand::Clear)
         );
         assert!(parse("/default codex").is_err());
+    }
+
+    #[test]
+    fn update_can_check_install_or_force_a_reinstall() {
+        assert_eq!(
+            parse("/update").expect("parse"),
+            Command::Update(UpdateCommand::Check)
+        );
+        assert_eq!(
+            parse("/update install").expect("parse"),
+            Command::Update(UpdateCommand::Install)
+        );
+        assert_eq!(
+            parse("/upgrade force").expect("parse"),
+            Command::Update(UpdateCommand::Force)
+        );
+        assert!(parse("/update maybe").is_err());
+        assert!(complete("/update ").contains(&"/update install"));
     }
 
     #[test]

@@ -155,6 +155,17 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled(delegated, Style::default().fg(NOTICE)));
     }
 
+    if let Some(version) = &app.available_update {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("update v{version} · /update"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(NOTICE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         shorten_path(&app.workspace, 34),
@@ -573,6 +584,10 @@ fn draw_picker(
                 action: PickerAction::StartupAgent,
                 ..
             } => "Enter once · Space default · type to filter",
+            Overlay::Picker {
+                action: PickerAction::Agents,
+                ..
+            } => "Enter switch · Space set default · Del clear · type to filter",
             _ => "type to filter, Enter, Esc",
         };
         format!(" {title} — {} items · {controls} ", matches.len())
@@ -1453,6 +1468,30 @@ mod tests {
         assert!(output.contains("choose a coding CLI"), "{output}");
         assert!(output.contains("claude"), "{output}");
         assert!(output.contains("Space default"), "{output}");
+    }
+
+    #[test]
+    fn agents_picker_explains_switch_and_default_controls() {
+        let mut app = App::new("/repo");
+        app.open_picker(
+            "coding CLIs",
+            vec!["Codex".into(), "Claude".into()],
+            vec!["codex".into(), "claude".into()],
+            PickerAction::Agents,
+        );
+        let output = render(&app, 100, 18);
+        assert!(output.contains("Enter switch"), "{output}");
+        assert!(output.contains("Space set default"), "{output}");
+        assert!(output.contains("Del clear"), "{output}");
+    }
+
+    #[test]
+    fn an_available_update_is_visible_in_the_header() {
+        let mut app = App::new("/repo");
+        app.available_update = Some("0.2.0".into());
+        let output = render(&app, 100, 14);
+        assert!(output.contains("update v0.2.0"), "{output}");
+        assert!(output.contains("/update"), "{output}");
     }
 
     #[test]

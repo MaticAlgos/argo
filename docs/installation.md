@@ -178,8 +178,26 @@ argo
 
 ## Update
 
-Run the installer again with the desired revision. It builds the replacement
-first, asks the existing daemon to stop, and then replaces the command:
+An existing installation can compare its semantic version with the version on
+GitHub without executing remote code:
+
+```bash
+argo update --check
+```
+
+Install a newer published build directly:
+
+```bash
+argo update
+```
+
+`argo update --force` reinstalls even when the published version matches. In the
+TUI, `/update` checks and `/update install` restores the normal terminal before
+running the installer. Startup may show an update badge, but Argo never executes
+downloaded code without one of these explicit install commands.
+
+The manual installer remains available. It builds the replacement first, asks
+the existing daemon to stop, and then replaces the command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | bash

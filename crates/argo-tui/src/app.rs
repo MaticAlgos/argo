@@ -195,6 +195,8 @@ pub enum PickerAction {
     DefaultEffort,
     /// Switch agent.
     Agent,
+    /// Browse every supported CLI; Enter switches and Space configures default.
+    Agents,
     /// Switch model.
     Model,
     /// Set reasoning effort.
@@ -340,6 +342,10 @@ pub struct App {
     pub context_tokens: usize,
     /// Argo build version, shown on the splash.
     pub version: String,
+    /// Newer published version discovered by the background startup check.
+    pub available_update: Option<String>,
+    /// Requested self-update after terminal restoration; `true` forces reinstall.
+    pub update_on_exit: Option<bool>,
     /// Messages typed while a turn was running, sent in order once it ends.
     ///
     /// Dropping them was the alternative, and it lost work: a follow-up thought
@@ -460,6 +466,8 @@ impl App {
             last_usage_source: None,
             context_tokens: 0,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            available_update: None,
+            update_on_exit: None,
             queued: std::collections::VecDeque::new(),
             active_usage_source: None,
             active_prompt: None,

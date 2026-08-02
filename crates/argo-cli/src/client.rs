@@ -207,6 +207,38 @@ pub async fn doctor(paths: &ArgoPaths) -> Result<()> {
     Ok(())
 }
 
+/// Checks for and, when requested, installs a newer published Argo build.
+pub async fn update(check_only: bool, force: bool) -> Result<()> {
+    let status = argo_runtime::update::check().await?;
+    println!("current: v{}", status.current);
+    println!("latest:  v{}", status.latest);
+
+    if check_only {
+        println!(
+            "{}",
+            if status.available() {
+                "update available · run `argo update` to install it"
+            } else {
+                "Argo is up to date"
+            }
+        );
+        return Ok(());
+    }
+    if !status.available() && !force {
+        println!("Argo is already up to date");
+        return Ok(());
+    }
+
+    if force && !status.available() {
+        println!("reinstalling v{}…", status.latest);
+    } else {
+        println!("updating Argo to v{}…", status.latest);
+    }
+    argo_runtime::update::install_latest().await?;
+    println!("update complete · restart Argo to use v{}", status.latest);
+    Ok(())
+}
+
 /// Lists detected agents.
 pub async fn agents(paths: &ArgoPaths, refresh: bool) -> Result<()> {
     let mut client = Client::connect(paths).await?;

@@ -10,6 +10,7 @@ description = "Argo runtime registry: declarative CLI adapter definitions, detec
 argo-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }

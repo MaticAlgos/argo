@@ -203,6 +203,15 @@ enum Command {
     },
     /// Stop the running daemon.
     Stop,
+    /// Check for a newer Argo build and install it from GitHub.
+    Update {
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall the published build even when the version is unchanged.
+        #[arg(long, conflicts_with = "check")]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -329,6 +338,7 @@ async fn run(cli: Cli) -> Result<()> {
             prompt,
         } => client::context(&paths, &conversation_id, &prompt).await,
         Command::Stop => client::stop(&paths).await,
+        Command::Update { check, force } => client::update(check, force).await,
     }
 }
 
@@ -427,6 +437,28 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn update_supports_check_and_force_modes() {
+        let checked = Cli::try_parse_from(["argo", "update", "--check"]).expect("check parse");
+        assert!(matches!(
+            checked.command,
+            Some(Command::Update {
+                check: true,
+                force: false
+            })
+        ));
+
+        let forced = Cli::try_parse_from(["argo", "update", "--force"]).expect("force parse");
+        assert!(matches!(
+            forced.command,
+            Some(Command::Update {
+                check: false,
+                force: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["argo", "update", "--check", "--force"]).is_err());
     }
 
     #[test]
