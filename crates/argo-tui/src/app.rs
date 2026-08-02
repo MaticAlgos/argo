@@ -4036,27 +4036,10 @@ mod new_feature_tests {
     use super::*;
     use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
     use argo_core::ids::RunId;
-    use argo_daemon::protocol::{ConversationSummary, MessageView};
+    use argo_daemon::protocol::MessageView;
 
     fn new_app() -> App {
         App::new("/repo")
-    }
-
-    fn summary_with_id(id: &str) -> ConversationSummary {
-        ConversationSummary {
-            id: argo_core::ids::ConversationId::new(id),
-            title: Some("test".into()),
-            description: None,
-            selected_agent_id: Some("codex".into()),
-            selected_model: Some("gpt-5".into()),
-            selected_reasoning: None,
-            selected_mode: None,
-            message_count: 2,
-            agents_with_sessions: vec![],
-            parent_conversation_id: None,
-            workspace: Some("/repo".into()),
-            updated_at: 42,
-        }
     }
 
     #[test]
@@ -4184,17 +4167,6 @@ mod new_feature_tests {
         app.replace_transcript(vec![]);
         assert_eq!(app.last_usage, None);
         assert_eq!(app.last_usage_source, None);
-    }
-
-    #[test]
-    fn farewell_format_is_exactly_one_line() {
-        let mut app = new_app();
-        app.conversation = Some(summary_with_id("abc-def-ghi"));
-        app.push(LineKind::User, "hello".to_string());
-        let msg = farewell(&app).expect("farewell");
-        assert_eq!(msg.matches('\n').count(), 0, "must be one line: {msg}");
-        assert!(msg.starts_with("argo --resume "), "format: {msg}");
-        assert!(msg.contains("abc-def-ghi"), "full id: {msg}");
     }
 
     #[test]

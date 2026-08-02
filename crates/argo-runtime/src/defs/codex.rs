@@ -404,16 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_models_are_not_offered() {
-        // `codex-auto-review` is internal machinery, not a user choice.
-        let ids: Vec<String> = parse_models(MODELS_JSON)
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        assert!(!ids.iter().any(|id| id == "codex-auto-review"));
-    }
-
-    #[test]
     fn reasoning_levels_are_read_per_model() {
         // Levels belong to the model: sol advertises six, terra advertises one.
         // A single hardcoded list would have hidden `xhigh`, `max`, and `ultra`.

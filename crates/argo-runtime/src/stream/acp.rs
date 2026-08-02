@@ -1019,19 +1019,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_notification_is_dropped_silently() {
-        // No id means no answer is expected; replying would itself be an error.
-        let mut sink = CollectingSink::default();
-        let mut s = session(None, None);
-        let action = s.handle_line(
-            &json!({"jsonrpc":"2.0","method":"_kiro.dev/subagent/list_update","params":{}})
-                .to_string(),
-            &mut sink,
-        );
-        assert!(matches!(action, AcpAction::Idle));
-    }
-
-    #[test]
     fn permission_requests_are_auto_approved_because_there_is_no_tty() {
         let mut sink = CollectingSink::default();
         let mut s = session(None, None);

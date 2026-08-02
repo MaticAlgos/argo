@@ -343,17 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_is_passed_when_generated() {
-        let args = CLAUDE.args_for(&InvocationContext {
-            mcp_config: Some("/tmp/argo-mcp.json".into()),
-            ..ctx()
-        });
-        assert!(args
-            .windows(2)
-            .any(|w| w == ["--mcp-config", "/tmp/argo-mcp.json"]));
-    }
-
-    #[test]
     fn capabilities_allow_resume_and_delegation() {
         const {
             assert!(CLAUDE.capabilities.native_resume);

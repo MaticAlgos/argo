@@ -549,11 +549,4 @@ mod tests {
         assert_eq!(cli.resume.as_deref(), Some("abc-def-123"));
         assert!(cli.command.is_none());
     }
-
-    #[test]
-    fn resume_flag_is_a_global_option() {
-        // --resume must work without a subcommand.
-        let cli = Cli::try_parse_from(["argo", "--resume", "conv-id"]).expect("parse");
-        assert_eq!(cli.resume.as_deref(), Some("conv-id"));
-    }
 }

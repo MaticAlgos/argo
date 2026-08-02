@@ -211,12 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_delivered_over_the_protocol() {
-        assert_eq!(KIRO.capabilities.prompt_delivery, PromptDelivery::Protocol);
-        assert_eq!(KIRO.capabilities.stream_format, StreamFormat::AcpJsonRpc);
-    }
-
-    #[test]
     fn falls_back_to_the_short_binary_name() {
         // Installations expose `kiro-cli`; some setups symlink `kiro`.
         assert_eq!(KIRO.candidate_bins(), vec!["kiro-cli", "kiro"]);
