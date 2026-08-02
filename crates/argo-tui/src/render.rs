@@ -4,7 +4,7 @@
 //! transcript (or an overlay), a composer, and a status line. Layout is computed
 //! from the terminal size each frame so a resize needs no special handling.
 
-use crate::app::{Activity, App, LineKind, Overlay};
+use crate::app::{Activity, App, LineKind, Overlay, PickerAction};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -83,6 +83,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
     // Drawn last so it floats above the transcript, anchored to the composer.
     draw_completions(frame, areas[1], areas[2], app);
+    draw_mouse_selection(frame.buffer_mut(), app);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -137,6 +138,17 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
+    let (active_children, known_children) = app.delegated_agent_counts();
+    if known_children > 0 {
+        spans.push(Span::raw("  "));
+        let delegated = if active_children > 0 {
+            format!("agents: {active_children} active/{known_children} · /children")
+        } else {
+            format!("agents: {known_children} · /children")
+        };
+        spans.push(Span::styled(delegated, Style::default().fg(NOTICE)));
+    }
+
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         shorten_path(&app.workspace, 34),
@@ -152,17 +164,69 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
             title,
             selected,
             filter,
+            action,
             ..
         } => {
             let matches = app.picker_matches();
-            draw_picker(frame, area, title, app, &matches, *selected, filter)
+            if matches!(
+                action,
+                PickerAction::StartupAgent
+                    | PickerAction::StartupModel
+                    | PickerAction::StartupEffort
+            ) {
+                draw_welcome_picker(frame, area, title, app, &matches, *selected, filter);
+            } else {
+                draw_picker(frame, area, title, app, &matches, *selected, filter)
+            }
         }
         Overlay::Text {
             title,
             lines,
             scroll,
         } => draw_text_overlay(frame, area, title, lines, *scroll),
+        Overlay::Input {
+            title,
+            prompt,
+            value,
+            secret,
+            ..
+        } => draw_input_overlay(frame, area, title, prompt, value, *secret),
     }
+}
+
+fn draw_input_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    prompt: &str,
+    value: &str,
+    secret: bool,
+) {
+    frame.render_widget(Clear, area);
+    let shown = if secret {
+        "•".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
+    let lines = vec![
+        TextLine::from(Span::styled(prompt, Style::default().fg(MUTED))),
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            format!("> {shown}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            "Paste is supported · Enter continues · Esc cancels",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(panel(format!(" {title} "), true)),
+        area,
+    );
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -171,7 +235,11 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
 
     let mut rendered: Vec<TextLine<'_>> = Vec::new();
-    for line in &app.lines {
+    for line in app
+        .lines
+        .iter()
+        .filter(|line| app.thinking_visible || line.kind != LineKind::Thinking)
+    {
         rendered.extend(render_line(line, inner_width));
     }
 
@@ -189,6 +257,13 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(marker, Style::default().fg(ACCENT)),
             Span::styled(indicator, Style::default().fg(MUTED)),
         ]));
+        rendered.push(TextLine::from(vec![
+            Span::styled("? ", Style::default().fg(NOTICE)),
+            Span::styled(
+                format!("tip · {}", app.shortcut_tip()),
+                Style::default().fg(MUTED),
+            ),
+        ]));
     }
 
     if rendered.is_empty() {
@@ -198,18 +273,20 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .iter()
             .filter(|info| info.available)
             .map(|info| {
-                format!(
-                    "{:<10} {}",
-                    info.id,
-                    info.version.clone().unwrap_or_default()
-                )
+                let detail = crate::app::agent_picker_detail(info);
+                format!("{:<10} {detail}", info.name)
             })
             .collect();
         // `splash` returns owned lines, so they coerce into the borrowed vector.
-        rendered.extend(crate::banner::splash(
+        let default_label = app
+            .default_selection
+            .as_ref()
+            .map(|selection| selection.label());
+        rendered.extend(crate::banner::splash_with_selection(
             area.width.saturating_sub(4),
             &app.version,
             &agents,
+            default_label.as_deref(),
         ));
     }
 
@@ -226,9 +303,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let offset = max_scroll.saturating_sub(scroll_back);
 
     let mouse_hint = if app.mouse_scroll_mode {
-        "F2 selection"
+        "wheel · drag select+copy · F2 native"
     } else {
-        "F2 mouse wheel"
+        "native select · F2 wheel + drag"
     };
     let title = if scroll_back > 0 {
         format!(" conversation — scrolled back {scroll_back} rows · PgDn/End · {mouse_hint} ")
@@ -377,6 +454,61 @@ fn render_line(line: &crate::app::Line, inner_width: usize) -> Vec<TextLine<'sta
 }
 
 #[allow(clippy::too_many_arguments)]
+fn draw_welcome_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    app: &App,
+    matches: &[usize],
+    selected: usize,
+    filter: &str,
+) {
+    let header_height = area.height.saturating_sub(5).min(8);
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header_height), Constraint::Min(5)])
+        .split(area);
+    let header = crate::banner::welcome_header(areas[0].width, &app.version);
+    frame.render_widget(Paragraph::new(header), areas[0]);
+    draw_picker(frame, areas[1], title, app, matches, selected, filter);
+}
+
+/// Highlights the terminal cells selected by Argo's combined mouse mode.
+fn draw_mouse_selection(buffer: &mut Buffer, app: &App) {
+    if !app.mouse_scroll_mode {
+        return;
+    }
+    let Some(selection) = app.mouse_selection else {
+        return;
+    };
+    let (start, end) = selection.ordered();
+    let area = buffer.area;
+    for row in start.row..=end.row {
+        if row < area.top() || row >= area.bottom() {
+            continue;
+        }
+        let left = if row == start.row {
+            start.column
+        } else {
+            area.left()
+        };
+        let right = if row == end.row {
+            end.column
+        } else {
+            area.right().saturating_sub(1)
+        };
+        for column in left..=right {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(170, 210, 235)),
+                );
+            }
+        }
+    }
+}
+
 fn draw_picker(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -430,10 +562,14 @@ fn draw_picker(
     };
 
     let heading = if filter.is_empty() {
-        format!(
-            " {title} — {} items · type to filter, Enter, Esc ",
-            matches.len()
-        )
+        let controls = match &app.overlay {
+            Overlay::Picker {
+                action: PickerAction::StartupAgent,
+                ..
+            } => "Enter once · Space default · type to filter",
+            _ => "type to filter, Enter, Esc",
+        };
+        format!(" {title} — {} items · {controls} ", matches.len())
     } else {
         format!(
             " {title} — filter '{filter}' · {} of {} ",
@@ -585,13 +721,12 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Text of the standing authority warning.
-const AUTHORITY_WARNING: &str = " unrestricted mode ";
-
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The warning is reserved its own cell: a long status line must never be able
     // to push a standing authority grant off screen.
-    let warning_width = (AUTHORITY_WARNING.chars().count() as u16).min(area.width);
+    let mode = app.mode();
+    let authority_label = format!(" {} mode ", mode.label());
+    let warning_width = (authority_label.chars().count() as u16).min(area.width);
     let cells = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(warning_width)])
@@ -600,10 +735,14 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(TextLine::from(Span::styled(
-            AUTHORITY_WARNING,
+            authority_label,
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Rgb(200, 80, 80))
+                .bg(if mode == argo_core::mode::AgentMode::Full {
+                    Color::Rgb(200, 80, 80)
+                } else {
+                    NOTICE
+                })
                 .add_modifier(Modifier::BOLD),
         ))),
         warning_area,
@@ -612,12 +751,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .conversation
         .as_ref()
         .and_then(|c| c.selected_agent_id.clone())
-        .unwrap_or_else(|| "auto".to_string());
+        .unwrap_or_else(|| "choose CLI".to_string());
     let model = app
         .conversation
         .as_ref()
         .and_then(|c| c.selected_model.clone())
-        .unwrap_or_else(|| "default".to_string());
+        .unwrap_or_else(|| "choose model".to_string());
 
     let mut spans = vec![
         // The active target, which is the fact a user checks most often.
@@ -723,6 +862,10 @@ pub(crate) fn native_hyperlinks(buffer: &Buffer, app: &App) -> Vec<NativeHyperli
                 .iter()
                 .flat_map(|line| urls_in_text(line).into_iter().map(|(_, _, url)| url)),
         ),
+        Overlay::Input { value, secret, .. } if !secret => {
+            known.extend(urls_in_text(value).into_iter().map(|(_, _, url)| url));
+        }
+        Overlay::Input { .. } => {}
         Overlay::None => {}
     }
     known.sort();
@@ -947,6 +1090,7 @@ mod tests {
             ],
             agent_id: Some("antigravity".into()),
             model: Some("sonnet".into()),
+            usage: None,
             created_at: 0,
         }]);
 
@@ -1089,6 +1233,7 @@ mod tests {
         app.conversation = Some(argo_daemon::protocol::ConversationSummary {
             id: argo_core::ids::ConversationId::new("c1"),
             title: Some("demo".into()),
+            description: None,
             selected_agent_id: Some("codex".into()),
             selected_model: None,
             selected_reasoning: None,
@@ -1096,6 +1241,7 @@ mod tests {
             message_count: 4,
             agents_with_sessions: vec!["claude".into(), "codex".into()],
             parent_conversation_id: None,
+            workspace: Some("/repo".into()),
             updated_at: 0,
         });
         let output = render(&app, 100, 12);
@@ -1173,8 +1319,23 @@ mod tests {
         let output = render(&app, 80, 20);
         assert!(output.contains("ARGO"));
         assert!(output.contains("/help"));
-        // The authority warning is always visible.
-        assert!(output.contains("unrestricted mode"));
+        // The current authority mode is always visible.
+        assert!(output.contains("full access mode"));
+    }
+
+    #[test]
+    fn secret_guided_input_is_masked() {
+        let mut app = App::new("/repo");
+        app.open_input(
+            "MCP bearer token",
+            "Paste token",
+            true,
+            crate::app::InputAction::McpBearerToken,
+        );
+        app.overlay_input_push_str("super-secret-token");
+        let output = render(&app, 70, 18);
+        assert!(!output.contains("super-secret-token"), "{output}");
+        assert!(output.contains('•'), "{output}");
     }
 
     #[test]
@@ -1214,6 +1375,22 @@ mod tests {
         assert!(output.contains("codex"));
         assert!(output.contains("type to filter"));
         assert!(!output.contains("hidden behind the overlay"));
+    }
+
+    #[test]
+    fn startup_picker_keeps_the_argo_logo_visible() {
+        let mut app = App::new("/repo");
+        app.open_picker(
+            "choose a coding CLI",
+            vec!["claude".into(), "codex".into()],
+            vec!["claude".into(), "codex".into()],
+            PickerAction::StartupAgent,
+        );
+        let output = render(&app, 80, 24);
+        assert!(output.contains("████"), "{output}");
+        assert!(output.contains("choose a coding CLI"), "{output}");
+        assert!(output.contains("claude"), "{output}");
+        assert!(output.contains("Space default"), "{output}");
     }
 
     #[test]
@@ -1351,6 +1528,7 @@ mod tests {
         app.conversation = Some(argo_daemon::protocol::ConversationSummary {
             id: argo_core::ids::ConversationId::new("c1"),
             title: Some("switching demo".into()),
+            description: None,
             selected_agent_id: Some("codex".into()),
             selected_model: Some("gpt-5.6".into()),
             selected_reasoning: None,
@@ -1358,10 +1536,23 @@ mod tests {
             message_count: 2,
             agents_with_sessions: vec!["claude".into()],
             parent_conversation_id: None,
+            workspace: Some("/repo".into()),
             updated_at: 0,
         });
         let output = render(&app, 90, 12);
         assert!(output.contains("switching demo"));
         assert!(output.contains("codex/gpt-5.6"));
+    }
+
+    #[test]
+    fn thinking_can_be_hidden_without_mutating_the_transcript() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::Thinking, "private-visible-reasoning");
+        app.push(LineKind::Assistant, "final answer");
+        app.set_thinking_visible(false);
+        let output = render(&app, 70, 12);
+        assert!(!output.contains("private-visible-reasoning"));
+        assert!(output.contains("final answer"));
+        assert!(app.lines.iter().any(|line| line.kind == LineKind::Thinking));
     }
 }

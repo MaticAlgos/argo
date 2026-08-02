@@ -9,9 +9,10 @@ pub mod app;
 pub mod banner;
 pub mod commands;
 mod markdown;
+pub mod preferences;
 pub mod render;
 pub mod run;
 
 pub use app::{App, EnterAction, LineKind, Overlay, PickerAction};
 pub use commands::{parse, Command};
-pub use run::run;
+pub use run::{run, run_with_conversation};

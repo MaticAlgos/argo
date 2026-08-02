@@ -12,10 +12,12 @@ argo-daemon = { workspace = true }
 argo-runtime = { workspace = true }
 argo-resources = { workspace = true }
 futures = { workspace = true }
+shlex = { workspace = true }
 libc = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 pulldown-cmark = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -216,6 +216,8 @@ pub struct Daemon {
     store: SharedStore,
     paths: ArgoPaths,
     agents: Mutex<Option<Vec<AgentInfo>>>,
+    /// Serializes deep probes so concurrent requests cannot launch duplicates.
+    probe_lock: Mutex<()>,
     running: Mutex<HashMap<RunId, CancelToken>>,
     events: broadcast::Sender<argo_core::event::RunEvent>,
     shutdown: broadcast::Sender<()>,
@@ -226,10 +228,13 @@ impl Daemon {
     pub fn new(store: Store, paths: ArgoPaths) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown, _) = broadcast::channel(1);
+        // Initialize with lightweight filesystem-only discovery — no subprocesses.
+        let agents = argo_runtime::discover_all_lightweight();
         Self {
             store: Arc::new(StdMutex::new(store)),
             paths,
-            agents: Mutex::new(None),
+            agents: Mutex::new(Some(agents)),
+            probe_lock: Mutex::new(()),
             running: Mutex::new(HashMap::new()),
             events,
             shutdown,
@@ -286,43 +291,106 @@ impl Daemon {
             .map_err(|_| ArgoError::Store("store lock poisoned by a previous panic".into()))
     }
 
-    /// Detected adapters, probing on first use or when `refresh` is set.
+    /// Detected adapters. Refresh re-runs lightweight PATH-only discovery (never
+    /// deep-probes all). Use `probe_agent` for deep-probing a single adapter.
     async fn agent_inventory(&self, refresh: bool) -> Vec<AgentInfo> {
+        if refresh {
+            let _probe = self.probe_lock.lock().await;
+            let discovered = argo_runtime::discover_all_lightweight();
+            *self.agents.lock().await = Some(discovered.clone());
+            return discovered;
+        }
+        if let Some(cached) = self.agents.lock().await.clone() {
+            return cached;
+        }
+        let discovered = argo_runtime::discover_all_lightweight();
+        *self.agents.lock().await = Some(discovered.clone());
+        discovered
+    }
+
+    /// Deep-probes a single adapter and updates that one cache entry.
+    ///
+    /// Prevents duplicate concurrent probes for the same agent. Returns the
+    /// freshly probed `AgentInfo`.
+    async fn probe_agent(&self, agent_id: &str, refresh: bool) -> Result<AgentInfo> {
         if !refresh {
-            if let Some(cached) = self.agents.lock().await.clone() {
-                return cached;
+            if let Some(info) = self
+                .agents
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|agents| agents.iter().find(|agent| agent.id == agent_id))
+                .filter(|agent| agent.probed)
+                .cloned()
+            {
+                return Ok(info);
             }
         }
-        let detected = argo_runtime::detect_all().await;
-        *self.agents.lock().await = Some(detected.clone());
-        detected
+
+        // Await the probe barrier, then re-check: another waiter may have filled
+        // this exact entry while this task was suspended.
+        let _probe = self.probe_lock.lock().await;
+        if !refresh {
+            if let Some(info) = self
+                .agents
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|agents| agents.iter().find(|agent| agent.id == agent_id))
+                .filter(|agent| agent.probed)
+                .cloned()
+            {
+                return Ok(info);
+            }
+        }
+
+        let def = argo_runtime::require(agent_id)?;
+        let probed = argo_runtime::detect_one(def).await;
+        let mut inventory = self.agents.lock().await;
+        let agents = inventory.get_or_insert_with(argo_runtime::discover_all_lightweight);
+        if let Some(existing) = agents.iter_mut().find(|agent| agent.id == agent_id) {
+            *existing = probed.clone();
+        } else {
+            agents.push(probed.clone());
+        }
+        Ok(probed)
     }
 
     /// Resolves which agent and model a conversation's next turn should use.
     ///
-    /// Falls back to the first available adapter so a fresh conversation works
-    /// without the user having to run `/agent` first.
+    /// Chooses from lightweight inventory, then deep-probes only the chosen
+    /// adapter before returning its full info.
     async fn resolve_selection(
         &self,
         conversation: &Conversation,
     ) -> Result<(AgentInfo, Option<String>, Option<String>)> {
         let agents = self.agent_inventory(false).await;
 
-        let chosen =
-            match &conversation.selected_agent_id {
-                Some(id) => agents.iter().find(|a| &a.id == id).ok_or_else(|| {
-                    ArgoError::AgentUnavailable {
+        let chosen_id = match &conversation.selected_agent_id {
+            Some(id) => {
+                // Verify it exists in the registry.
+                agents
+                    .iter()
+                    .find(|a| &a.id == id)
+                    .ok_or_else(|| ArgoError::AgentUnavailable {
                         agent: id.clone(),
                         reason: "not present in the adapter registry".into(),
-                    }
-                })?,
-                None => agents.iter().find(|a| a.available).ok_or_else(|| {
-                    ArgoError::AgentUnavailable {
-                        agent: "any".into(),
-                        reason: "no supported coding CLI was detected on PATH".into(),
-                    }
-                })?,
-            };
+                    })?;
+                id.clone()
+            }
+            None => agents
+                .iter()
+                .find(|a| a.available)
+                .ok_or_else(|| ArgoError::AgentUnavailable {
+                    agent: "any".into(),
+                    reason: "no supported coding CLI was detected on PATH".into(),
+                })?
+                .id
+                .clone(),
+        };
+
+        // Deep-probe only the chosen adapter to populate models/help/version.
+        let chosen = self.probe_agent(&chosen_id, false).await?;
 
         if !chosen.available {
             return Err(ArgoError::AgentUnavailable {
@@ -341,10 +409,12 @@ impl Daemon {
             .selected_model
             .clone()
             .filter(|m| chosen.models.iter().any(|option| &option.id == m));
-        let reasoning = conversation
-            .selected_reasoning
-            .clone()
-            .filter(|r| chosen.reasoning.iter().any(|option| &option.id == r));
+        let reasoning = conversation.selected_reasoning.clone().filter(|r| {
+            chosen
+                .reasoning_for(model.as_deref())
+                .iter()
+                .any(|option| &option.id == r)
+        });
 
         Ok((chosen.clone(), model, reasoning))
     }
@@ -353,10 +423,19 @@ impl Daemon {
     async fn summarize(&self, conversation: &Conversation) -> Result<ConversationSummary> {
         let store = self.store()?;
         let messages = store.list_messages(&conversation.id)?;
+        let user_prompts = messages
+            .iter()
+            .filter(|message| message.role == argo_core::message::Role::User)
+            .map(argo_core::message::Message::transferable_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let description = argo_core::conversation_description(&user_prompts);
         let sessions = store.list_agent_sessions(&conversation.id)?;
+        let workspace = Some(store.workspace_root(&conversation.workspace_id)?);
         Ok(ConversationSummary {
             id: conversation.id.clone(),
             title: conversation.title.clone(),
+            description: (!description.is_empty()).then_some(description),
             selected_agent_id: conversation.selected_agent_id.clone(),
             selected_model: conversation.selected_model.clone(),
             selected_reasoning: conversation.selected_reasoning.clone(),
@@ -364,6 +443,7 @@ impl Daemon {
             message_count: messages.len(),
             agents_with_sessions: sessions.iter().map(|s| s.agent_id.to_string()).collect(),
             parent_conversation_id: conversation.parent_conversation_id.clone(),
+            workspace,
             updated_at: conversation.updated_at,
         })
     }
@@ -378,6 +458,20 @@ fn message_view(message: &argo_core::message::Message, events: &[RunEvent]) -> M
     } else {
         recovered
     };
+
+    // Usage is set only for assistant messages whose run succeeded.
+    let usage = if message.role == argo_core::message::Role::Assistant {
+        events.iter().rev().find_map(|e| match &e.kind {
+            RunEventKind::RunFinished {
+                status: RunStatus::Succeeded,
+                usage,
+            } => Some(*usage),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
     MessageView {
         id: message.id.to_string(),
         role: match message.role {
@@ -390,6 +484,7 @@ fn message_view(message: &argo_core::message::Message, events: &[RunEvent]) -> M
         blocks,
         agent_id: message.agent_id.as_ref().map(|a| a.to_string()),
         model: message.model.clone(),
+        usage,
         created_at: message.created_at,
     }
 }
@@ -638,11 +733,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             match &request {
                 Request::Hello { protocol, client } => {
                     if *protocol != IPC_PROTOCOL_VERSION {
-                        let error = ArgoError::Invalid(format!(
-                            "client protocol v{protocol} does not match daemon v{IPC_PROTOCOL_VERSION}; restart both from the same build"
-                        ));
+                        let response = Response::Error {
+                            code: "PROTOCOL_MISMATCH".into(),
+                            message: format!(
+                                "client protocol v{protocol} does not match daemon v{IPC_PROTOCOL_VERSION}; restart both from the same build"
+                            ),
+                            retryable: true,
+                        };
                         write_half
-                            .write_all(Response::from_error(&error).encode().as_bytes())
+                            .write_all(response.encode().as_bytes())
                             .await
                             .ok();
                         return Ok(());
@@ -820,6 +919,11 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             agents: daemon.agent_inventory(refresh).await,
         }),
 
+        Request::ProbeAgent { agent_id, refresh } => {
+            let agent = daemon.probe_agent(&agent_id, refresh).await?;
+            Ok(Response::Agent { agent })
+        }
+
         Request::OpenWorkspace { root } => {
             let (workspace, conversations) = {
                 let store = daemon.store()?;
@@ -851,6 +955,25 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             Ok(Response::Conversations {
                 conversations: summaries,
             })
+        }
+
+        Request::ClearConversations { root } => {
+            if !daemon.running.lock().await.is_empty() {
+                return Err(ArgoError::Invalid(
+                    "cannot clear history while an agent turn is running; cancel it first".into(),
+                ));
+            }
+            let count = {
+                let store = daemon.store()?;
+                match root {
+                    Some(root) => {
+                        let workspace = store.ensure_workspace(&root)?;
+                        store.clear_workspace_conversations(&workspace)?
+                    }
+                    None => store.clear_all_conversations()?,
+                }
+            };
+            Ok(Response::Cleared { count })
         }
 
         Request::NewConversation { root, title } => {
@@ -968,12 +1091,25 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
         }
 
         Request::ListChildren { conversation_id } => {
-            let children = {
+            // Breadth-first traversal exposes the complete orchestration graph,
+            // including agents delegated by another delegated agent.
+            let descendants = {
                 let store = daemon.store()?;
-                store.list_child_conversations(&conversation_id)?
+                let mut pending = std::collections::VecDeque::from([conversation_id]);
+                let mut seen = std::collections::HashSet::new();
+                let mut descendants = Vec::new();
+                while let Some(parent) = pending.pop_front() {
+                    for child in store.list_child_conversations(&parent)? {
+                        if seen.insert(child.id.clone()) {
+                            pending.push_back(child.id.clone());
+                            descendants.push(child);
+                        }
+                    }
+                }
+                descendants
             };
             let mut summaries = Vec::new();
-            for child in &children {
+            for child in &descendants {
                 summaries.push(daemon.summarize(child).await?);
             }
             Ok(Response::Children {
@@ -1025,8 +1161,6 @@ async fn validate_selection(
     conversation: &Conversation,
     change: &SelectionChange,
 ) -> Result<()> {
-    let agents = daemon.agent_inventory(false).await;
-
     // The agent this change resolves to: the new one, or the one already selected.
     let agent_id = change
         .agent_id
@@ -1039,16 +1173,29 @@ async fn validate_selection(
         return Ok(());
     };
     let def = argo_runtime::require(&agent_id)?;
-    let info = agents.iter().find(|a| a.id == def.id);
+
+    // Explicit selection is consent to deep-probe this one adapter. Errors and
+    // unavailable state remain actionable instead of becoming an empty model list.
+    let info = daemon.probe_agent(&agent_id, false).await?;
+    if !info.available {
+        return Err(ArgoError::AgentUnavailable {
+            agent: def.id.to_string(),
+            reason: info
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("install it from {}", info.install_url)),
+        });
+    }
 
     if let Some(model) = &change.model {
-        let known = info
-            .map(|a| a.models.iter().any(|m| &m.id == model))
-            .unwrap_or(false);
-        if !known {
+        if !info.models.iter().any(|candidate| &candidate.id == model) {
             let available: Vec<&str> = info
-                .map(|a| a.models.iter().map(|m| m.id.as_str()).take(12).collect())
-                .unwrap_or_default();
+                .models
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .take(12)
+                .collect();
             return Err(ArgoError::Invalid(format!(
                 "{} does not offer model '{model}'. Available: {}",
                 def.name,
@@ -1064,9 +1211,7 @@ async fn validate_selection(
             .model
             .clone()
             .or_else(|| conversation.selected_model.clone());
-        let levels = info
-            .map(|a| a.reasoning_for(model.as_deref()))
-            .unwrap_or_default();
+        let levels = info.reasoning_for(model.as_deref());
         if levels.is_empty() {
             return Err(ArgoError::Invalid(format!(
                 "{} does not expose reasoning levels",
@@ -1130,7 +1275,7 @@ async fn preview_context(
         model,
         reasoning,
         bin: agent.path.clone().unwrap_or_else(|| def.bin.to_string()),
-        help_flags: argo_runtime::observed_flags(&agent.id),
+        help_flags: agent.help_flags.clone(),
         active_skills: skill_names,
         active_mcp_servers: mcp_plan.names.clone(),
         project_instructions: resolve_instructions(&cwd),
@@ -1188,15 +1333,8 @@ async fn delegate(
     }
 
     let def = argo_runtime::require(agent_id.as_str())?;
-    let agents = daemon.agent_inventory(false).await;
-    let info =
-        agents
-            .iter()
-            .find(|a| a.id == def.id)
-            .ok_or_else(|| ArgoError::AgentUnavailable {
-                agent: def.id.to_string(),
-                reason: "not present in the adapter registry".into(),
-            })?;
+    // Deep-probe the delegate target so help_flags and models are available.
+    let info = daemon.probe_agent(agent_id.as_str(), false).await?;
     if !info.available {
         return Err(ArgoError::AgentUnavailable {
             agent: def.id.to_string(),
@@ -1314,7 +1452,7 @@ async fn delegate(
         model: model.clone(),
         reasoning: None,
         bin: info.path.clone().unwrap_or_else(|| def.bin.to_string()),
-        help_flags: argo_runtime::observed_flags(&info.id),
+        help_flags: info.help_flags.clone(),
         active_skills: skill_names,
         active_mcp_servers: mcp_plan.names.clone(),
         project_instructions: resolve_instructions(&workspace_root),
@@ -1478,7 +1616,7 @@ async fn send_message(
         model: model.clone(),
         reasoning,
         bin: agent.path.clone().unwrap_or_else(|| def.bin.to_string()),
-        help_flags: argo_runtime::observed_flags(&agent.id),
+        help_flags: agent.help_flags.clone(),
         active_skills: skill_names,
         active_mcp_servers: mcp_plan.names.clone(),
         project_instructions: resolve_instructions(&workspace_root),
@@ -1583,6 +1721,7 @@ mod tests {
                 info.available = true;
                 info.path = Some(test_bin.clone());
                 info.version = Some("test".into());
+                info.probed = true;
                 info.diagnostics.clear();
                 info
             })
@@ -1631,6 +1770,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_agents_uses_only_lightweight_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = ArgoPaths::with_root(dir.path().join("data"));
+        let daemon = Arc::new(Daemon::bootstrap(paths).await.expect("bootstrap"));
+        let response = handle(&daemon, Request::ListAgents { refresh: true })
+            .await
+            .expect("list agents");
+        match response {
+            Response::Agents { agents } => {
+                assert_eq!(agents.len(), argo_runtime::ADAPTERS.len());
+                assert!(agents.iter().all(|agent| !agent.probed));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn opening_a_workspace_creates_it_and_lists_conversations() {
         let (daemon, dir) = daemon().await;
         let root = dir.path().to_string_lossy().to_string();
@@ -1662,6 +1818,40 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_summary_describes_start_and_current_focus() {
+        let (daemon, dir) = daemon().await;
+        let id = new_conversation(&daemon, dir.path()).await;
+        {
+            let store = daemon.store().expect("store");
+            store
+                .append_message(&id, argo_store::NewMessage::user("build login"))
+                .expect("first prompt");
+            store
+                .append_message(
+                    &id,
+                    argo_store::NewMessage::user("now fix keyboard shortcuts"),
+                )
+                .expect("latest prompt");
+            store
+                .set_title(
+                    &id,
+                    &argo_core::conversation_title("now fix keyboard shortcuts"),
+                )
+                .expect("title");
+        }
+        let conversation = daemon
+            .store()
+            .expect("store")
+            .get_conversation(&id)
+            .expect("conversation");
+        let summary = daemon.summarize(&conversation).await.expect("summary");
+        assert_eq!(summary.title.as_deref(), Some("now fix keyboard shortcuts"));
+        let description = summary.description.expect("description");
+        assert!(description.contains("Started with: build login"));
+        assert!(description.contains("Current focus: now fix keyboard shortcuts"));
     }
 
     #[tokio::test]

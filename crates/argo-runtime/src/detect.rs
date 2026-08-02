@@ -9,6 +9,11 @@
 //! 2. Run the version probe. A binary that launches but rejects `--version` is
 //!    still available, just without a version string.
 //! 3. Only then run help, model, and auth probes in parallel.
+//!
+//! **Lightweight discovery** (`discover_one`/`discover_all`) resolves executables
+//! purely from PATH without spawning any child processes. This is used for daemon
+//! startup and agent list refresh, deferring the expensive deep probe until a
+//! specific adapter is actually needed for a turn.
 
 use crate::def::{AgentInfo, RuntimeDef};
 use crate::registry::ADAPTERS;
@@ -20,6 +25,103 @@ use tokio::process::Command;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default timeout for the help probe.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// Lightweight filesystem-only discovery (no child processes)
+// ---------------------------------------------------------------------------
+
+/// Resolves an executable name to an absolute path by searching PATH.
+///
+/// On Unix, additionally verifies executable bits. Never spawns a child process.
+fn resolve_path(bin: &str) -> Option<String> {
+    if std::path::Path::new(bin).is_absolute() {
+        return executable_path(std::path::Path::new(bin));
+    }
+    let path = std::env::var_os("PATH")?;
+    resolve_path_in(bin, std::env::split_paths(&path))
+}
+
+/// Resolves `bin` against explicit directories, which also makes no-spawn tests
+/// hermetic without mutating process-global PATH.
+fn resolve_path_in(
+    bin: &str,
+    directories: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<String> {
+    directories
+        .into_iter()
+        .filter_map(|directory| executable_path(&directory.join(bin)))
+        .next()
+}
+
+fn executable_path(path: &std::path::Path) -> Option<String> {
+    if !path.is_file() || !is_executable(path) {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+}
+
+/// Checks executable permission bits on Unix. On non-Unix, returns true if file exists.
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// Lightweight discovery for one adapter — filesystem only, no subprocess.
+///
+/// Returns an `AgentInfo` with `available = true` and `probed = false` when the
+/// executable is found on PATH. No version, models, or auth state is resolved.
+pub fn discover_one(def: &'static RuntimeDef) -> AgentInfo {
+    for candidate in def.candidate_bins() {
+        if let Some(abs) = resolve_path(candidate) {
+            return AgentInfo {
+                id: def.id.to_string(),
+                name: def.name.to_string(),
+                available: true,
+                probed: false,
+                path: Some(abs),
+                version: None,
+                authenticated: None,
+                models: def.fallback_model_options(),
+                models_live: false,
+                reasoning: def.reasoning_option_values(),
+                model_reasoning: Vec::new(),
+                capabilities: def.capabilities.clone(),
+                diagnostics: {
+                    let mut diagnostics = vec![
+                        "installed; version, authentication, and live models load only when selected"
+                            .to_string(),
+                    ];
+                    diagnostics.extend(crate::def::capability_diagnostics(def));
+                    diagnostics
+                },
+                install_url: def.install_url.to_string(),
+                help_flags: Vec::new(),
+            };
+        }
+    }
+    AgentInfo::unavailable(
+        def,
+        format!(
+            "{} not found on PATH. Install it from {}",
+            def.bin, def.install_url
+        ),
+    )
+}
+
+/// Lightweight discovery for all registered adapters — filesystem only.
+pub fn discover_all_lightweight() -> Vec<AgentInfo> {
+    ADAPTERS.iter().map(discover_one).collect()
+}
 
 /// Output of one probe.
 struct ProbeOutput {
@@ -51,16 +153,6 @@ async fn run(bin: &str, args: &[&str], timeout: Duration) -> Option<ProbeOutput>
         // with no version rather than hiding the agent entirely.
         Ok(Err(_)) | Err(_) => None,
     }
-}
-
-/// Resolves which candidate binary is executable, preferring the primary name.
-async fn resolve_bin(def: &RuntimeDef) -> Option<(String, Option<ProbeOutput>)> {
-    for candidate in def.candidate_bins() {
-        if let Some(output) = run(candidate, def.version_args, VERSION_TIMEOUT).await {
-            return Some((candidate.to_string(), Some(output)));
-        }
-    }
-    None
 }
 
 /// Extracts a version string from probe output.
@@ -96,32 +188,64 @@ fn extract_flags(help: &str) -> Vec<String> {
     flags
 }
 
-/// Detects one adapter.
+/// Detects one adapter (deep probe: spawns subprocess for version, help, models, auth).
+///
+/// First resolves the path without executing, then probes. A version timeout or
+/// failure does not make a filesystem-present executable unavailable.
 pub async fn detect_one(def: &'static RuntimeDef) -> AgentInfo {
-    let Some((bin, version_output)) = resolve_bin(def).await else {
-        return AgentInfo::unavailable(
+    // Phase 1: resolve without executing. If found on PATH, the adapter is
+    // considered available even if version/help probes fail or timeout.
+    let resolved_path = {
+        let mut found = None;
+        for candidate in def.candidate_bins() {
+            if let Some(abs) = resolve_path(candidate) {
+                found = Some(abs);
+                break;
+            }
+        }
+        found
+    };
+
+    let Some(resolved) = resolved_path else {
+        let mut unavailable = AgentInfo::unavailable(
             def,
             format!(
                 "{} not found on PATH. Install it from {}",
                 def.bin, def.install_url
             ),
         );
+        unavailable.probed = true;
+        return unavailable;
     };
 
+    // Phase 2: deep probe (version, help, models, auth). Failures here do NOT
+    // make the adapter unavailable — the binary exists on disk.
+    let bin = &resolved;
     let mut diagnostics: Vec<String> = Vec::new();
-    let version = version_output.as_ref().and_then(extract_version);
-    if version.is_none() {
-        // Not fatal: the binary launched, which is what availability means.
-        diagnostics.push(format!(
-            "{bin} did not report a version; capability detection may be limited"
-        ));
-    }
+
+    let version = match run(bin, def.version_args, VERSION_TIMEOUT).await {
+        Some(output) => {
+            let v = extract_version(&output);
+            if v.is_none() {
+                diagnostics.push(format!(
+                    "{bin} did not report a version; capability detection may be limited"
+                ));
+            }
+            v
+        }
+        None => {
+            diagnostics.push(format!(
+                "{bin} version probe timed out; capability detection may be limited"
+            ));
+            None
+        }
+    };
 
     // Availability is established; remaining probes run concurrently.
-    let help_future = run(&bin, def.help_args, HELP_TIMEOUT);
+    let help_future = run(bin, def.help_args, HELP_TIMEOUT);
     let models_future = async {
         match &def.model_probe {
-            Some(probe) => run(&bin, probe.args, Duration::from_millis(probe.timeout_ms))
+            Some(probe) => run(bin, probe.args, Duration::from_millis(probe.timeout_ms))
                 .await
                 .filter(|o| o.ok)
                 .map(|o| {
@@ -139,7 +263,7 @@ pub async fn detect_one(def: &'static RuntimeDef) -> AgentInfo {
     };
     let auth_future = async {
         match &def.auth_probe {
-            Some(probe) => run(&bin, probe.args, Duration::from_millis(probe.timeout_ms))
+            Some(probe) => run(bin, probe.args, Duration::from_millis(probe.timeout_ms))
                 .await
                 .map(|o| o.ok),
             // Adapters without a probe leave auth unknown rather than guessing
@@ -172,7 +296,8 @@ pub async fn detect_one(def: &'static RuntimeDef) -> AgentInfo {
         id: def.id.to_string(),
         name: def.name.to_string(),
         available: true,
-        path: Some(bin),
+        probed: true,
+        path: Some(resolved),
         version,
         authenticated,
         models,
@@ -182,43 +307,11 @@ pub async fn detect_one(def: &'static RuntimeDef) -> AgentInfo {
         capabilities: def.capabilities.clone(),
         diagnostics,
         install_url: def.install_url.to_string(),
-    }
-    .with_help_flags(help_flags)
-}
-
-impl AgentInfo {
-    /// Attaches observed help flags, kept out of the serialized surface.
-    fn with_help_flags(self, flags: Vec<String>) -> Self {
-        HELP_FLAGS.with(|cell| {
-            cell.borrow_mut().retain(|(id, _)| id != &self.id);
-            cell.borrow_mut().push((self.id.clone(), flags));
-        });
-        self
+        help_flags,
     }
 }
 
-thread_local! {
-    /// Per-thread cache of the flags each installed binary advertises.
-    ///
-    /// Detection and invocation happen on the daemon's runtime, so this stays
-    /// process-local rather than being persisted; a stale cache would otherwise
-    /// outlive a CLI upgrade.
-    static HELP_FLAGS: std::cell::RefCell<Vec<(String, Vec<String>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Returns the flags last observed for `agent_id`.
-pub fn observed_flags(agent_id: &str) -> Vec<String> {
-    HELP_FLAGS.with(|cell| {
-        cell.borrow()
-            .iter()
-            .find(|(id, _)| id == agent_id)
-            .map(|(_, flags)| flags.clone())
-            .unwrap_or_default()
-    })
-}
-
-/// Detects every registered adapter concurrently.
+/// Detects every registered adapter concurrently (deep probe).
 pub async fn detect_all() -> Vec<AgentInfo> {
     let futures: Vec<_> = ADAPTERS.iter().map(detect_one).collect();
     futures::future::join_all(futures).await
@@ -321,9 +414,9 @@ mod tests {
         assert!(!info.models.is_empty());
     }
 
-    #[tokio::test]
-    async fn detection_probes_every_adapter_without_one_failure_hiding_others() {
-        let all = detect_all().await;
+    #[test]
+    fn lightweight_discovery_lists_every_adapter_without_launching_them() {
+        let all = discover_all_lightweight();
         assert_eq!(all.len(), ADAPTERS.len());
         let ids: Vec<&str> = all.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
@@ -378,15 +471,20 @@ mod tests {
 
         let info = detect_one(&SH).await;
         assert!(info.available);
-        assert_eq!(info.path.as_deref(), Some("sh"));
+        // detect_one resolves to absolute path now.
+        assert!(
+            info.path.as_ref().unwrap().ends_with("/sh"),
+            "path should be absolute: {:?}",
+            info.path
+        );
         assert_eq!(info.version.as_deref(), Some("1.2.3"));
-        assert!(observed_flags("test-sh").contains(&"--demo-flag".to_string()));
+        assert!(info.help_flags.contains(&"--demo-flag".to_string()));
+        assert!(info.probed);
     }
 
-    #[tokio::test]
-    async fn capability_limitations_are_surfaced_as_diagnostics() {
-        let all = detect_all().await;
-        let grok = all.iter().find(|i| i.id == "grok").expect("grok");
+    #[test]
+    fn capability_limitations_are_surfaced_as_diagnostics() {
+        let grok = discover_one(crate::registry::find("grok").expect("grok"));
         let joined = grok.diagnostics.join(" ");
         // The user should learn why Grok behaves differently before they hit it.
         assert!(joined.contains("reseeded"));
@@ -394,5 +492,79 @@ mod tests {
         assert!(joined.contains("separate reasoning channel"));
         assert!(joined.contains("no stable native-subagent lifecycle"));
         assert!(joined.contains("command fallback"));
+    }
+
+    #[test]
+    fn lightweight_path_resolution_never_executes_the_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let executable = directory.path().join("fake-agent");
+        let marker = directory.path().join("executed");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("chmod");
+
+        let resolved = resolve_path_in("fake-agent", [directory.path().to_path_buf()]);
+        let expected = std::fs::canonicalize(&executable).expect("canonical executable");
+        assert_eq!(resolved.as_deref(), expected.to_str());
+        assert!(
+            !marker.exists(),
+            "discovery must never launch the candidate"
+        );
+    }
+
+    #[test]
+    fn lightweight_discovery_missing_binary_is_unavailable() {
+        static MISSING_DISCOVER: RuntimeDef = RuntimeDef {
+            id: "test-missing-discover",
+            name: "Ghost",
+            bin: "argo-nonexistent-binary-test-xyz",
+            fallback_bins: &[],
+            version_args: &["--version"],
+            help_args: &["--help"],
+            model_probe: None,
+            fallback_models: &[("default", "default")],
+            reasoning_options: &[],
+            auth_probe: None,
+            build_args: |_| vec![],
+            capture_session: None,
+            capabilities: argo_core::runtime::AgentCapabilities {
+                stream_format: argo_core::runtime::StreamFormat::Plain,
+                prompt_delivery: argo_core::runtime::PromptDelivery::Stdin,
+                prompt_encoding: argo_core::runtime::PromptEncoding::Raw,
+                native_resume: false,
+                captures_session: false,
+                mcp_injection: argo_core::runtime::McpInjection::None,
+                supports_images: false,
+                permission: argo_core::runtime::PermissionPosture::FullBypass,
+                modes: argo_core::mode::ModeSupport::NONE,
+            },
+            install_url: "https://example.invalid",
+        };
+
+        let info = discover_one(&MISSING_DISCOVER);
+        assert!(!info.available);
+        assert!(!info.probed);
+    }
+
+    #[test]
+    fn discover_all_lightweight_never_deep_probes() {
+        let all = discover_all_lightweight();
+        assert_eq!(all.len(), ADAPTERS.len());
+        for info in &all {
+            assert!(
+                !info.probed,
+                "{} was deep-probed during lightweight discovery",
+                info.id
+            );
+        }
     }
 }

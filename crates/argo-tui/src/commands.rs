@@ -19,6 +19,8 @@ pub enum Command {
     Model(Option<String>),
     /// Set reasoning effort.
     Effort(Option<String>),
+    /// Configure or clear the CLI/model used for new conversations.
+    Default(DefaultCommand),
     /// Set or cycle the execution mode.
     Mode(Option<String>),
     /// Show exact token usage reported for the last completed turn.
@@ -29,17 +31,23 @@ pub enum Command {
     Agents,
     /// List discovered skills.
     Skills,
-    /// List configured MCP servers.
-    Mcp,
+    /// Show or change whether agent thinking is rendered.
+    Thinking(ThinkingCommand),
+    /// Inspect or manage configured MCP servers.
+    Mcp(McpCommand),
     /// Show what the next turn would send.
     Context,
     /// Resume a session: list them, or open one directly.
     Resume(Option<String>),
     /// Start a new conversation.
     New(Option<String>),
+    /// Delete stored conversations for the current workspace.
+    ClearHistory,
 
     /// Show child conversations from delegation.
     Children,
+    /// Return from a directly opened child conversation to its parent.
+    Parent,
     /// Delegate a task to another agent.
     Delegate {
         /// Target agent id.
@@ -57,6 +65,47 @@ pub enum Command {
     Quit,
 }
 
+/// A visibility change requested through `/thinking`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingCommand {
+    /// Render thinking blocks in the transcript.
+    Show,
+    /// Hide thinking blocks from the transcript.
+    Hide,
+    /// Invert the current visibility setting.
+    Toggle,
+}
+
+/// An operation requested through `/default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultCommand {
+    /// Open the CLI → model → effort configuration flow.
+    Configure,
+    /// Save the current complete selection.
+    Current,
+    /// Remove the startup selection.
+    Clear,
+}
+
+/// An operation requested through `/mcp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCommand {
+    /// List configured MCP servers and their connection state.
+    List,
+    /// Open the guided server setup flow.
+    Add,
+    /// Check every server, or one named server when supplied.
+    Check(Option<String>),
+    /// Reconnect a named server.
+    Reconnect(String),
+    /// Authenticate a named server.
+    Login(String),
+    /// Clear authentication for a named server.
+    Logout(String),
+    /// Delete a named server from the configuration.
+    Remove(String),
+}
+
 /// Why a line could not be parsed as a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -66,6 +115,15 @@ pub enum ParseError {
     MissingArgument {
         /// Command name.
         command: &'static str,
+        /// What was expected.
+        expected: &'static str,
+    },
+    /// An argument was present, but is not one of the supported values.
+    InvalidArgument {
+        /// Command name.
+        command: &'static str,
+        /// The unsupported argument.
+        value: String,
         /// What was expected.
         expected: &'static str,
     },
@@ -81,6 +139,14 @@ impl std::fmt::Display for ParseError {
             Self::MissingArgument { command, expected } => {
                 write!(f, "/{command} needs {expected}")
             }
+            Self::InvalidArgument {
+                command,
+                value,
+                expected,
+            } => write!(
+                f,
+                "invalid /{command} argument '{value}'; expected {expected}"
+            ),
         }
     }
 }
@@ -108,19 +174,23 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "agent" => Ok(Command::Agent(argument)),
         "model" => Ok(Command::Model(argument)),
         "effort" | "reasoning" => Ok(Command::Effort(argument)),
+        "default" => parse_default(rest),
         "mode" | "plan" => Ok(Command::Mode(argument)),
         "usage" => Ok(Command::Usage),
         "status" => Ok(Command::Status),
         "agents" => Ok(Command::Agents),
         "skills" => Ok(Command::Skills),
-        "mcp" => Ok(Command::Mcp),
+        "thinking" => parse_thinking(rest),
+        "mcp" => parse_mcp(rest),
         "context" => Ok(Command::Context),
         // One command for both listing and opening: two commands for one intent
         // was needless surface.
         "resume" | "chats" | "sessions" | "conversations" | "open" => Ok(Command::Resume(argument)),
         "new" => Ok(Command::New(argument)),
+        "clear-history" | "clear-chats" => Ok(Command::ClearHistory),
 
         "children" => Ok(Command::Children),
+        "parent" | "back" => Ok(Command::Parent),
         "delegate" => {
             let rest = argument.ok_or(ParseError::MissingArgument {
                 command: "delegate",
@@ -145,27 +215,118 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
     }
 }
 
+fn parse_default(rest: &str) -> std::result::Result<Command, ParseError> {
+    match rest.to_ascii_lowercase().as_str() {
+        "" | "configure" | "set" => Ok(Command::Default(DefaultCommand::Configure)),
+        "current" => Ok(Command::Default(DefaultCommand::Current)),
+        "clear" | "remove" => Ok(Command::Default(DefaultCommand::Clear)),
+        _ => Err(ParseError::InvalidArgument {
+            command: "default",
+            value: rest.to_string(),
+            expected: "configure, current, or clear",
+        }),
+    }
+}
+
+fn parse_thinking(rest: &str) -> std::result::Result<Command, ParseError> {
+    match rest.to_ascii_lowercase().as_str() {
+        "" | "toggle" => Ok(Command::Thinking(ThinkingCommand::Toggle)),
+        "show" => Ok(Command::Thinking(ThinkingCommand::Show)),
+        "hide" => Ok(Command::Thinking(ThinkingCommand::Hide)),
+        _ => Err(ParseError::InvalidArgument {
+            command: "thinking",
+            value: rest.to_string(),
+            expected: "show, hide, or toggle",
+        }),
+    }
+}
+
+fn parse_mcp(rest: &str) -> std::result::Result<Command, ParseError> {
+    let (action, target) = match rest.split_once(char::is_whitespace) {
+        Some((action, target)) => (action, target.trim()),
+        None => (rest, ""),
+    };
+    let target = (!target.is_empty()).then(|| target.to_string());
+
+    let command = match action.to_ascii_lowercase().as_str() {
+        "" | "list" => McpCommand::List,
+        "add" => McpCommand::Add,
+        "check" => McpCommand::Check(target),
+        "reconnect" => McpCommand::Reconnect(required_mcp_name(target, "reconnect")?),
+        "login" | "reauth" => McpCommand::Login(required_mcp_name(target, "login")?),
+        "logout" => McpCommand::Logout(required_mcp_name(target, "logout")?),
+        "remove" | "delete" => McpCommand::Remove(required_mcp_name(target, "remove")?),
+        _ => {
+            return Err(ParseError::InvalidArgument {
+                command: "mcp",
+                value: action.to_string(),
+                expected: "list, add, check, reconnect, login, reauth, logout, remove, or delete",
+            });
+        }
+    };
+    Ok(Command::Mcp(command))
+}
+
+fn required_mcp_name(
+    target: Option<String>,
+    action: &'static str,
+) -> std::result::Result<String, ParseError> {
+    target.ok_or(ParseError::MissingArgument {
+        command: "mcp",
+        expected: match action {
+            "reconnect" => "a server name after reconnect",
+            "login" => "a server name after login or reauth",
+            "logout" => "a server name after logout",
+            "remove" => "a server name after remove or delete",
+            _ => "a server name",
+        },
+    })
+}
+
 /// Command names offered for completion, in display order.
 pub const COMMAND_NAMES: &[&str] = &[
     "/help",
     "/agent",
     "/model",
     "/effort",
+    "/default",
     "/mode",
     "/usage",
     "/status",
     "/agents",
     "/skills",
+    "/thinking",
     "/mcp",
     "/context",
     "/resume",
     "/new",
+    "/clear-history",
     "/children",
+    "/parent",
     "/delegate",
     "/cancel",
     "/config",
     "/doctor",
     "/quit",
+];
+
+/// Argument-bearing completions for commands with a fixed subcommand set.
+const SUBCOMMAND_COMPLETIONS: &[&str] = &[
+    "/default clear",
+    "/default configure",
+    "/default current",
+    "/mcp check",
+    "/mcp add",
+    "/mcp delete",
+    "/mcp list",
+    "/mcp login",
+    "/mcp logout",
+    "/mcp reauth",
+    "/mcp reconnect",
+    "/mcp remove",
+    "/thinking hide",
+    "/thinking show",
+    "/thinking toggle",
 ];
 
 /// Completion candidates for a partially typed command.
@@ -179,10 +340,12 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     if !prefix.starts_with('/') {
         return Vec::new();
     }
-    // Once a full name plus a space is typed, the user is entering arguments and
-    // further name completion would be noise.
     if prefix.contains(char::is_whitespace) {
-        return Vec::new();
+        return SUBCOMMAND_COMPLETIONS
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .copied()
+            .collect();
     }
     let mut matches: Vec<&'static str> = COMMAND_NAMES
         .iter()
@@ -222,6 +385,10 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "set reasoning effort where the model supports it",
         },
         HelpEntry {
+            usage: "/default [configure|current|clear]",
+            detail: "configure the exact CLI/model used for new conversations",
+        },
+        HelpEntry {
             usage: "/mode [id]",
             detail: "switch execution mode (Shift+Tab cycles): full, plan, accept-edits",
         },
@@ -242,8 +409,32 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "list skills available to every agent",
         },
         HelpEntry {
-            usage: "/mcp",
-            detail: "list configured MCP servers",
+            usage: "/thinking [show|hide|toggle]",
+            detail: "show, hide, or toggle agent thinking in the transcript",
+        },
+        HelpEntry {
+            usage: "/mcp [list|check [name]]",
+            detail: "list MCP servers or check their connection state",
+        },
+        HelpEntry {
+            usage: "/mcp add",
+            detail: "guided setup for local, remote, imported, OAuth, bearer-token, or header-auth MCP servers",
+        },
+        HelpEntry {
+            usage: "/mcp reconnect <name>",
+            detail: "disconnect and reconnect an MCP server",
+        },
+        HelpEntry {
+            usage: "/mcp login|reauth <name>",
+            detail: "authenticate an MCP server again",
+        },
+        HelpEntry {
+            usage: "/mcp logout <name>",
+            detail: "clear an MCP server's authentication",
+        },
+        HelpEntry {
+            usage: "/mcp remove|delete <name>",
+            detail: "delete an MCP server from configuration",
         },
         HelpEntry {
             usage: "/context",
@@ -258,8 +449,16 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "start a new conversation",
         },
         HelpEntry {
+            usage: "/clear-history",
+            detail: "delete stored chats in this workspace and start fresh",
+        },
+        HelpEntry {
             usage: "/children",
-            detail: "show conversations spawned by delegation",
+            detail: "inspect delegated conversations; Esc returns to the parent",
+        },
+        HelpEntry {
+            usage: "/parent",
+            detail: "return from a directly opened child chat to its parent",
         },
         HelpEntry {
             usage: "/delegate <agent> <task>",
@@ -350,6 +549,7 @@ mod tests {
         assert_eq!(parse("/q").expect("parse"), Command::Quit);
         assert_eq!(parse("/exit").expect("parse"), Command::Quit);
         assert_eq!(parse("/stop").expect("parse"), Command::Cancel);
+        assert_eq!(parse("/back").expect("parse"), Command::Parent);
         assert_eq!(parse("/?").expect("parse"), Command::Help);
         assert_eq!(
             parse("/reasoning high").expect("parse"),
@@ -359,6 +559,147 @@ mod tests {
             parse("/conversations").expect("parse"),
             Command::Resume(None)
         );
+        assert_eq!(
+            parse("/THINKING SHOW").expect("parse"),
+            Command::Thinking(ThinkingCommand::Show)
+        );
+    }
+
+    #[test]
+    fn thinking_defaults_to_toggle_and_accepts_each_visibility_action() {
+        assert_eq!(
+            parse("/thinking").expect("parse"),
+            Command::Thinking(ThinkingCommand::Toggle)
+        );
+        assert_eq!(
+            parse("/thinking toggle").expect("parse"),
+            Command::Thinking(ThinkingCommand::Toggle)
+        );
+        assert_eq!(
+            parse("/thinking show").expect("parse"),
+            Command::Thinking(ThinkingCommand::Show)
+        );
+        assert_eq!(
+            parse("/thinking hide").expect("parse"),
+            Command::Thinking(ThinkingCommand::Hide)
+        );
+    }
+
+    #[test]
+    fn default_configuration_is_explicit_and_clearable() {
+        assert_eq!(
+            parse("/default").expect("parse"),
+            Command::Default(DefaultCommand::Configure)
+        );
+        assert_eq!(
+            parse("/default current").expect("parse"),
+            Command::Default(DefaultCommand::Current)
+        );
+        assert_eq!(
+            parse("/default clear").expect("parse"),
+            Command::Default(DefaultCommand::Clear)
+        );
+        assert!(parse("/default codex").is_err());
+    }
+
+    #[test]
+    fn thinking_rejects_unknown_actions_with_guidance() {
+        let error = parse("/thinking sometimes").expect_err("must fail");
+        assert_eq!(
+            error,
+            ParseError::InvalidArgument {
+                command: "thinking",
+                value: "sometimes".into(),
+                expected: "show, hide, or toggle",
+            }
+        );
+        assert!(error.to_string().contains("show, hide, or toggle"));
+    }
+
+    #[test]
+    fn mcp_bare_and_list_forms_list_servers() {
+        for line in ["/mcp", "/mcp list", "/MCP LIST"] {
+            assert_eq!(parse(line).expect("parse"), Command::Mcp(McpCommand::List));
+        }
+    }
+
+    #[test]
+    fn mcp_add_opens_the_guided_flow() {
+        assert_eq!(
+            parse("/mcp add").expect("parse"),
+            Command::Mcp(McpCommand::Add)
+        );
+        assert!(complete("/mcp a").contains(&"/mcp add"));
+    }
+
+    #[test]
+    fn parses_mcp_inspection_and_lifecycle_actions() {
+        assert_eq!(
+            parse("/mcp check").expect("parse"),
+            Command::Mcp(McpCommand::Check(None))
+        );
+        assert_eq!(
+            parse("/mcp check github").expect("parse"),
+            Command::Mcp(McpCommand::Check(Some("github".into())))
+        );
+        assert_eq!(
+            parse("/mcp reconnect github").expect("parse"),
+            Command::Mcp(McpCommand::Reconnect("github".into()))
+        );
+        assert_eq!(
+            parse("/mcp login github").expect("parse"),
+            Command::Mcp(McpCommand::Login("github".into()))
+        );
+        assert_eq!(
+            parse("/mcp logout github").expect("parse"),
+            Command::Mcp(McpCommand::Logout("github".into()))
+        );
+        assert_eq!(
+            parse("/mcp remove github").expect("parse"),
+            Command::Mcp(McpCommand::Remove("github".into()))
+        );
+    }
+
+    #[test]
+    fn mcp_aliases_map_to_their_canonical_operations() {
+        assert_eq!(
+            parse("/mcp reauth github").expect("parse"),
+            Command::Mcp(McpCommand::Login("github".into()))
+        );
+        assert_eq!(
+            parse("/mcp delete github").expect("parse"),
+            Command::Mcp(McpCommand::Remove("github".into()))
+        );
+    }
+
+    #[test]
+    fn mcp_mutations_require_a_server_name() {
+        for action in ["reconnect", "login", "reauth", "logout", "remove", "delete"] {
+            let line = format!("/mcp {action}");
+            let error = parse(&line).expect_err("must fail without a server name");
+            assert!(
+                matches!(error, ParseError::MissingArgument { command: "mcp", .. }),
+                "unexpected error for {line}: {error}"
+            );
+            assert!(error.to_string().contains("server name"));
+        }
+    }
+
+    #[test]
+    fn mcp_rejects_unknown_actions_with_the_valid_set() {
+        let error = parse("/mcp restart github").expect_err("must fail");
+        assert!(matches!(
+            error,
+            ParseError::InvalidArgument {
+                command: "mcp",
+                ref value,
+                ..
+            } if value == "restart"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("reconnect"));
+        assert!(message.contains("reauth"));
+        assert!(message.contains("delete"));
     }
 
     #[test]
@@ -417,6 +758,18 @@ mod tests {
     }
 
     #[test]
+    fn completion_offers_thinking_and_mcp_subcommands() {
+        assert_eq!(complete("/thinking sh"), vec!["/thinking show"]);
+        assert_eq!(
+            complete("/mcp re"),
+            vec!["/mcp reauth", "/mcp reconnect", "/mcp remove"]
+        );
+        assert_eq!(complete("/mcp del"), vec!["/mcp delete"]);
+        // After the fixed action, the remainder is a user-defined server name.
+        assert!(complete("/mcp login github").is_empty());
+    }
+
+    #[test]
     fn agent_ids_are_validated_against_the_registry() {
         assert_eq!(
             resolve_agent("codex").expect("resolve").to_string(),
@@ -465,6 +818,30 @@ mod tests {
             assert!(
                 entries.iter().any(|e| e.usage.contains(bare)),
                 "{name} is missing from /help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_documents_thinking_and_every_mcp_operation() {
+        let entries = help();
+        let usages: Vec<&str> = entries.iter().map(|entry| entry.usage).collect();
+        assert!(usages.contains(&"/thinking [show|hide|toggle]"));
+        for operation in [
+            "list",
+            "check",
+            "reconnect",
+            "login",
+            "reauth",
+            "logout",
+            "remove",
+            "delete",
+        ] {
+            assert!(
+                usages
+                    .iter()
+                    .any(|usage| usage.starts_with("/mcp") && usage.contains(operation)),
+                "/help does not document /mcp {operation}"
             );
         }
     }

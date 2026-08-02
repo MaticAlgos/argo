@@ -208,6 +208,38 @@ impl Store {
             .map_err(|e| ArgoError::Store(format!("read conversations: {e}")))
     }
 
+    /// Deletes every conversation in one workspace, relying on foreign-key
+    /// cascades to remove messages, runs, events, sessions, and context epochs.
+    pub fn clear_workspace_conversations(&self, workspace_id: &WorkspaceId) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| ArgoError::Store(format!("count workspace conversations: {e}")))?;
+        self.conn
+            .execute(
+                "DELETE FROM conversations WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+            )
+            .map_err(|e| ArgoError::Store(format!("clear workspace conversations: {e}")))?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Deletes conversation history across every workspace.
+    pub fn clear_all_conversations(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .map_err(|e| ArgoError::Store(format!("count conversations: {e}")))?;
+        self.conn
+            .execute("DELETE FROM conversations", [])
+            .map_err(|e| ArgoError::Store(format!("clear conversations: {e}")))?;
+        Ok(count.max(0) as usize)
+    }
+
     /// Lists direct child conversations of a conversation.
     pub fn list_child_conversations(&self, id: &ConversationId) -> Result<Vec<Conversation>> {
         let mut stmt = self
@@ -231,7 +263,8 @@ impl Store {
     /// Records a pending agent/model/reasoning selection.
     ///
     /// Applied at the next turn boundary. Only the fields present in `change` are
-    /// written, so `/model` does not clear a previously chosen reasoning level.
+    /// written. Changing a model clears its previous reasoning level because
+    /// effort support and valid values are model-specific.
     pub fn update_selection(&self, id: &ConversationId, change: &SelectionChange) -> Result<()> {
         if change.is_empty() {
             return Ok(());
@@ -249,10 +282,10 @@ impl Store {
             (Some(_), None) => None,
             (None, None) => existing.selected_model,
         };
-        let reasoning = match (&change.agent_id, &change.reasoning) {
-            (_, Some(r)) => Some(r.clone()),
-            (Some(_), None) => None,
-            (None, None) => existing.selected_reasoning,
+        let reasoning = match (&change.agent_id, &change.model, &change.reasoning) {
+            (_, _, Some(r)) => Some(r.clone()),
+            (Some(_), _, None) | (None, Some(_), None) => None,
+            (None, None, None) => existing.selected_reasoning,
         };
 
         self.conn
@@ -485,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_only_the_model_keeps_the_agent_and_reasoning() {
+    fn changing_the_model_keeps_the_agent_but_clears_reasoning() {
         let s = store();
         let ws = s.ensure_workspace(std::env::temp_dir()).expect("ws");
         let id = s.create_conversation(&ws, None).expect("create");
@@ -509,7 +542,7 @@ mod tests {
         let after = s.get_conversation(&id).expect("load");
         assert_eq!(after.selected_agent_id.as_deref(), Some("grok"));
         assert_eq!(after.selected_model.as_deref(), Some("grok-4.20-reasoning"));
-        assert_eq!(after.selected_reasoning.as_deref(), Some("high"));
+        assert_eq!(after.selected_reasoning, None);
     }
 
     #[test]
@@ -594,5 +627,29 @@ mod tests {
             first.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
             second.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn clearing_history_is_scoped_or_global_and_cascades() {
+        let s = store();
+        let root_a = std::env::temp_dir().join("argo-clear-a");
+        let root_b = std::env::temp_dir().join("argo-clear-b");
+        let ws_a = s.ensure_workspace(&root_a).expect("workspace a");
+        let ws_b = s.ensure_workspace(&root_b).expect("workspace b");
+        let parent = s
+            .create_conversation(&ws_a, Some("parent"))
+            .expect("parent");
+        s.create_child_conversation(&ws_a, &parent, None, Some("child"))
+            .expect("child");
+        s.create_conversation(&ws_b, Some("other")).expect("other");
+
+        assert_eq!(s.clear_workspace_conversations(&ws_a).expect("clear a"), 2);
+        assert!(s.list_conversations(&ws_a).expect("list a").is_empty());
+        assert_eq!(s.list_conversations(&ws_b).expect("list b").len(), 1);
+        assert_eq!(s.clear_all_conversations().expect("clear all"), 1);
+        assert!(s
+            .list_conversations(&ws_b)
+            .expect("list b empty")
+            .is_empty());
     }
 }

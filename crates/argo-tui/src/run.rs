@@ -5,7 +5,9 @@
 //! leaving a user's shell in raw mode with no cursor is worse than any error
 //! message.
 
-use crate::app::{App, EnterAction, LineKind, PickerAction};
+use crate::app::{
+    App, EnterAction, InputAction, LineKind, McpDraft, MouseSelection, PickerAction, ScreenPoint,
+};
 use crate::commands::{self, Command};
 use argo_core::error::{ArgoError, Result};
 use argo_core::event::RunEvent;
@@ -15,7 +17,8 @@ use argo_daemon::protocol::{Request, Response};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::style::{
     Attribute, Color as CrosstermColor, Print, SetAttribute, SetForegroundColor,
@@ -26,17 +29,92 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-/// Minimal wheel reporting: normal button events plus SGR coordinates.
+/// Button/drag/wheel reporting plus unambiguous SGR coordinates.
 ///
-/// Deliberately omit 1002/1003 motion tracking and crossterm's RXVT mode. Explicit
-/// wheel events keep scrolling distinguishable from physical Up/Down keys. F2
-/// disables reporting whenever terminal-owned text selection is preferred.
-const ENABLE_MOUSE_WHEEL: &str = "\x1b[?1000h\x1b[?1006h";
-const DISABLE_MOUSE_WHEEL: &str = "\x1b[?1006l\x1b[?1000l";
+/// Argo renders and copies the selected range itself, so wheel scrolling and text
+/// selection no longer depend on a terminal-specific Shift-drag bypass. F2 still
+/// disables reporting for fully native selection.
+const ENABLE_MOUSE_WHEEL: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MOUSE_WHEEL: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+#[derive(Debug, Default, Clone)]
+struct ScreenSnapshot {
+    area: ratatui::layout::Rect,
+    cells: Vec<Vec<String>>,
+}
+
+#[derive(Debug)]
+enum McpAuthEvent {
+    Progress { name: String, message: String },
+    Complete { name: String },
+    Failed { name: String, message: String },
+}
+
+impl ScreenSnapshot {
+    fn capture(buffer: &ratatui::buffer::Buffer) -> Self {
+        let area = buffer.area;
+        let cells = (area.top()..area.bottom())
+            .map(|row| {
+                (area.left()..area.right())
+                    .map(|column| buffer[(column, row)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        Self { area, cells }
+    }
+
+    fn selected_text(&self, selection: MouseSelection) -> Option<String> {
+        if self.area.is_empty() || selection.is_click() {
+            return None;
+        }
+        let (mut start, mut end) = selection.ordered();
+        start.row = start
+            .row
+            .clamp(self.area.top(), self.area.bottom().saturating_sub(1));
+        end.row = end
+            .row
+            .clamp(self.area.top(), self.area.bottom().saturating_sub(1));
+        start.column = start
+            .column
+            .clamp(self.area.left(), self.area.right().saturating_sub(1));
+        end.column = end
+            .column
+            .clamp(self.area.left(), self.area.right().saturating_sub(1));
+
+        let mut rows = Vec::new();
+        for row in start.row..=end.row {
+            let left = if row == start.row {
+                start.column
+            } else {
+                self.area.left()
+            };
+            let right = if row == end.row {
+                end.column
+            } else {
+                self.area.right().saturating_sub(1)
+            };
+            let row_index = usize::from(row.saturating_sub(self.area.top()));
+            let Some(cells) = self.cells.get(row_index) else {
+                continue;
+            };
+            let from = usize::from(left.saturating_sub(self.area.left()));
+            let through = usize::from(right.saturating_sub(self.area.left()));
+            let line = cells
+                .get(from..=through)
+                .unwrap_or_default()
+                .concat()
+                .trim_end()
+                .to_string();
+            rows.push(line);
+        }
+        let text = rows.join("\n").trim_matches('\n').to_string();
+        (!text.is_empty()).then_some(text)
+    }
+}
 
 fn set_mouse_wheel_reporting<W: std::io::Write>(
     writer: &mut W,
@@ -59,21 +137,33 @@ fn set_mouse_scroll_mode<W: std::io::Write>(
 ) -> std::io::Result<()> {
     set_mouse_wheel_reporting(writer, enabled)?;
     app.mouse_scroll_mode = enabled;
+    app.clear_mouse_selection();
     app.set_status(if enabled {
-        "mouse wheel enabled · F2 returns to terminal selection"
+        "mouse ready · wheel scrolls · drag selects + copies · F2 native mode"
     } else {
-        "selection mode · F2 enables mouse-wheel scrolling"
+        "native selection enabled · F2 restores wheel + drag selection"
     });
     Ok(())
 }
 
 fn enter_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
-    crossterm::execute!(writer, EnterAlternateScreen, EnableBracketedPaste)
+    crossterm::execute!(
+        writer,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )
 }
 
 fn leave_terminal_screen<W: std::io::Write>(writer: &mut W) -> std::io::Result<()> {
     crossterm::execute!(
         writer,
+        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         Print(DISABLE_MOUSE_WHEEL),
         LeaveAlternateScreen
@@ -101,13 +191,48 @@ impl Drop for TerminalRestoreGuard {
 
 /// Runs the TUI against the daemon.
 pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
+    run_inner(paths, workspace, None).await
+}
+
+/// Runs the TUI, resuming a specific conversation by its full id.
+///
+/// The TUI uses the conversation's authoritative workspace rather than requiring
+/// it from the caller.
+pub async fn run_with_conversation(paths: &ArgoPaths, conversation_id: String) -> Result<()> {
+    run_inner(
+        paths,
+        // Temporary placeholder; overridden once the conversation is loaded.
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .to_string(),
+        Some(conversation_id),
+    )
+    .await
+}
+
+/// Internal run implementation with optional initial conversation.
+async fn run_inner(
+    paths: &ArgoPaths,
+    workspace: String,
+    initial_conversation: Option<String>,
+) -> Result<()> {
     let mut connection = Connection::connect(paths).await?;
     let mut app = App::new(workspace.clone());
 
-    // Open the workspace before drawing so the first frame is already populated.
+    // A direct resume resolves the conversation first so its authoritative
+    // workspace is opened even when the command runs from another directory.
+    if let Some(conversation_id) = initial_conversation {
+        let requested = ConversationId::new(conversation_id);
+        load_conversation(&mut connection, &mut app, &requested).await?;
+        if app.conversation.as_ref().map(|summary| &summary.id) != Some(&requested) {
+            return Err(ArgoError::not_found("conversation", requested.as_str()));
+        }
+    }
+
     match connection
         .request(Request::OpenWorkspace {
-            root: workspace.clone(),
+            root: app.workspace.clone(),
         })
         .await?
     {
@@ -133,9 +258,15 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
         app.agents = agents;
     }
 
-    // Always open a fresh session. Reopening the last conversation silently
-    // continues work the user may not have meant to resume; `/resume` is explicit.
-    new_conversation(&mut connection, &mut app, None).await?;
+    match crate::preferences::load(paths) {
+        Ok(selection) => app.default_selection = selection,
+        Err(error) => app.set_status(format!("startup default ignored: {error}")),
+    }
+
+    if app.conversation.is_none() {
+        // Default launch remains a fresh conversation; resume is always explicit.
+        new_conversation(&mut connection, &mut app, None).await?;
+    }
 
     // Any panic must not leave the terminal unusable.
     let default_hook = std::panic::take_hook();
@@ -147,13 +278,12 @@ pub async fn run(paths: &ArgoPaths, workspace: String) -> Result<()> {
     let mut terminal_guard = TerminalRestoreGuard(true);
     enable_raw_mode().map_err(|e| ArgoError::Io(format!("enable raw mode: {e}")))?;
     let mut stdout = std::io::stdout();
-    // Wheel motion and physical Up/Down keys must remain distinguishable: the
-    // wheel scrolls the transcript, while arrows recall user prompts. Request only
-    // button events (not motion tracking); F2 restores terminal-owned selection.
+    // Combined mode keeps wheel scrolling and lets Argo own drag selection. F2
+    // remains a fully terminal-native selection escape hatch.
     enter_terminal_screen(&mut stdout)
         .map_err(|e| ArgoError::Io(format!("enter alternate screen: {e}")))?;
     set_mouse_scroll_mode(&mut stdout, &mut app, true)
-        .map_err(|e| ArgoError::Io(format!("enable mouse wheel: {e}")))?;
+        .map_err(|e| ArgoError::Io(format!("enable combined mouse mode: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal =
         Terminal::new(backend).map_err(|e| ArgoError::Io(format!("create terminal: {e}")))?;
@@ -182,6 +312,8 @@ async fn event_loop(
 ) -> Result<()> {
     let mut keys = EventStream::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RunEvent>();
+    let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<McpAuthEvent>();
+    let mut screen = ScreenSnapshot::default();
 
     loop {
         let mut hyperlinks = Vec::new();
@@ -189,6 +321,7 @@ async fn event_loop(
             .draw(|frame| {
                 crate::render::draw(frame, app);
                 hyperlinks = crate::render::native_hyperlinks(frame.buffer_mut(), app);
+                screen = ScreenSnapshot::capture(frame.buffer_mut());
             })
             .map_err(|e| ArgoError::Io(format!("draw: {e}")))?;
         write_native_hyperlinks(&mut std::io::stdout(), &hyperlinks)
@@ -217,6 +350,29 @@ async fn event_loop(
                     apply_stream_event(connection, app, paths, &event_tx, event).await?;
                 }
             }
+            Some(auth) = auth_rx.recv() => {
+                match auth {
+                    McpAuthEvent::Progress { name, message } => {
+                        if !app.append_text_overlay("mcp authentication", message.clone()) {
+                            app.push(LineKind::Notice, format!("· MCP {name}: {message}"));
+                        }
+                    }
+                    McpAuthEvent::Complete { name } => {
+                        let message = format!("authenticated '{name}' · /mcp check {name}");
+                        if !app.append_text_overlay("mcp authentication", message.clone()) {
+                            app.push(LineKind::Notice, format!("✓ {message}"));
+                        }
+                        app.set_status(format!("MCP authentication complete · {name}"));
+                    }
+                    McpAuthEvent::Failed { name, message } => {
+                        let detail = format!("authentication failed for '{name}': {message}");
+                        if !app.append_text_overlay("mcp authentication", detail.clone()) {
+                            app.push(LineKind::Error, format!("! {detail}"));
+                        }
+                        app.report_error(detail);
+                    }
+                }
+            }
             _ = animation => {
                 app.advance_tick();
             }
@@ -228,11 +384,11 @@ async fn event_loop(
                             set_mouse_scroll_mode(&mut std::io::stdout(), app, enabled)
                                 .map_err(|e| ArgoError::Io(format!("toggle mouse wheel: {e}")))?;
                         } else {
-                            handle_key(key, connection, app, paths, &event_tx).await?;
+                            handle_key(key, connection, app, paths, &event_tx, &auth_tx).await?;
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
-                        if let Some(url) = handle_mouse(mouse, app, &hyperlinks) {
+                        if let Some(url) = handle_mouse(mouse, app, &hyperlinks, &screen) {
                             match open_web_url(&url) {
                                 Ok(()) => app.set_status(format!("opened {url}")),
                                 Err(error) => app.report_error(error),
@@ -407,25 +563,58 @@ fn open_web_url(url: &str) -> std::result::Result<(), String> {
         .map_err(|error| format!("could not open link: {error}"))
 }
 
-/// Applies wheel movement and resolves clicks on currently rendered web links.
-///
-/// Apple Terminal's mouse protocol does not carry the Command modifier. A click
-/// consumed by wheel mode is therefore opened only when it lands on an exact
-/// visible HTTP(S) hyperlink; outside wheel mode OSC 8 remains terminal-native.
+/// Applies wheel movement, Argo-owned drag selection, and safe link clicks.
 fn handle_mouse(
     mouse: MouseEvent,
     app: &mut App,
     hyperlinks: &[crate::render::NativeHyperlink],
+    screen: &ScreenSnapshot,
 ) -> Option<String> {
     const ROWS_PER_NOTCH: i32 = 3;
     let delta = match mouse.kind {
         MouseEventKind::ScrollUp => -ROWS_PER_NOTCH,
         MouseEventKind::ScrollDown => ROWS_PER_NOTCH,
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            return hyperlink_at(hyperlinks, mouse.column, mouse.row);
+            app.begin_mouse_selection(mouse.column, mouse.row);
+            return None;
+        }
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            app.update_mouse_selection(mouse.column, mouse.row);
+            app.set_status("selecting visible text · release to copy");
+            return None;
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            app.update_mouse_selection(mouse.column, mouse.row);
+            let selection = app.mouse_selection.unwrap_or(MouseSelection {
+                anchor: ScreenPoint {
+                    column: mouse.column,
+                    row: mouse.row,
+                },
+                focus: ScreenPoint {
+                    column: mouse.column,
+                    row: mouse.row,
+                },
+                dragging: false,
+            });
+            if selection.is_click() {
+                app.clear_mouse_selection();
+                return hyperlink_at(hyperlinks, mouse.column, mouse.row);
+            }
+            let text = screen.selected_text(selection);
+            let count = text
+                .as_deref()
+                .map(|value| value.chars().count())
+                .unwrap_or(0);
+            app.finish_mouse_selection(mouse.column, mouse.row, text);
+            copy_latest_response(app);
+            if app.status == "copied selected text" {
+                app.set_status(format!("selected and copied {count} characters"));
+            }
+            return None;
         }
         _ => return None,
     };
+    app.clear_mouse_selection();
     if app.has_overlay() {
         app.overlay_move(delta);
     } else if delta < 0 {
@@ -453,6 +642,10 @@ fn navigate_vertical(app: &mut App, previous: bool) {
 /// Multi-line pastes into a picker are ignored (the picker is for navigation, not
 /// bulk input). When no overlay is open, the full text is inserted atomically.
 fn handle_paste(app: &mut App, text: &str) {
+    if matches!(app.overlay, crate::app::Overlay::Input { .. }) {
+        app.overlay_input_push_str(text.trim_end_matches(['\r', '\n']));
+        return;
+    }
     if app.has_overlay() {
         // Single-line paste into a picker filter is useful (e.g., pasting a model name).
         if !text.contains('\n') && !text.contains('\r') {
@@ -473,7 +666,42 @@ async fn handle_key(
     app: &mut App,
     paths: &ArgoPaths,
     event_tx: &mpsc::UnboundedSender<RunEvent>,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
 ) -> Result<()> {
+    let plain_ctrl_c = key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::SUPER);
+    if plain_ctrl_c {
+        app.request_ctrl_c_exit();
+        return Ok(());
+    }
+    app.clear_ctrl_c_exit_confirmation();
+
+    if matches!(app.overlay, crate::app::Overlay::Input { .. }) {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_overlay();
+                app.mcp_draft = None;
+                app.set_status("MCP setup cancelled");
+            }
+            KeyCode::Backspace => app.overlay_input_pop(),
+            KeyCode::Enter => {
+                if let Some((action, value)) = app.overlay_submit_input() {
+                    apply_mcp_input(app, paths, auth_tx, action, value)?;
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.overlay_input_push_str(&ch.to_string());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Overlays capture navigation keys while open.
     if app.has_overlay() {
         match key.code {
@@ -484,7 +712,10 @@ async fn handle_key(
             KeyCode::PageDown => app.overlay_move(10),
             KeyCode::Enter => match app.overlay_choose() {
                 Some((action, value)) => {
-                    apply_choice(connection, app, paths, event_tx, action, value).await?
+                    if action == PickerAction::StartupAgent {
+                        app.startup_save_default = false;
+                    }
+                    apply_choice(connection, app, paths, event_tx, auth_tx, action, value).await?
                 }
                 // A read-only pane has nothing to choose, so Enter dismisses it
                 // rather than appearing to do nothing.
@@ -493,20 +724,57 @@ async fn handle_key(
             // Typing narrows a picker, which is the only practical way through a
             // list of several hundred models.
             KeyCode::Backspace => app.picker_filter_pop(),
-            KeyCode::Char(ch) => app.picker_filter_push(ch),
+            KeyCode::Char(' ')
+                if matches!(
+                    &app.overlay,
+                    crate::app::Overlay::Picker {
+                        action: PickerAction::StartupAgent,
+                        ..
+                    }
+                ) =>
+            {
+                app.startup_save_default = true;
+                if let Some((action, value)) = app.overlay_choose() {
+                    apply_choice(connection, app, paths, event_tx, auth_tx, action, value).await?;
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.picker_filter_push(ch)
+            }
             _ => {}
         }
         return Ok(());
     }
 
+    if is_mode_cycle_key(&key) {
+        cycle_mode(connection, app).await?;
+        return Ok(());
+    }
+
+    if is_multiline_enter(&key) {
+        app.insert_newline();
+        return Ok(());
+    }
+
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.input.is_empty() {
                 app.should_quit = true;
             }
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.undo_edit() {
+                app.set_status("restored previous composer edit");
+            }
+        }
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::SUPER)
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)) =>
+        {
+            copy_latest_response(app);
         }
         KeyCode::Esc => {
             if app.has_completions() {
@@ -533,14 +801,8 @@ async fn handle_key(
                 }
             }
         }
-        // Shift+Enter and Ctrl+J insert a line break instead of submitting, which
-        // is what a multi-paragraph prompt or a pasted stack trace needs.
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.insert_newline();
-        }
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-            app.insert_newline();
-        }
+        // Ctrl+J remains a portable fallback for terminals that cannot preserve
+        // modified Enter at all.
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.insert_newline();
         }
@@ -564,9 +826,17 @@ async fn handle_key(
                     }
                     return Ok(());
                 }
-                submit(connection, app, paths, line, event_tx).await?;
+                submit(connection, app, paths, line, event_tx, auth_tx).await?;
             }
         },
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+            app.backspace_to_line_start()
+        }
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => app.backspace_word(),
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => app.backspace_word(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.backspace_to_line_start()
+        }
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
         KeyCode::Left => app.move_left(),
@@ -591,22 +861,111 @@ async fn handle_key(
         KeyCode::Down => navigate_vertical(app, false),
         KeyCode::PageUp => app.scroll_up(10),
         KeyCode::PageDown => app.scroll_down(10),
-        // Shift+Tab cycles execution mode, matching the convention other coding
-        // TUIs use for plan mode.
-        KeyCode::BackTab => {
-            cycle_mode(connection, app).await?;
-        }
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            cycle_mode(connection, app).await?;
-        }
         KeyCode::Tab => {
             // Accept the highlighted suggestion; the popup already shows it.
             app.accept_completion();
         }
-        KeyCode::Char(ch) => app.insert(ch),
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            app.insert(ch)
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// True when an Enter-like event requests a composer line break.
+fn is_multiline_enter(key: &crossterm::event::KeyEvent) -> bool {
+    if !matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
+    ) {
+        return false;
+    }
+    is_multiline_enter_with_native_shift(key, native_shift_key_is_pressed())
+}
+
+fn is_multiline_enter_with_native_shift(
+    key: &crossterm::event::KeyEvent,
+    native_shift_pressed: bool,
+) -> bool {
+    let enter = matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
+    );
+    enter
+        && (key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            || native_shift_pressed)
+}
+
+/// Apple Terminal collapses Shift+Enter to the same `\r` byte as plain Enter.
+/// Querying the current Quartz modifier flags recovers the information while the
+/// key chord is held, without installing an event tap or requesting input access.
+#[cfg(target_os = "macos")]
+fn native_shift_key_is_pressed() -> bool {
+    const COMBINED_SESSION_STATE: i32 = 0;
+    const SHIFT_MASK: u64 = 0x0002_0000;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    // SAFETY: this CoreGraphics query has no pointer arguments and is available
+    // on every supported macOS release (10.4+).
+    unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) & SHIFT_MASK != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn native_shift_key_is_pressed() -> bool {
+    false
+}
+
+/// Recognizes both legacy CSI-Z and enhanced-keyboard Shift+Tab encodings.
+fn is_mode_cycle_key(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab)
+        || (key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Tab | KeyCode::Char('\t')))
+}
+
+/// Copies an Argo-selected visible range, or the latest response as a fallback.
+fn copy_latest_response(app: &mut App) {
+    let selected = app.selected_screen_text().map(str::to_string);
+    let text = selected.clone().or_else(|| {
+        app.lines
+            .iter()
+            .rev()
+            .find(|line| line.kind == LineKind::Assistant)
+            .map(|line| line.text.clone())
+    });
+    let Some(text) = text else {
+        app.set_status("nothing to copy yet");
+        return;
+    };
+
+    let copier = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "wl-copy"
+    };
+    let result = std::process::Command::new(copier)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait().map(|_| ())
+        });
+    match result {
+        Ok(()) if selected.is_some() => app.set_status("copied selected text"),
+        Ok(()) => app.set_status("copied latest response"),
+        Err(error) => app.report_error(format!("copy failed: {error}")),
+    }
 }
 
 /// Routes a submitted line to a command or a message.
@@ -616,10 +975,11 @@ async fn submit(
     paths: &ArgoPaths,
     line: String,
     event_tx: &mpsc::UnboundedSender<RunEvent>,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
 ) -> Result<()> {
     let line = if commands::is_command(&line) {
         match commands::parse(&line) {
-            Ok(command) => match run_command(connection, app, paths, command).await? {
+            Ok(command) => match run_command(connection, app, paths, auth_tx, command).await? {
                 // A command may queue a message, as `/delegate` does.
                 Some(followup) => followup,
                 None => return Ok(()),
@@ -827,6 +1187,7 @@ async fn run_command(
     connection: &mut Connection,
     app: &mut App,
     paths: &ArgoPaths,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
     command: Command,
 ) -> Result<Option<String>> {
     match command {
@@ -846,10 +1207,13 @@ async fn run_command(
                 .iter()
                 .map(|info| {
                     let mark = if info.available { "✓" } else { "·" };
-                    let version = info
-                        .version
-                        .clone()
-                        .unwrap_or_else(|| "not installed".into());
+                    let version = info.version.clone().unwrap_or_else(|| {
+                        if info.available {
+                            "installed".into()
+                        } else {
+                            "not installed".into()
+                        }
+                    });
                     format!("{mark} {:<10} {version}", info.id)
                 })
                 .collect();
@@ -857,7 +1221,9 @@ async fn run_command(
             app.open_picker("switch agent", items, values, PickerAction::Agent);
         }
         Command::Agent(Some(id)) => match commands::resolve_agent(&id) {
-            Ok(agent) => select(connection, app, commands::agent_change(agent)).await?,
+            Ok(agent) => {
+                start_agent_flow(connection, app, agent, PickerAction::Model, true).await?;
+            }
             Err(message) => app.report_error(message),
         },
 
@@ -872,26 +1238,29 @@ async fn run_command(
                     .find(|a| a.available)
                     .map(|a| a.id.clone())
             });
-            match agent.and_then(|id| app.agents.iter().find(|a| a.id == id)) {
-                Some(info) => {
-                    let items = info
-                        .models
-                        .iter()
-                        .map(|model| model.label.clone())
-                        .collect();
-                    let values = info.models.iter().map(|model| model.id.clone()).collect();
-                    app.open_picker(
-                        format!("model for {}", info.id),
-                        items,
-                        values,
-                        PickerAction::Model,
-                    );
+            match agent {
+                Some(id) => {
+                    if let Some(info) = probe_agent(connection, app, &id, false).await? {
+                        let items = info
+                            .models
+                            .iter()
+                            .map(|model| model.label.clone())
+                            .collect();
+                        let values = info.models.iter().map(|model| model.id.clone()).collect();
+                        app.open_picker(
+                            format!("model for {}", info.id),
+                            items,
+                            values,
+                            PickerAction::Model,
+                        );
+                    }
                 }
                 None => app.report_error("no agent is selected yet; use /agent first"),
             }
         }
         Command::Model(Some(model)) => {
-            select(connection, app, commands::model_change(model)).await?
+            select(connection, app, commands::model_change(model)).await?;
+            offer_effort_for_current_model(connection, app).await?;
         }
 
         Command::Effort(None) => {
@@ -912,21 +1281,24 @@ async fn run_command(
                 .as_ref()
                 .and_then(|c| c.selected_model.clone());
 
-            match selected.and_then(|id| app.agents.iter().find(|a| a.id == id)) {
-                Some(info) => {
-                    // Levels are per model: `gpt-5.6-sol` accepts six, another
-                    // model may accept one, and Claude exposes none.
-                    let levels = info.reasoning_for(model.as_deref());
-                    if levels.is_empty() {
-                        app.report_error(format!("{} does not expose reasoning levels", info.id));
-                    } else {
-                        let title = match &model {
-                            Some(model) => format!("reasoning effort for {model}"),
-                            None => format!("reasoning effort for {}", info.id),
-                        };
-                        let items = levels.iter().map(|r| r.label.clone()).collect();
-                        let values = levels.iter().map(|r| r.id.clone()).collect();
-                        app.open_picker(title, items, values, PickerAction::Effort);
+            match selected {
+                Some(id) => {
+                    if let Some(info) = probe_agent(connection, app, &id, false).await? {
+                        let levels = info.reasoning_for(model.as_deref());
+                        if levels.is_empty() {
+                            app.report_error(format!(
+                                "{} does not expose reasoning levels",
+                                info.id
+                            ));
+                        } else {
+                            let title = match &model {
+                                Some(model) => format!("reasoning effort for {model}"),
+                                None => format!("reasoning effort for {}", info.id),
+                            };
+                            let items = levels.iter().map(|r| r.label.clone()).collect();
+                            let values = levels.iter().map(|r| r.id.clone()).collect();
+                            app.open_picker(title, items, values, PickerAction::Effort);
+                        }
                     }
                 }
                 None => app.report_error("no coding CLI was detected; run /agents"),
@@ -944,6 +1316,18 @@ async fn run_command(
             )
             .await?
         }
+
+        Command::Default(action) => match action {
+            commands::DefaultCommand::Configure => {
+                open_agent_picker(app, "configure default CLI", PickerAction::DefaultAgent);
+            }
+            commands::DefaultCommand::Current => save_current_default(paths, app)?,
+            commands::DefaultCommand::Clear => {
+                crate::preferences::save(paths, None)?;
+                app.default_selection = None;
+                app.set_status("startup default cleared · next new chat will ask for a CLI");
+            }
+        },
 
         Command::Mode(None) => {
             let support = app.mode_support();
@@ -966,8 +1350,24 @@ async fn run_command(
         }
 
         Command::Usage => {
-            let lines = app.usage_report();
-            app.open_text("exact CLI usage", lines);
+            let mut lines = app.usage_report();
+            lines.push(String::new());
+            lines.push(format!("Current conversation: {}", app.context_label()));
+            lines.push(String::new());
+            let agent = app
+                .conversation
+                .as_ref()
+                .and_then(|summary| summary.selected_agent_id.as_deref())
+                .or_else(|| {
+                    app.agents
+                        .iter()
+                        .find(|agent| agent.available)
+                        .map(|agent| agent.id.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            lines.extend(provider_usage_report(&agent).await);
+            app.open_text("usage and provider allowance", lines);
         }
 
         Command::Status => {
@@ -982,9 +1382,11 @@ async fn run_command(
                 lines.push(format!(
                     "{mark} {} {}",
                     info.id,
-                    info.version
-                        .clone()
-                        .unwrap_or_else(|| "not installed".into())
+                    info.version.clone().unwrap_or_else(|| if info.available {
+                        "installed".into()
+                    } else {
+                        "not installed".into()
+                    })
                 ));
                 if info.available {
                     let models: Vec<&str> =
@@ -1037,40 +1439,17 @@ async fn run_command(
             }
         }
 
-        Command::Mcp => {
-            let path = paths.root().join("mcp.json");
-            match argo_resources::McpRegistry::load(&path) {
-                Ok(registry) if registry.servers.is_empty() => app.open_text(
-                    "mcp servers",
-                    vec![
-                        "No MCP servers configured.".to_string(),
-                        format!("Add them to {}", path.display()),
-                        "Every agent that supports MCP receives them automatically.".to_string(),
-                    ],
-                ),
-                Ok(registry) => {
-                    let lines = registry
-                        .servers
-                        .iter()
-                        .map(|server| {
-                            let state = if server.enabled {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            };
-                            let transport = match &server.transport {
-                                argo_resources::McpTransport::Local { command, .. } => {
-                                    command.join(" ")
-                                }
-                                argo_resources::McpTransport::Remote { url, .. } => url.clone(),
-                            };
-                            format!("{:<20} {state:<9} {transport}", server.name)
-                        })
-                        .collect();
-                    app.open_text("mcp servers", lines);
-                }
-                Err(error) => app.report_error(error.to_string()),
-            }
+        Command::Thinking(action) => {
+            let visible = match action {
+                commands::ThinkingCommand::Show => true,
+                commands::ThinkingCommand::Hide => false,
+                commands::ThinkingCommand::Toggle => !app.thinking_visible,
+            };
+            app.set_thinking_visible(visible);
+        }
+
+        Command::Mcp(action) => {
+            run_mcp_command(app, paths, auth_tx, action).await?;
         }
 
         Command::Context => {
@@ -1151,6 +1530,26 @@ async fn run_command(
 
         Command::New(title) => new_conversation(connection, app, title).await?,
 
+        Command::ClearHistory => {
+            match connection
+                .request(Request::ClearConversations {
+                    root: Some(app.workspace.clone()),
+                })
+                .await?
+            {
+                Response::Cleared { count } => {
+                    app.conversations.clear();
+                    new_conversation(connection, app, None).await?;
+                    app.push(
+                        LineKind::Notice,
+                        format!("cleared {count} stored conversation(s) in this workspace"),
+                    );
+                }
+                Response::Error { message, .. } => app.report_error(message),
+                other => app.report_error(format!("unexpected reply: {other:?}")),
+            }
+        }
+
         Command::Children => {
             let Some(conversation) = app.conversation.as_ref().map(|c| c.id.clone()) else {
                 app.report_error("no conversation is open");
@@ -1170,20 +1569,58 @@ async fn run_command(
                     ],
                 ),
                 Response::Children { children } => {
-                    let lines = children
+                    let mut depths = std::collections::HashMap::new();
+                    let items: Vec<String> = children
                         .iter()
                         .map(|child| {
+                            let depth = child
+                                .parent_conversation_id
+                                .as_ref()
+                                .and_then(|parent| depths.get(parent))
+                                .copied()
+                                .unwrap_or(0usize)
+                                + 1;
+                            depths.insert(child.id.clone(), depth);
+                            let branch = format!("{}↳", "  ".repeat(depth.saturating_sub(1)));
+                            let agent = child.selected_agent_id.as_deref().unwrap_or("?");
+                            let model = child.selected_model.as_deref().unwrap_or("default");
+                            let title = child.title.as_deref().unwrap_or("(untitled)");
+                            let short_id = child
+                                .id
+                                .to_string()
+                                .split('-')
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
                             format!(
-                                "{}  {}",
-                                child.id,
-                                child.title.clone().unwrap_or_else(|| "(untitled)".into())
+                                "{branch} {:<8} {agent}/{model}  {} msgs  {title}",
+                                short_id, child.message_count
                             )
                         })
                         .collect();
-                    app.open_text("subagents — /open <id> to view", lines);
+                    let values: Vec<String> = children.iter().map(|c| c.id.to_string()).collect();
+                    app.open_picker(
+                        "orchestrated agents — Enter inspect · Esc stay with parent",
+                        items,
+                        values,
+                        PickerAction::ChildConversation,
+                    );
                 }
                 Response::Error { message, .. } => app.report_error(message),
                 other => app.report_error(format!("unexpected reply: {other:?}")),
+            }
+        }
+
+        Command::Parent => {
+            let parent = app
+                .conversation
+                .as_ref()
+                .and_then(|summary| summary.parent_conversation_id.clone());
+            if let Some(parent) = parent {
+                load_conversation(connection, app, &parent).await?;
+                app.set_status("returned to parent conversation · agents continue running");
+            } else {
+                app.set_status("already at the main conversation");
             }
         }
 
@@ -1254,6 +1691,17 @@ async fn run_command(
                     format!("database      {}", paths.database().display()),
                     format!("socket        {}", paths.socket().display()),
                     format!("mcp registry  {}", paths.root().join("mcp.json").display()),
+                    format!(
+                        "startup       {}",
+                        app.default_selection
+                            .as_ref()
+                            .map(|selection| selection.label())
+                            .unwrap_or_else(|| "ask on launch".into())
+                    ),
+                    format!(
+                        "preferences   {}",
+                        paths.root().join("tui-preferences.json").display()
+                    ),
                     format!("user skills   {}", paths.user_skills().display()),
                     format!("protocol      v{IPC_PROTOCOL_VERSION}"),
                     String::new(),
@@ -1283,9 +1731,11 @@ async fn run_command(
                         "{} {} {}",
                         if info.available { "✓" } else { "·" },
                         info.id,
-                        info.version
-                            .clone()
-                            .unwrap_or_else(|| "not installed".into())
+                        info.version.clone().unwrap_or_else(|| if info.available {
+                            "installed".into()
+                        } else {
+                            "not installed".into()
+                        })
                     ));
                 }
                 app.agents = agents;
@@ -1348,18 +1798,56 @@ async fn apply_choice(
     app: &mut App,
     paths: &ArgoPaths,
     event_tx: &mpsc::UnboundedSender<RunEvent>,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
     action: PickerAction,
     value: String,
 ) -> Result<()> {
     match action {
-        PickerAction::Agent => match commands::resolve_agent(&value) {
-            Ok(agent) => select(connection, app, commands::agent_change(agent)).await,
+        PickerAction::StartupAgent => match commands::resolve_agent(&value) {
+            Ok(agent) => {
+                start_agent_flow(connection, app, agent, PickerAction::StartupModel, false).await
+            }
             Err(message) => {
                 app.report_error(message);
                 Ok(())
             }
         },
-        PickerAction::Model => select(connection, app, commands::model_change(value)).await,
+        PickerAction::DefaultAgent => match commands::resolve_agent(&value) {
+            Ok(agent) => {
+                start_agent_flow(connection, app, agent, PickerAction::DefaultModel, true).await
+            }
+            Err(message) => {
+                app.report_error(message);
+                Ok(())
+            }
+        },
+        PickerAction::Agent => match commands::resolve_agent(&value) {
+            Ok(agent) => start_agent_flow(connection, app, agent, PickerAction::Model, true).await,
+            Err(message) => {
+                app.report_error(message);
+                Ok(())
+            }
+        },
+        PickerAction::Model => {
+            select(connection, app, commands::model_change(value)).await?;
+            offer_effort_for_current_model(connection, app).await
+        }
+        PickerAction::StartupModel => {
+            if select_with_visibility(connection, app, commands::model_change(value), false).await?
+                && !open_effort_picker(connection, app, PickerAction::StartupEffort).await?
+            {
+                finalize_startup_selection(paths, app)?;
+            }
+            Ok(())
+        }
+        PickerAction::DefaultModel => {
+            if select_with_visibility(connection, app, commands::model_change(value), true).await?
+                && !open_effort_picker(connection, app, PickerAction::DefaultEffort).await?
+            {
+                save_current_default(paths, app)?;
+            }
+            Ok(())
+        }
         PickerAction::Effort => {
             select(
                 connection,
@@ -1372,12 +1860,1274 @@ async fn apply_choice(
             )
             .await
         }
+        PickerAction::StartupEffort => {
+            if select_with_visibility(
+                connection,
+                app,
+                argo_core::session::SelectionChange {
+                    agent_id: None,
+                    model: None,
+                    reasoning: Some(value),
+                },
+                false,
+            )
+            .await?
+            {
+                finalize_startup_selection(paths, app)?;
+            }
+            Ok(())
+        }
+        PickerAction::DefaultEffort => {
+            if select_with_visibility(
+                connection,
+                app,
+                argo_core::session::SelectionChange {
+                    agent_id: None,
+                    model: None,
+                    reasoning: Some(value),
+                },
+                true,
+            )
+            .await?
+            {
+                save_current_default(paths, app)?;
+            }
+            Ok(())
+        }
         PickerAction::Mode => set_mode(connection, app, Some(value)).await,
         PickerAction::Conversation => {
             let id = ConversationId::new(value);
             load_conversation(connection, app, &id).await
         }
-        PickerAction::ResponseOption => submit(connection, app, paths, value, event_tx).await,
+        PickerAction::ChildConversation => {
+            let id = ConversationId::new(value);
+            open_child_conversation(connection, app, &id).await
+        }
+        PickerAction::ResponseOption => {
+            submit(connection, app, paths, value, event_tx, auth_tx).await
+        }
+        PickerAction::McpAddTransport => {
+            match value.as_str() {
+                "remote" => app.open_input(
+                    "add remote MCP · endpoint",
+                    "HTTP/SSE endpoint URL",
+                    false,
+                    InputAction::McpRemoteUrl,
+                ),
+                "local" => app.open_input(
+                    "add local MCP · command",
+                    "Command and arguments (shell quoting is supported)",
+                    false,
+                    InputAction::McpLocalCommand,
+                ),
+                "import" => open_mcp_import_picker(app)?,
+                _ => app.report_error("unknown MCP transport"),
+            }
+            Ok(())
+        }
+        PickerAction::McpAddAuth => {
+            match value.as_str() {
+                "none" => {
+                    let name = save_mcp_draft(app, paths)?;
+                    app.set_status(format!("added MCP server {name}"));
+                }
+                "oauth" => {
+                    let name = save_mcp_draft(app, paths)?;
+                    start_mcp_login(app, paths, auth_tx, &name)?;
+                }
+                "bearer" => app.open_input(
+                    "add MCP server · bearer token",
+                    "Paste the token (masked and excluded from composer history)",
+                    true,
+                    InputAction::McpBearerToken,
+                ),
+                "header" => app.open_input(
+                    "add MCP server · custom header",
+                    "Header name (for example X-API-Key)",
+                    false,
+                    InputAction::McpHeaderName,
+                ),
+                _ => app.report_error("unknown MCP authentication method"),
+            }
+            Ok(())
+        }
+        PickerAction::McpLocalConfig => {
+            if value == "env" {
+                app.open_input(
+                    "add local MCP · environment",
+                    "Environment key passed to the MCP process",
+                    false,
+                    InputAction::McpLocalEnvName,
+                );
+            } else {
+                let name = save_mcp_draft(app, paths)?;
+                app.set_status(format!("added local MCP server {name}"));
+            }
+            Ok(())
+        }
+        PickerAction::McpImport => {
+            import_mcp_choice(app, paths, &value)?;
+            Ok(())
+        }
+    }
+}
+
+fn open_mcp_import_picker(app: &mut App) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| ArgoError::Io("HOME is not set".into()))?;
+    let found = argo_resources::discover_importable(&home);
+    if found.is_empty() {
+        app.mcp_draft = None;
+        app.open_text(
+            "import MCP server",
+            vec!["No MCP servers were found in supported CLI configuration files.".into()],
+        );
+        return Ok(());
+    }
+    let items = found
+        .iter()
+        .map(|entry| {
+            let transport = match &entry.server.transport {
+                argo_resources::McpTransport::Local { command, .. } => command.join(" "),
+                argo_resources::McpTransport::Remote { url, .. } => url.clone(),
+            };
+            format!("{:<18} {transport} · {}", entry.server.name, entry.source)
+        })
+        .collect();
+    let values = (0..found.len()).map(|index| index.to_string()).collect();
+    app.open_picker(
+        "import MCP server from CLI config",
+        items,
+        values,
+        PickerAction::McpImport,
+    );
+    Ok(())
+}
+
+fn import_mcp_choice(app: &mut App, paths: &ArgoPaths, value: &str) -> Result<()> {
+    let index = value
+        .parse::<usize>()
+        .map_err(|_| ArgoError::Invalid("invalid MCP import selection".into()))?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| ArgoError::Io("HOME is not set".into()))?;
+    let found = argo_resources::discover_importable(&home);
+    let entry = found
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| ArgoError::Invalid("MCP import list changed; run /mcp add again".into()))?;
+    let name = entry.server.name.clone();
+    let path = paths.root().join("mcp.json");
+    let mut registry = argo_resources::McpRegistry::load(&path)?;
+    registry.upsert(entry.server)?;
+    registry.save(&path)?;
+    app.mcp_draft = None;
+    app.push(LineKind::Notice, format!("· imported MCP server '{name}'"));
+    app.set_status(format!("imported MCP server {name}"));
+    Ok(())
+}
+
+fn open_agent_picker(app: &mut App, title: &str, action: PickerAction) {
+    if action == PickerAction::StartupAgent {
+        app.startup_save_default = false;
+    }
+    let available: Vec<_> = app.agents.iter().filter(|info| info.available).collect();
+    let items = available
+        .iter()
+        .map(|info| {
+            let detail = crate::app::agent_picker_detail(info);
+            let is_default = app
+                .default_selection
+                .as_ref()
+                .is_some_and(|selection| selection.agent == info.id);
+            let default_mark = if is_default { " ★ default" } else { "" };
+            format!("{:<18} {detail}{default_mark}", info.name)
+        })
+        .collect();
+    let values = available.iter().map(|info| info.id.clone()).collect();
+    app.open_picker(title, items, values, action);
+}
+
+async fn start_agent_flow(
+    connection: &mut Connection,
+    app: &mut App,
+    agent: argo_core::AgentId,
+    model_action: PickerAction,
+    announce: bool,
+) -> Result<()> {
+    let agent_id = agent.to_string();
+    if !select_with_visibility(
+        connection,
+        app,
+        argo_core::session::SelectionChange {
+            agent_id: Some(agent),
+            model: None,
+            reasoning: None,
+        },
+        announce,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let Some(info) = probe_agent(connection, app, &agent_id, false).await? else {
+        return Ok(());
+    };
+    let concrete: Vec<_> = info
+        .models
+        .iter()
+        .filter(|model| model.id != argo_runtime::DEFAULT_MODEL_ID)
+        .collect();
+    let models: Vec<_> = if concrete.is_empty() {
+        info.models.iter().collect()
+    } else {
+        concrete
+    };
+    let items = models.iter().map(|model| model.label.clone()).collect();
+    let values = models.iter().map(|model| model.id.clone()).collect();
+    app.open_picker(
+        format!("choose model for {}", info.id),
+        items,
+        values,
+        model_action,
+    );
+    Ok(())
+}
+
+/// Opens the model-specific effort picker, returning whether one was shown.
+async fn open_effort_picker(
+    connection: &mut Connection,
+    app: &mut App,
+    action: PickerAction,
+) -> Result<bool> {
+    let Some(summary) = app.conversation.clone() else {
+        return Ok(false);
+    };
+    let Some(agent_id) = summary.selected_agent_id else {
+        return Ok(false);
+    };
+    let model = summary
+        .selected_model
+        .unwrap_or_else(|| argo_runtime::DEFAULT_MODEL_ID.to_string());
+    let Some(info) = probe_agent(connection, app, &agent_id, false).await? else {
+        return Ok(false);
+    };
+    let levels = info.reasoning_for(Some(&model));
+    if levels.is_empty() {
+        return Ok(false);
+    }
+    let items = levels.iter().map(|level| level.label.clone()).collect();
+    let values = levels.iter().map(|level| level.id.clone()).collect();
+    app.open_picker(
+        format!("reasoning effort for {agent_id}/{model}"),
+        items,
+        values,
+        action,
+    );
+    Ok(true)
+}
+
+/// Opens the effort picker immediately after a model selection when applicable.
+async fn offer_effort_for_current_model(connection: &mut Connection, app: &mut App) -> Result<()> {
+    let _ = open_effort_picker(connection, app, PickerAction::Effort).await?;
+    Ok(())
+}
+
+fn finalize_startup_selection(paths: &ArgoPaths, app: &mut App) -> Result<()> {
+    if std::mem::take(&mut app.startup_save_default) {
+        save_current_default(paths, app)
+    } else {
+        let label = app.selection_label();
+        app.set_status(format!("using {label} for this chat · /default to save it"));
+        Ok(())
+    }
+}
+
+fn save_current_default(paths: &ArgoPaths, app: &mut App) -> Result<()> {
+    let Some(summary) = &app.conversation else {
+        app.report_error("no conversation is open");
+        return Ok(());
+    };
+    let Some(agent) = summary.selected_agent_id.clone() else {
+        app.report_error("choose a CLI before saving a default");
+        return Ok(());
+    };
+    let Some(model) = summary.selected_model.clone() else {
+        app.report_error("choose a model before saving a default");
+        return Ok(());
+    };
+    if model == argo_runtime::DEFAULT_MODEL_ID {
+        app.report_error("choose a concrete model before saving a default");
+        return Ok(());
+    }
+    let selection = crate::preferences::DefaultSelection {
+        agent,
+        model,
+        effort: summary.selected_reasoning.clone(),
+    };
+    crate::preferences::save(paths, Some(selection.clone()))?;
+    app.default_selection = Some(selection.clone());
+    app.set_status(format!("saved startup default · {}", selection.label()));
+    Ok(())
+}
+
+/// Provider allowance is intentionally separate from per-turn token accounting.
+/// Only local, non-inference CLI surfaces are called here.
+async fn provider_usage_report(agent_id: &str) -> Vec<String> {
+    let mut lines = vec!["Provider allowance / local history:".into()];
+    match agent_id {
+        "codex" => match codex_rate_limits().await {
+            Ok(report) => lines.extend(report),
+            Err(error) => lines.push(format!("Codex allowance unavailable: {error}")),
+        },
+        "claude" => match claude_usage().await {
+            Ok(report) => lines.extend(report),
+            Err(error) => lines.push(format!("Claude allowance unavailable: {error}")),
+        },
+        "opencode" => match opencode_local_stats().await {
+            Ok(report) => {
+                lines.push("OpenCode local history (not provider quota):".into());
+                lines.extend(report);
+            }
+            Err(error) => lines.push(format!("OpenCode local history unavailable: {error}")),
+        },
+        "kiro" => match kiro_usage().await {
+            Ok(report) => lines.extend(report),
+            Err(error) => lines.push(format!("Kiro usage unavailable: {error}")),
+        },
+        "cmd" => match interactive_slash_usage(
+            "commandcode",
+            &["--skip-onboarding", "--trust"],
+            "Command Code",
+        )
+        .await
+        {
+            Ok(report) => lines.extend(report),
+            Err(error) => lines.push(format!("Command Code usage unavailable: {error}")),
+        },
+        "antigravity" => match interactive_slash_usage(
+            "agy",
+            &["--dangerously-skip-permissions"],
+            "Antigravity",
+        )
+        .await
+        {
+            Ok(report) => lines.extend(report),
+            Err(error) => lines.push(format!("Antigravity usage unavailable: {error}")),
+        },
+        "grok" => lines.push(
+            "Grok stores local historical token totals, but exposes no remaining xAI quota command."
+                .into(),
+        ),
+        _ => lines.push("No provider allowance surface is available for this CLI.".into()),
+    }
+    lines
+}
+
+async fn codex_rate_limits() -> Result<Vec<String>> {
+    let mut child = tokio::process::Command::new("codex")
+        .args(["app-server", "--listen", "stdio://"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| ArgoError::Process(format!("start codex app-server: {error}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ArgoError::Process("codex app-server has no stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ArgoError::Process("codex app-server has no stdout".into()))?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    write_json_line(
+        &mut stdin,
+        serde_json::json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "argo", "title": "Argo", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": null
+            }
+        }),
+    )
+    .await?;
+    let _ = read_json_id(&mut reader, 1).await?;
+    write_json_line(&mut stdin, serde_json::json!({ "method": "initialized" })).await?;
+    write_json_line(
+        &mut stdin,
+        serde_json::json!({ "method": "account/rateLimits/read", "id": 2, "params": null }),
+    )
+    .await?;
+    let response = read_json_id(&mut reader, 2).await?;
+    drop(stdin);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    let result = response
+        .get("result")
+        .ok_or_else(|| ArgoError::Protocol("Codex rate-limit response had no result".into()))?;
+    let limits = result
+        .get("rateLimitsByLimitId")
+        .and_then(|groups| groups.get("codex"))
+        .filter(|value| !value.is_null())
+        .or_else(|| result.get("rateLimits"))
+        .unwrap_or(result);
+    let mut lines = Vec::new();
+    if let Some(plan) = limits.get("planType").and_then(serde_json::Value::as_str) {
+        lines.push(format!("Codex plan: {plan}"));
+    }
+    for (label, key) in [("primary", "primary"), ("secondary", "secondary")] {
+        let Some(window) = limits.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let Some(used) = window
+            .get("usedPercent")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        let remaining = (100.0 - used).clamp(0.0, 100.0);
+        let duration = window
+            .get("windowDurationMins")
+            .and_then(serde_json::Value::as_u64)
+            .map(|minutes| format!(" · {minutes} min window"))
+            .unwrap_or_default();
+        let reset = window
+            .get("resetsAt")
+            .and_then(serde_json::Value::as_i64)
+            .map(|epoch| format!(" · resets at epoch {epoch}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Codex {label}: {remaining:.0}% remaining ({used:.0}% used){duration}{reset}"
+        ));
+    }
+    if let Some(credits) = limits.get("credits").filter(|value| !value.is_null()) {
+        if credits
+            .get("unlimited")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            lines.push("Codex credits: unlimited".into());
+        } else if let Some(balance) = credits.get("balance").and_then(serde_json::Value::as_str) {
+            lines.push(format!("Codex credit balance: {balance}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("Codex returned no rate-limit windows.".into());
+    }
+    Ok(lines)
+}
+
+async fn write_json_line(
+    writer: &mut tokio::process::ChildStdin,
+    value: serde_json::Value,
+) -> Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| ArgoError::Io(format!("write usage request: {error}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| ArgoError::Io(format!("flush usage request: {error}")))
+}
+
+async fn read_json_id(
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    wanted: i64,
+) -> Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let line = tokio::time::timeout_at(deadline, reader.next_line())
+            .await
+            .map_err(|_| ArgoError::Timeout(8_000))?
+            .map_err(|error| ArgoError::Io(format!("read usage response: {error}")))?
+            .ok_or_else(|| ArgoError::Protocol("usage process closed its output".into()))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("id").and_then(serde_json::Value::as_i64) == Some(wanted) {
+            return Ok(value);
+        }
+    }
+}
+
+async fn claude_usage() -> Result<Vec<String>> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("claude")
+            .args([
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| ArgoError::Timeout(15_000))?
+    .map_err(|error| ArgoError::Process(format!("run Claude /usage: {error}")))?;
+    if !output.status.success() {
+        return Err(ArgoError::Process(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let inference_used = value
+        .get("duration_api_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        || value
+            .get("num_turns")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || value
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            > 0.0;
+    if inference_used {
+        return Err(ArgoError::Invalid(
+            "Claude unexpectedly treated /usage as a model turn; result suppressed".into(),
+        ));
+    }
+    let result = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ArgoError::Protocol("Claude /usage returned no result text".into()))?;
+    let mut lines = vec!["Claude account usage (local /usage command):".into()];
+    lines.extend(
+        result
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(30)
+            .map(str::to_string),
+    );
+    Ok(lines)
+}
+
+async fn opencode_local_stats() -> Result<Vec<String>> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        tokio::process::Command::new("opencode")
+            .args(["stats", "--pure", "--days", "30", "--models", "5"])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| ArgoError::Timeout(12_000))?
+    .map_err(|error| ArgoError::Process(format!("run opencode stats: {error}")))?;
+    if !output.status.success() {
+        return Err(ArgoError::Process(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(30)
+        .map(str::to_string)
+        .collect())
+}
+
+async fn kiro_usage() -> Result<Vec<String>> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("kiro-cli")
+            .args(["chat", "--no-interactive", "/usage"])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| ArgoError::Timeout(15_000))?
+    .map_err(|error| ArgoError::Process(format!("run Kiro /usage: {error}")))?;
+    if !output.status.success() {
+        return Err(ArgoError::Process(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let clean = strip_terminal_sequences(&String::from_utf8_lossy(&output.stdout));
+    let lines = useful_usage_lines(&clean, "Kiro");
+    if lines.iter().any(|line| line.contains("Estimated Usage")) {
+        Ok(lines)
+    } else {
+        Err(ArgoError::Protocol(
+            "Kiro /usage returned no usage summary".into(),
+        ))
+    }
+}
+
+/// Runs a slash command inside a real pseudo-terminal so it is handled by the
+/// CLI's local command palette, never by its model-facing print mode.
+async fn interactive_slash_usage(program: &str, args: &[&str], label: &str) -> Result<Vec<String>> {
+    let mut command = tokio::process::Command::new("script");
+    #[cfg(target_os = "macos")]
+    {
+        command.args(["-q", "/dev/null", program]);
+        command.args(args);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let invocation = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        command.args(["-q", "-c", &invocation, "/dev/null"]);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (program, args, label);
+        return Err(ArgoError::Invalid(
+            "interactive /usage capture is currently supported on Unix terminals".into(),
+        ));
+    }
+
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| ArgoError::Process(format!("start {label} /usage: {error}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ArgoError::Process(format!("{label} usage process has no stdin")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ArgoError::Process(format!("{label} usage process has no stdout")))?;
+
+    // The command palette accepts Tab completion before Enter across the two
+    // installed Ink/terminal implementations. Input written before their first
+    // paint is buffered by the PTY.
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    stdin
+        .write_all(b"/usage")
+        .await
+        .map_err(|error| ArgoError::Io(format!("write {label} /usage: {error}")))?;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    stdin
+        .write_all(b"\t")
+        .await
+        .map_err(|error| ArgoError::Io(format!("complete {label} /usage: {error}")))?;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    stdin
+        .write_all(b"\r")
+        .await
+        .map_err(|error| ArgoError::Io(format!("submit {label} /usage: {error}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| ArgoError::Io(format!("flush {label} /usage: {error}")))?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    let mut raw = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = tokio::time::timeout_at(deadline, stdout.read(&mut buffer))
+            .await
+            .map_err(|_| ArgoError::Timeout(25_000))?
+            .map_err(|error| ArgoError::Io(format!("read {label} /usage: {error}")))?;
+        if count == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..count]);
+        if raw.len() > 256 * 1024 {
+            return Err(ArgoError::Invalid(format!(
+                "{label} /usage output exceeded 256 KiB"
+            )));
+        }
+        let clean = strip_terminal_sequences(&String::from_utf8_lossy(&raw));
+        let lower = clean.to_ascii_lowercase();
+        if lower.contains("usage limits")
+            || (lower.contains("usage")
+                && lower.contains("plan")
+                && (lower.contains("used") || lower.contains("remaining")))
+        {
+            drop(stdin);
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Ok(useful_usage_lines(&clean, label));
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    Err(ArgoError::Protocol(format!(
+        "{label} local /usage overlay returned no usage summary"
+    )))
+}
+
+fn useful_usage_lines(text: &str, label: &str) -> Vec<String> {
+    let mut lines = vec![format!("{label} account usage (local /usage command):")];
+    let mut seen = std::collections::HashSet::new();
+    let relevant = text
+        .rfind("\n USAGE")
+        .or_else(|| text.rfind("Estimated Usage"))
+        .map(|index| &text[index..])
+        .unwrap_or(text);
+    for line in relevant.lines() {
+        let line = line.trim().trim_matches('\0');
+        if line.is_empty()
+            || line.eq_ignore_ascii_case("press esc to close")
+            || line.eq_ignore_ascii_case("loading…")
+            || line.starts_with('❯')
+            || line.contains("Ask your question")
+        {
+            continue;
+        }
+        if seen.insert(line.to_string()) {
+            lines.push(line.to_string());
+        }
+        if lines.len() >= 30 {
+            break;
+        }
+    }
+    lines
+}
+
+fn strip_terminal_sequences(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            if index >= bytes.len() {
+                break;
+            }
+            match bytes[index] {
+                b'[' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        if bytes[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if bytes[index] == 0x1b && bytes.get(index + 1).copied() == Some(b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => index += 1,
+            }
+            continue;
+        }
+        match bytes[index] {
+            b'\r' => output.push('\n'),
+            b'\n' | b'\t' => output.push(bytes[index] as char),
+            byte if byte >= 0x20 => {
+                let rest = &input[index..];
+                let Some(ch) = rest.chars().next() else { break };
+                output.push(ch);
+                index += ch.len_utf8();
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    output
+}
+
+async fn run_mcp_command(
+    app: &mut App,
+    paths: &ArgoPaths,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
+    action: commands::McpCommand,
+) -> Result<()> {
+    let registry_path = paths.root().join("mcp.json");
+    match action {
+        commands::McpCommand::List => {
+            let registry = argo_resources::McpRegistry::load(&registry_path)?;
+            if registry.servers.is_empty() {
+                app.open_text(
+                    "mcp servers",
+                    vec![
+                        "No MCP servers configured.".into(),
+                        format!("Registry: {}", registry_path.display()),
+                        "Run /mcp add for guided local, remote, auth, or import setup.".into(),
+                    ],
+                );
+                return Ok(());
+            }
+            let token_path = argo_resources::oauth::token_store_path(paths.root());
+            let tokens = argo_resources::oauth::TokenStore::load(&token_path)?;
+            let mut lines = vec![
+                "Commands: /mcp add · check [name] · reconnect · reauth · logout · delete".into(),
+                String::new(),
+            ];
+            for server in &registry.servers {
+                let auth = if tokens.tokens.contains_key(&server.name) {
+                    "authenticated"
+                } else {
+                    "no Argo token"
+                };
+                let transport = match &server.transport {
+                    argo_resources::McpTransport::Local { command, .. } => {
+                        format!("local · {}", command.join(" "))
+                    }
+                    argo_resources::McpTransport::Remote { url, .. } => {
+                        format!("remote · {url} · {auth}")
+                    }
+                };
+                lines.push(format!(
+                    "{:<20} {:<8} {transport}",
+                    server.name,
+                    if server.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ));
+            }
+            app.open_text("mcp servers", lines);
+        }
+        commands::McpCommand::Add => {
+            app.mcp_draft = Some(McpDraft::default());
+            app.open_input(
+                "add MCP server · 1/3",
+                "Unique server name (used as the tool prefix)",
+                false,
+                InputAction::McpAddName,
+            );
+        }
+        commands::McpCommand::Check(name) => {
+            let lines = check_mcp_servers(paths, name.as_deref()).await?;
+            app.open_text("mcp connection check", lines);
+        }
+        commands::McpCommand::Reconnect(name) => {
+            let mut lines = vec![
+                "Argo creates MCP connections per agent turn; no stale shared socket is retained."
+                    .into(),
+                "The server was re-checked and the next turn will receive the current configuration."
+                    .into(),
+                String::new(),
+            ];
+            lines.extend(check_mcp_servers(paths, Some(&name)).await?);
+            app.open_text("mcp reconnect", lines);
+        }
+        commands::McpCommand::Login(name) => {
+            start_mcp_login(app, paths, auth_tx, &name)?;
+        }
+        commands::McpCommand::Logout(name) => {
+            let token_path = argo_resources::oauth::token_store_path(paths.root());
+            let mut tokens = argo_resources::oauth::TokenStore::load(&token_path)?;
+            let removed = tokens.tokens.remove(&name).is_some();
+            tokens.save(&token_path)?;
+            app.set_status(if removed {
+                format!("forgot MCP credentials for {name}")
+            } else {
+                format!("no stored MCP credentials for {name}")
+            });
+        }
+        commands::McpCommand::Remove(name) => {
+            let mut registry = argo_resources::McpRegistry::load(&registry_path)?;
+            if !registry.remove(&name) {
+                app.report_error(format!("MCP server not found: {name}"));
+                return Ok(());
+            }
+            registry.save(&registry_path)?;
+            let token_path = argo_resources::oauth::token_store_path(paths.root());
+            let mut tokens = argo_resources::oauth::TokenStore::load(&token_path)?;
+            tokens.tokens.remove(&name);
+            tokens.save(&token_path)?;
+            app.push(
+                LineKind::Notice,
+                format!("deleted MCP server '{name}' and its Argo credentials"),
+            );
+            app.set_status(format!("deleted MCP server {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_mcp_input(
+    app: &mut App,
+    paths: &ArgoPaths,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
+    action: InputAction,
+    value: String,
+) -> Result<()> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        app.report_error("this MCP setup field cannot be empty");
+        return Ok(());
+    }
+    match action {
+        InputAction::McpAddName => {
+            if !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            {
+                app.report_error("MCP names may contain letters, numbers, '-' and '_' only");
+                return Ok(());
+            }
+            app.mcp_draft.get_or_insert_with(McpDraft::default).name = value;
+            app.open_picker(
+                "add MCP server · transport",
+                vec![
+                    "Remote HTTP/SSE endpoint".into(),
+                    "Local stdio command".into(),
+                    "Import from another CLI config".into(),
+                ],
+                vec!["remote".into(), "local".into(), "import".into()],
+                PickerAction::McpAddTransport,
+            );
+        }
+        InputAction::McpRemoteUrl => {
+            if !is_safe_web_url(&value) {
+                app.report_error("remote MCP endpoint must be a valid http:// or https:// URL");
+                return Ok(());
+            }
+            app.mcp_draft.get_or_insert_with(McpDraft::default).url = Some(value);
+            open_mcp_auth_picker(app);
+        }
+        InputAction::McpLocalCommand => {
+            let Some(command) = shlex::split(&value).filter(|parts| !parts.is_empty()) else {
+                app.report_error("local MCP command has invalid or unmatched shell quoting");
+                return Ok(());
+            };
+            app.mcp_draft.get_or_insert_with(McpDraft::default).command = command;
+            open_mcp_local_config_picker(app);
+        }
+        InputAction::McpBearerToken => {
+            let name = save_mcp_draft(app, paths)?;
+            let token_path = argo_resources::oauth::token_store_path(paths.root());
+            let mut tokens = argo_resources::oauth::TokenStore::load(&token_path)?;
+            tokens.tokens.insert(
+                name.clone(),
+                argo_resources::oauth::StoredToken {
+                    access_token: value,
+                    refresh_token: None,
+                    expires_at: None,
+                    client_id: "manual-bearer-token".into(),
+                    token_endpoint: String::new(),
+                },
+            );
+            tokens.save(&token_path)?;
+            app.set_status(format!("added and authenticated MCP server {name}"));
+        }
+        InputAction::McpHeaderName => {
+            app.mcp_draft
+                .get_or_insert_with(McpDraft::default)
+                .pending_key = Some(value);
+            app.open_input(
+                "add MCP server · header authentication",
+                "Environment variable containing the header value (the secret is not stored)",
+                false,
+                InputAction::McpHeaderEnv,
+            );
+        }
+        InputAction::McpHeaderEnv => {
+            let draft = app.mcp_draft.get_or_insert_with(McpDraft::default);
+            let Some(key) = draft.pending_key.take() else {
+                app.report_error("missing header name; restart /mcp add");
+                return Ok(());
+            };
+            draft.headers.push((key, format!("{{env:{value}}}")));
+            let name = save_mcp_draft(app, paths)?;
+            app.set_status(format!(
+                "added MCP server {name} with environment-backed header"
+            ));
+        }
+        InputAction::McpLocalEnvName => {
+            app.mcp_draft
+                .get_or_insert_with(McpDraft::default)
+                .pending_key = Some(value);
+            app.open_input(
+                "add local MCP · environment",
+                "Source environment variable (its current value is not stored)",
+                false,
+                InputAction::McpLocalEnvSource,
+            );
+        }
+        InputAction::McpLocalEnvSource => {
+            let draft = app.mcp_draft.get_or_insert_with(McpDraft::default);
+            let Some(key) = draft.pending_key.take() else {
+                app.report_error("missing environment key; restart /mcp add");
+                return Ok(());
+            };
+            draft.environment.push((key, format!("{{env:{value}}}")));
+            open_mcp_local_config_picker(app);
+        }
+    }
+    let _ = auth_tx;
+    Ok(())
+}
+
+fn open_mcp_auth_picker(app: &mut App) {
+    app.open_picker(
+        "add remote MCP · authentication",
+        vec![
+            "No authentication".into(),
+            "OAuth 2.1 · browser + fallback link".into(),
+            "Bearer token · paste securely".into(),
+            "Custom header · value from environment".into(),
+        ],
+        vec![
+            "none".into(),
+            "oauth".into(),
+            "bearer".into(),
+            "header".into(),
+        ],
+        PickerAction::McpAddAuth,
+    );
+}
+
+fn open_mcp_local_config_picker(app: &mut App) {
+    app.open_picker(
+        "add local MCP · configuration",
+        vec![
+            "Save and enable server".into(),
+            "Add environment-variable mapping".into(),
+        ],
+        vec!["save".into(), "env".into()],
+        PickerAction::McpLocalConfig,
+    );
+}
+
+fn save_mcp_draft(app: &mut App, paths: &ArgoPaths) -> Result<String> {
+    let Some(draft) = app.mcp_draft.take() else {
+        return Err(ArgoError::Invalid(
+            "MCP setup expired; run /mcp add again".into(),
+        ));
+    };
+    let transport = if let Some(url) = draft.url {
+        argo_resources::McpTransport::Remote {
+            url,
+            headers: draft.headers,
+        }
+    } else if !draft.command.is_empty() {
+        argo_resources::McpTransport::Local {
+            command: draft.command,
+            environment: draft.environment,
+        }
+    } else {
+        return Err(ArgoError::Invalid("MCP transport is incomplete".into()));
+    };
+    let server = argo_resources::McpServer {
+        name: draft.name.clone(),
+        transport,
+        enabled: true,
+    };
+    let path = paths.root().join("mcp.json");
+    let mut registry = argo_resources::McpRegistry::load(&path)?;
+    registry.upsert(server)?;
+    registry.save(&path)?;
+    app.push(
+        LineKind::Notice,
+        format!(
+            "· added MCP server '{}' for every supported CLI",
+            draft.name
+        ),
+    );
+    Ok(draft.name)
+}
+
+fn start_mcp_login(
+    app: &mut App,
+    paths: &ArgoPaths,
+    auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
+    name: &str,
+) -> Result<()> {
+    let registry = argo_resources::McpRegistry::load(&paths.root().join("mcp.json"))?;
+    let server = registry
+        .servers
+        .iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| ArgoError::not_found("mcp server", name))?;
+    let url = match &server.transport {
+        argo_resources::McpTransport::Remote { url, .. } => url.clone(),
+        argo_resources::McpTransport::Local { .. } => {
+            app.report_error(format!("'{name}' is local and does not use OAuth"));
+            return Ok(());
+        }
+    };
+    let owned_name = name.to_string();
+    let token_path = argo_resources::oauth::token_store_path(paths.root());
+    let sender = auth_tx.clone();
+    let task_name = owned_name.clone();
+    tokio::task::spawn_blocking(move || {
+        let progress_name = task_name.clone();
+        let progress_sender = sender.clone();
+        let mut announce = move |message: &str| {
+            let _ = progress_sender.send(McpAuthEvent::Progress {
+                name: progress_name.clone(),
+                message: message.to_string(),
+            });
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = sender.send(McpAuthEvent::Failed {
+                    name: task_name,
+                    message: format!("start OAuth runtime: {error}"),
+                });
+                return;
+            }
+        };
+        match runtime.block_on(argo_resources::oauth::login(
+            &task_name,
+            &url,
+            &token_path,
+            &mut announce,
+        )) {
+            Ok(()) => {
+                let _ = sender.send(McpAuthEvent::Complete { name: task_name });
+            }
+            Err(error) => {
+                let _ = sender.send(McpAuthEvent::Failed {
+                    name: task_name,
+                    message: error.to_string(),
+                });
+            }
+        }
+    });
+    app.open_text(
+        "mcp authentication",
+        vec![
+            format!("Reauthentication started for '{owned_name}'."),
+            "Discovering OAuth metadata…".into(),
+            "The exact authorization link will appear here; click it or drag-copy it if the browser does not open.".into(),
+            String::new(),
+            "Esc closes this pane; login continues in the background.".into(),
+        ],
+    );
+    Ok(())
+}
+
+async fn check_mcp_servers(paths: &ArgoPaths, only: Option<&str>) -> Result<Vec<String>> {
+    let registry = argo_resources::McpRegistry::load(&paths.root().join("mcp.json"))?;
+    let selected: Vec<_> = registry
+        .servers
+        .iter()
+        .filter(|server| only.is_none_or(|name| server.name == name))
+        .collect();
+    if selected.is_empty() {
+        return if let Some(name) = only {
+            Err(ArgoError::not_found("mcp server", name))
+        } else {
+            Ok(vec!["No MCP servers configured.".into()])
+        };
+    }
+
+    let mut lines = Vec::new();
+    for server in selected {
+        let verdict = match &server.transport {
+            argo_resources::McpTransport::Local { command, .. } => {
+                let binary = command.first().map(String::as_str).unwrap_or_default();
+                if binary_on_path(binary) {
+                    format!("ok · local executable {binary}")
+                } else {
+                    format!("not found · {binary} is not on PATH")
+                }
+            }
+            argo_resources::McpTransport::Remote { url, headers } => {
+                let authorized = argo_resources::oauth::stored_access_token(
+                    &server.name,
+                    &argo_resources::oauth::token_store_path(paths.root()),
+                )
+                .map(|(token, _)| argo_resources::with_bearer_token(server, &token))
+                .unwrap_or_else(|| (*server).clone());
+                let effective_headers = match authorized.transport {
+                    argo_resources::McpTransport::Remote { headers, .. } => headers,
+                    _ => headers.clone(),
+                };
+                match probe_remote_mcp(url, &effective_headers).await {
+                    Some(code) if (200..300).contains(&code) => format!("ok · HTTP {code}"),
+                    Some(401 | 403) => "authentication required · use /mcp reauth".into(),
+                    Some(code) => format!("HTTP {code}"),
+                    None => "unreachable".into(),
+                }
+            }
+        };
+        lines.push(format!("{:<20} {verdict}", server.name));
+    }
+    Ok(lines)
+}
+
+fn binary_on_path(binary: &str) -> bool {
+    if binary.contains('/') {
+        return std::path::Path::new(binary).is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
+}
+
+async fn probe_remote_mcp(url: &str, headers: &[(String, String)]) -> Option<u16> {
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"argo-tui","version":"0.1.0"}}}"#;
+    let mut command = tokio::process::Command::new("curl");
+    command
+        .args(["-sS", "-m", "12", "-o", "/dev/null", "-w", "%{http_code}"])
+        .args(["-X", "POST", url])
+        .args(["-H", "Content-Type: application/json"])
+        .args(["-H", "Accept: application/json, text/event-stream"])
+        .args(["-d", INIT]);
+    for (name, value) in headers {
+        command.args(["-H", &format!("{name}: {value}")]);
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Deep-probes only the adapter whose live choices the user requested.
+async fn probe_agent(
+    connection: &mut Connection,
+    app: &mut App,
+    agent_id: &str,
+    refresh: bool,
+) -> Result<Option<argo_runtime::AgentInfo>> {
+    match connection
+        .request(Request::ProbeAgent {
+            agent_id: agent_id.to_string(),
+            refresh,
+        })
+        .await?
+    {
+        Response::Agent { agent } => {
+            app.update_agent(agent.clone());
+            Ok(Some(agent))
+        }
+        Response::Error { message, .. } => {
+            app.report_error(message);
+            Ok(None)
+        }
+        other => {
+            app.report_error(format!("unexpected probe reply: {other:?}"));
+            Ok(None)
+        }
     }
 }
 
@@ -1387,9 +3137,21 @@ async fn select(
     app: &mut App,
     change: argo_core::session::SelectionChange,
 ) -> Result<()> {
+    select_with_visibility(connection, app, change, true)
+        .await
+        .map(|_| ())
+}
+
+/// Applies a selection, optionally keeping the empty launch screen pristine.
+async fn select_with_visibility(
+    connection: &mut Connection,
+    app: &mut App,
+    change: argo_core::session::SelectionChange,
+    announce: bool,
+) -> Result<bool> {
     let Some(conversation) = app.conversation.as_ref().map(|c| c.id.clone()) else {
         app.report_error("no conversation is open");
-        return Ok(());
+        return Ok(false);
     };
     match connection
         .request(Request::Select {
@@ -1411,17 +3173,25 @@ async fn select(
                     .unwrap_or_else(|| "default".into())
             );
             app.set_conversation_summary(summary);
-            // Selections apply at the next turn, never to a running child.
-            app.push(
-                LineKind::Notice,
-                format!("· {label} — applies to your next message"),
-            );
+            if announce {
+                // Selections apply at the next turn, never to a running child.
+                app.push(
+                    LineKind::Notice,
+                    format!("· {label} — applies to your next message"),
+                );
+            }
             app.set_status(format!("switched to {label}"));
+            Ok(true)
         }
-        Response::Error { message, .. } => app.report_error(message),
-        other => app.report_error(format!("unexpected reply: {other:?}")),
+        Response::Error { message, .. } => {
+            app.report_error(message);
+            Ok(false)
+        }
+        other => {
+            app.report_error(format!("unexpected reply: {other:?}"));
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 /// Cancels the running turn.
@@ -1452,9 +3222,40 @@ async fn new_conversation(
         .await?
     {
         Response::Conversation { summary, .. } => {
-            app.lines.clear();
+            app.replace_transcript(Vec::new());
             app.set_conversation_summary(summary);
-            app.set_status("new conversation");
+            if let Some(configured) = app.default_selection.clone() {
+                let available = app
+                    .agents
+                    .iter()
+                    .any(|agent| agent.available && agent.id == configured.agent);
+                if available
+                    && select_with_visibility(
+                        connection,
+                        app,
+                        argo_core::session::SelectionChange {
+                            agent_id: Some(argo_core::AgentId::new(configured.agent.clone())),
+                            model: Some(configured.model.clone()),
+                            reasoning: configured.effort.clone(),
+                        },
+                        false,
+                    )
+                    .await?
+                {
+                    app.set_status(format!(
+                        "default selected · {} · /agent to change",
+                        configured.label()
+                    ));
+                } else {
+                    app.default_selection = None;
+                    app.set_status("saved default is unavailable · choose a CLI");
+                    open_agent_picker(app, "choose a coding CLI", PickerAction::StartupAgent);
+                }
+            } else if app.agents.iter().any(|agent| agent.available) {
+                open_agent_picker(app, "choose a coding CLI", PickerAction::StartupAgent);
+            } else {
+                app.set_status("new conversation · no coding CLI detected");
+            }
         }
         Response::Error { message, .. } => app.report_error(message),
         other => app.report_error(format!("unexpected reply: {other:?}")),
@@ -1475,9 +3276,73 @@ async fn load_conversation(
         .await?
     {
         Response::Conversation { summary, messages } => {
+            if let Some(workspace) = &summary.workspace {
+                app.workspace = workspace.clone();
+            }
             app.replace_transcript(messages);
+            // When viewing a child, surface its parent for easy navigation.
+            if let Some(ref parent_id) = summary.parent_conversation_id {
+                app.push(
+                    LineKind::Notice,
+                    format!("↑ child of parent conversation — /open {parent_id} to return"),
+                );
+            }
             app.set_conversation_summary(summary);
             app.set_status("loaded conversation");
+        }
+        Response::Error { message, .. } => app.report_error(message),
+        other => app.report_error(format!("unexpected reply: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Opens a delegated chat as a snapshot over the parent conversation.
+///
+/// Keeping the parent's live state in place is important: switching the active
+/// transcript while its run is streaming would otherwise render parent deltas in
+/// the child's chat. Closing this pane therefore needs no reconnect or reload.
+async fn open_child_conversation(
+    connection: &mut Connection,
+    app: &mut App,
+    id: &ConversationId,
+) -> Result<()> {
+    match connection
+        .request(Request::GetConversation {
+            conversation_id: id.clone(),
+        })
+        .await?
+    {
+        Response::Conversation { summary, messages } => {
+            let agent = summary.selected_agent_id.as_deref().unwrap_or("subagent");
+            let model = summary.selected_model.as_deref().unwrap_or("default");
+            let mut lines = vec![
+                format!("{agent}/{model} · {} messages", summary.message_count),
+                "Snapshot view · close and reopen to refresh live progress.".into(),
+                String::new(),
+            ];
+            for message in messages {
+                let label = match message.role.as_str() {
+                    "user" => "You".to_string(),
+                    "assistant" => format!(
+                        "{} / {}",
+                        message.agent_id.as_deref().unwrap_or(agent),
+                        message.model.as_deref().unwrap_or(model)
+                    ),
+                    role => role.to_string(),
+                };
+                lines.push(label);
+                if message.text.trim().is_empty() {
+                    lines.push("(no text output)".into());
+                } else {
+                    lines.extend(message.text.lines().map(str::to_string));
+                }
+                lines.push(String::new());
+            }
+            let title = summary.title.as_deref().unwrap_or("subagent conversation");
+            app.open_text(
+                format!("{title} · Esc/Enter back to parent · agents keep running"),
+                lines,
+            );
         }
         Response::Error { message, .. } => app.report_error(message),
         other => app.report_error(format!("unexpected reply: {other:?}")),
@@ -1606,8 +3471,13 @@ struct Connection {
 impl Connection {
     /// Connects and completes the handshake, starting the daemon if needed.
     async fn connect(paths: &ArgoPaths) -> Result<Self> {
-        if let Ok(connection) = Self::connect_to(&paths.socket()).await {
-            return Ok(connection);
+        match Self::connect_to(&paths.socket()).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                if let Some(protocol) = argo_daemon::mismatched_daemon_protocol(&error) {
+                    argo_daemon::stop_older_daemon(paths, protocol, "argo-tui").await?;
+                }
+            }
         }
         // The TUI is often the user's first command, so start the daemon rather
         // than telling them to run something else first.
@@ -1731,17 +3601,19 @@ mod tests {
     }
 
     #[test]
-    fn minimal_wheel_reporting_omits_motion_tracking() {
+    fn combined_mouse_reporting_includes_button_drag_and_sgr_coordinates() {
         let mut output = Vec::new();
         set_mouse_wheel_reporting(&mut output, true).expect("enable wheel");
         set_mouse_wheel_reporting(&mut output, false).expect("disable wheel");
         let output = String::from_utf8(output).expect("terminal output");
 
         assert!(output.contains("\x1b[?1000h"), "{output:?}");
+        assert!(output.contains("\x1b[?1002h"), "{output:?}");
         assert!(output.contains("\x1b[?1006h"), "{output:?}");
         assert!(output.contains("\x1b[?1006l"), "{output:?}");
+        assert!(output.contains("\x1b[?1002l"), "{output:?}");
         assert!(output.contains("\x1b[?1000l"), "{output:?}");
-        for invasive in ["\x1b[?1002h", "\x1b[?1003h", "\x1b[?1015h"] {
+        for invasive in ["\x1b[?1003h", "\x1b[?1015h"] {
             assert!(!output.contains(invasive), "{output:?}");
         }
     }
@@ -1752,10 +3624,63 @@ mod tests {
         let mut output = Vec::new();
         set_mouse_scroll_mode(&mut output, &mut app, true).expect("wheel mode");
         assert!(app.mouse_scroll_mode);
-        assert!(app.status.contains("F2 returns"));
+        assert!(app.status.contains("drag selects"));
         set_mouse_scroll_mode(&mut output, &mut app, false).expect("selection mode");
         assert!(!app.mouse_scroll_mode);
-        assert!(app.status.contains("selection mode"));
+        assert!(app.status.contains("native selection"));
+    }
+
+    #[test]
+    fn visible_drag_selection_preserves_rows_for_clipboard_copy() {
+        let screen = ScreenSnapshot {
+            area: ratatui::layout::Rect::new(0, 0, 8, 2),
+            cells: vec![
+                "hello   ".chars().map(|ch| ch.to_string()).collect(),
+                "world   ".chars().map(|ch| ch.to_string()).collect(),
+            ],
+        };
+        let selection = MouseSelection {
+            anchor: ScreenPoint { column: 1, row: 0 },
+            focus: ScreenPoint { column: 3, row: 1 },
+            dragging: false,
+        };
+
+        assert_eq!(
+            screen.selected_text(selection).as_deref(),
+            Some("ello\nworl")
+        );
+    }
+
+    #[test]
+    fn terminal_usage_output_is_cleaned_and_reduced_to_the_usage_panel() {
+        let raw = "\x1b[2Jstartup screen\r\n\x1b[1m USAGE  Pro Plan\x1b[0m\r\n20% used\r\nUsage limits\r\nWeekly 80% remaining\r\nPress Esc to close\r\n";
+        let clean = strip_terminal_sequences(raw);
+        let lines = useful_usage_lines(&clean, "Command Code");
+        assert!(
+            lines.iter().any(|line| line.contains("Pro Plan")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("80% remaining")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("startup screen")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("Press Esc")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn kiro_native_usage_panel_is_recognized() {
+        let raw = "\x1b[1mEstimated Usage\x1b[0m | resets on 2026-09-01 | KIRO POWER\nCredits (285.33 of 10000 covered in plan)\n2%\nTip: to see context window usage, run /context\n";
+        let clean = strip_terminal_sequences(raw);
+        let lines = useful_usage_lines(&clean, "Kiro");
+        assert!(lines.iter().any(|line| line.contains("Estimated Usage")));
+        assert!(lines.iter().any(|line| line.contains("Credits")));
     }
 
     #[test]
@@ -1782,6 +3707,53 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_recognizes_legacy_and_enhanced_terminal_encodings() {
+        use crossterm::event::KeyEvent;
+
+        assert!(is_mode_cycle_key(&KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+        )));
+        assert!(is_mode_cycle_key(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(is_mode_cycle_key(&KeyEvent::new(
+            KeyCode::Char('\t'),
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!is_mode_cycle_key(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn multiline_enter_recovers_shift_when_the_terminal_drops_it() {
+        use crossterm::event::KeyEvent;
+
+        let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!is_multiline_enter_with_native_shift(&plain, false));
+        assert!(is_multiline_enter_with_native_shift(&plain, true));
+        assert!(is_multiline_enter_with_native_shift(
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            false,
+        ));
+        assert!(is_multiline_enter_with_native_shift(
+            &KeyEvent::new(KeyCode::Char('\r'), KeyModifiers::SHIFT),
+            false,
+        ));
+        assert!(is_multiline_enter_with_native_shift(
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            false,
+        ));
+        assert!(!is_multiline_enter_with_native_shift(
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SHIFT),
+            true,
+        ));
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_and_link_clicks_resolve_safe_destinations() {
         use crossterm::event::MouseButton;
 
@@ -1800,16 +3772,37 @@ mod tests {
             text: "https://example.com".into(),
             url: "https://example.com/report".into(),
         }];
+        let screen = ScreenSnapshot::default();
 
-        assert!(handle_mouse(event(MouseEventKind::ScrollUp, 1, 1), &mut app, &links).is_none());
+        assert!(handle_mouse(
+            event(MouseEventKind::ScrollUp, 1, 1),
+            &mut app,
+            &links,
+            &screen
+        )
+        .is_none());
         assert_eq!(app.scroll_back, 13);
-        assert!(handle_mouse(event(MouseEventKind::ScrollDown, 1, 1), &mut app, &links).is_none());
+        assert!(handle_mouse(
+            event(MouseEventKind::ScrollDown, 1, 1),
+            &mut app,
+            &links,
+            &screen
+        )
+        .is_none());
         assert_eq!(app.scroll_back, 10);
+        assert!(handle_mouse(
+            event(MouseEventKind::Down(MouseButton::Left), 8, 7),
+            &mut app,
+            &links,
+            &screen,
+        )
+        .is_none());
         assert_eq!(
             handle_mouse(
-                event(MouseEventKind::Down(MouseButton::Left), 8, 7),
+                event(MouseEventKind::Up(MouseButton::Left), 8, 7),
                 &mut app,
                 &links,
+                &screen,
             )
             .as_deref(),
             Some("https://example.com/report")
@@ -1818,6 +3811,7 @@ mod tests {
             event(MouseEventKind::Down(MouseButton::Left), 3, 7),
             &mut app,
             &links,
+            &screen,
         )
         .is_none());
     }

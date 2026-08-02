@@ -1,13 +1,15 @@
-//! Deterministic conversation titles.
+//! Deterministic conversation titles and descriptions.
 //!
-//! A title is metadata, not something worth another paid model call. The first
-//! user request is already the best description of the session; this module turns
-//! its first meaningful line into a compact stable label shared by daemon and TUI.
+//! A title is metadata, not something worth another paid model call. The latest
+//! user request identifies the current focus, while a short description
+//! retains where the conversation began. Metadata stays useful as a long chat
+//! evolves without spending another model call.
 
 /// Maximum title length in terminal columns/Unicode scalar values.
 const MAX_TITLE_CHARS: usize = 72;
+const MAX_DESCRIPTION_CHARS: usize = 240;
 
-/// Derives a compact title from the first user request.
+/// Derives a compact title from the latest user request.
 pub fn conversation_title(prompt: &str) -> String {
     let first = prompt
         .lines()
@@ -44,6 +46,60 @@ pub fn conversation_title(prompt: &str) -> String {
         prefix.trim_end()
     };
     format!("{kept}…")
+}
+
+/// Describes the arc from the first request to the latest request.
+pub fn conversation_description(prompts: &[String]) -> String {
+    let meaningful = prompts
+        .iter()
+        .map(|prompt| compact_prompt(prompt))
+        .filter(|prompt| !prompt.is_empty())
+        .collect::<Vec<_>>();
+    let Some(current) = meaningful.last() else {
+        return String::new();
+    };
+    if meaningful.len() == 1 {
+        return truncate(current, MAX_DESCRIPTION_CHARS);
+    }
+    let started = meaningful.first().unwrap_or(current);
+    if started == current {
+        return truncate(current, MAX_DESCRIPTION_CHARS);
+    }
+    truncate(
+        &format!(
+            "Started with: {}. Current focus: {}",
+            truncate(started, 88).trim_end_matches(['.', '…']),
+            current
+        ),
+        MAX_DESCRIPTION_CHARS,
+    )
+}
+
+fn compact_prompt(prompt: &str) -> String {
+    prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("```"))
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(max.saturating_sub(1)).collect();
+    let boundary = prefix.rfind(char::is_whitespace).unwrap_or(prefix.len());
+    let kept = if boundary >= max / 2 {
+        &prefix[..boundary]
+    } else {
+        prefix.as_str()
+    };
+    format!("{}…", kept.trim_end())
 }
 
 #[cfg(test)]
@@ -83,5 +139,23 @@ mod tests {
     #[test]
     fn blank_prompts_have_a_stable_fallback() {
         assert_eq!(conversation_title(" \n```"), "New conversation");
+    }
+
+    #[test]
+    fn description_tracks_the_start_and_current_focus() {
+        let prompts = vec![
+            "Build the authentication screen".to_string(),
+            "Now fix keyboard navigation and add tests".to_string(),
+        ];
+        let description = conversation_description(&prompts);
+        assert!(description.contains("Started with: Build the authentication screen"));
+        assert!(description.contains("Current focus: Now fix keyboard navigation"));
+    }
+
+    #[test]
+    fn descriptions_are_bounded() {
+        let description = conversation_description(&["word ".repeat(200)]);
+        assert!(description.chars().count() <= MAX_DESCRIPTION_CHARS);
+        assert!(description.ends_with('…'));
     }
 }

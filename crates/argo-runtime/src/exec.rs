@@ -331,15 +331,20 @@ async fn drive_acp(
         request.mcp_servers.clone(),
     );
 
-    // Kick off the handshake.
-    write_action(&mut stdin, session.start()).await?;
+    // Kick off the handshake. A short-lived or misconfigured ACP executable can
+    // exit before this write reaches its stdin. Treat that as a terminal agent
+    // failure so its stderr is preserved instead of leaking a racy Broken pipe.
+    let mut transport_error = write_action(&mut stdin, session.start())
+        .await
+        .err()
+        .map(|error| error.to_string());
 
     let mut reader = BufReader::new(stdout).lines();
     let deadline = request
         .timeout_ms
         .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
 
-    loop {
+    while transport_error.is_none() {
         let next_line = reader.next_line();
         let line = tokio::select! {
             biased;
@@ -369,7 +374,10 @@ async fn drive_acp(
         let Some(line) = line else { break };
 
         let action = session.handle_line(&line, sink);
-        write_action(&mut stdin, action).await?;
+        if let Err(error) = write_action(&mut stdin, action).await {
+            transport_error = Some(error.to_string());
+            break;
+        }
 
         if session.is_done() {
             break;
@@ -387,10 +395,12 @@ async fn drive_acp(
     let session_id = session.session_id().map(|s| s.to_string());
     let outcome = session.outcome().cloned().unwrap_or_else(|| {
         // The transport closed without a prompt response: the agent died mid-turn.
-        TerminalOutcome::failed(if stderr_text.trim().is_empty() {
-            "the ACP agent exited before completing the turn".to_string()
-        } else {
+        TerminalOutcome::failed(if !stderr_text.trim().is_empty() {
             crate::stream::truncate(stderr_text.trim(), 500)
+        } else if let Some(error) = transport_error {
+            error
+        } else {
+            "the ACP agent exited before completing the turn".to_string()
         })
     });
 

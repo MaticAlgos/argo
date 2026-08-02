@@ -4,11 +4,61 @@
 //! behavior — composer editing, streaming assembly, picker navigation — is
 //! testable without a terminal attached.
 
+use crate::preferences::DefaultSelection;
 use argo_core::event::{RunEventKind, RunStatus};
 use argo_core::ids::{ConversationId, RunId};
 use argo_core::message::{ContentBlock, ToolStatus};
 use argo_daemon::protocol::{ConversationSummary, MessageView};
 use argo_runtime::AgentInfo;
+
+/// Honest, compact capability text for an agent picker row.
+///
+/// Lightweight startup detection intentionally does not launch every CLI. Until
+/// a deep probe succeeds, the listed model values are adapter-maintained presets,
+/// not a live inventory, and the UI must not describe them as discovered models.
+pub fn agent_capability_summary(info: &AgentInfo) -> String {
+    let model_count = info
+        .models
+        .iter()
+        .filter(|model| model.id != argo_runtime::DEFAULT_MODEL_ID)
+        .count();
+    let models = if info.models_live {
+        format!(
+            "{model_count} live model{}",
+            if model_count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{model_count} model preset{}",
+            if model_count == 1 { "" } else { "s" }
+        )
+    };
+    let session = if info.capabilities.native_resume {
+        "native resume"
+    } else {
+        "context replay"
+    };
+    let delegation = if info.capabilities.delegates_via_mcp() {
+        "Argo MCP delegation"
+    } else {
+        "Argo command delegation"
+    };
+    format!("{models} · {session} · {delegation}")
+}
+
+/// Includes a probed CLI version without hiding its actual Argo capabilities.
+pub fn agent_picker_detail(info: &AgentInfo) -> String {
+    let capabilities = agent_capability_summary(info);
+    match info
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(version) => format!("{version} · {capabilities}"),
+        None => capabilities,
+    }
+}
 
 /// A rendered transcript line.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +67,13 @@ pub struct Line {
     pub kind: LineKind,
     /// Text content.
     pub text: String,
+}
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    input: String,
+    cursor: usize,
+    multiline_paste: bool,
 }
 
 /// Classification used for styling.
@@ -82,11 +139,60 @@ pub enum Overlay {
         /// First visible line.
         scroll: usize,
     },
+    /// A one-field guided form, optionally masked for credentials.
+    Input {
+        /// Form title.
+        title: String,
+        /// Label describing the expected value.
+        prompt: String,
+        /// Current field contents.
+        value: String,
+        /// Whether the field must be rendered as bullets.
+        secret: bool,
+        /// Continuation invoked when Enter is pressed.
+        action: InputAction,
+    },
+}
+
+/// Continuation for a guided input field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    McpAddName,
+    McpRemoteUrl,
+    McpLocalCommand,
+    McpBearerToken,
+    McpHeaderName,
+    McpHeaderEnv,
+    McpLocalEnvName,
+    McpLocalEnvSource,
+}
+
+/// In-progress MCP server created by the guided TUI flow.
+#[derive(Debug, Clone, Default)]
+pub struct McpDraft {
+    pub name: String,
+    pub url: Option<String>,
+    pub command: Vec<String>,
+    pub headers: Vec<(String, String)>,
+    pub environment: Vec<(String, String)>,
+    pub pending_key: Option<String>,
 }
 
 /// What a picker selection applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerAction {
+    /// Choose a CLI from the launch screen.
+    StartupAgent,
+    /// Choose a model from the launch screen.
+    StartupModel,
+    /// Choose effort from the launch screen.
+    StartupEffort,
+    /// Choose a CLI while configuring the saved default.
+    DefaultAgent,
+    /// Choose a model while configuring the saved default.
+    DefaultModel,
+    /// Choose effort while configuring the saved default.
+    DefaultEffort,
     /// Switch agent.
     Agent,
     /// Switch model.
@@ -95,10 +201,56 @@ pub enum PickerAction {
     Effort,
     /// Open a conversation.
     Conversation,
+    /// Inspect a delegated conversation without leaving the parent view.
+    ChildConversation,
     /// Set the execution mode.
     Mode,
     /// Submit an option offered by the latest assistant response.
     ResponseOption,
+    /// Choose local, remote, or imported MCP setup.
+    McpAddTransport,
+    /// Choose authentication for a remote MCP server.
+    McpAddAuth,
+    /// Add environment mapping or finish a local server.
+    McpLocalConfig,
+    /// Select an MCP server discovered in another CLI config.
+    McpImport,
+}
+
+/// One terminal cell used by Argo-owned drag selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScreenPoint {
+    /// Zero-based terminal column.
+    pub column: u16,
+    /// Zero-based terminal row.
+    pub row: u16,
+}
+
+/// The visible range selected with the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseSelection {
+    /// Cell where the drag began.
+    pub anchor: ScreenPoint,
+    /// Most recent drag/release cell.
+    pub focus: ScreenPoint,
+    /// Whether the left button is still held.
+    pub dragging: bool,
+}
+
+impl MouseSelection {
+    /// Ordered endpoints in terminal reading order.
+    pub fn ordered(self) -> (ScreenPoint, ScreenPoint) {
+        if (self.anchor.row, self.anchor.column) <= (self.focus.row, self.focus.column) {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    /// A press/release without travel is a click, not a text range.
+    pub fn is_click(self) -> bool {
+        self.anchor == self.focus
+    }
 }
 
 /// Whole-application state.
@@ -111,6 +263,8 @@ pub struct App {
     pub conversations: Vec<ConversationSummary>,
     /// Detected adapters.
     pub agents: Vec<AgentInfo>,
+    /// Explicit CLI/model selection applied to new conversations.
+    pub default_selection: Option<DefaultSelection>,
     /// Transcript lines.
     pub lines: Vec<Line>,
     /// Composer contents.
@@ -125,6 +279,8 @@ pub struct App {
     pub status: String,
     /// True once the user asked to quit.
     pub should_quit: bool,
+    /// Short-lived guard requiring a second plain Ctrl+C before leaving the TUI.
+    quit_confirmation_deadline: Option<std::time::Instant>,
     /// Transcript scrollback offset from the bottom.
     pub scroll_back: usize,
     /// Whether Argo's minimal mouse-wheel reporting is active.
@@ -132,6 +288,14 @@ pub struct App {
     /// Explicit wheel events keep transcript scrolling separate from physical
     /// arrow keys. F2 restores fully terminal-owned mouse selection immediately.
     pub mouse_scroll_mode: bool,
+    /// Visible range selected by Argo while mouse reporting remains enabled.
+    pub mouse_selection: Option<MouseSelection>,
+    /// Text captured from the last completed visible drag.
+    selected_screen_text: Option<String>,
+    /// Space on the startup CLI picker requests persistence after model/effort.
+    pub startup_save_default: bool,
+    /// State carried between fields in `/mcp add`.
+    pub mcp_draft: Option<McpDraft>,
     /// Width-aware maximum rendered-row scroll, refreshed by the renderer.
     scroll_limit: std::cell::Cell<usize>,
     /// Recent inputs, newest last.
@@ -140,6 +304,10 @@ pub struct App {
     history_cursor: Option<usize>,
     /// Whether the composer contains a multiline bracketed-paste payload.
     multiline_paste: bool,
+    /// Previous composer state restored by Ctrl+Y.
+    edit_undo: Option<EditSnapshot>,
+    /// Whether CLI-emitted reasoning is currently rendered.
+    pub thinking_visible: bool,
     /// Assistant text accumulated for the streaming turn.
     streaming: String,
     /// Reasoning text accumulated for the streaming turn.
@@ -148,6 +316,8 @@ pub struct App {
     active_tools: std::collections::HashMap<String, String>,
     /// Adapter attribution for live delegated runs, keyed by durable child run id.
     child_agents: std::collections::HashMap<RunId, String>,
+    /// Delegated runs that have spawned but not yet reached a terminal event.
+    active_children: std::collections::HashSet<RunId>,
     /// Child tool ids retained independently so their lifecycle cannot disturb the parent.
     child_tools: std::collections::HashMap<(RunId, String), String>,
     /// Child streams already followed in this TUI session, preventing duplicate replay.
@@ -175,6 +345,10 @@ pub struct App {
     /// Dropping them was the alternative, and it lost work: a follow-up thought
     /// typed mid-turn is exactly the thing a user does not want to retype.
     pub queued: std::collections::VecDeque<String>,
+    /// Agent/model attribution captured when the parent run starts.
+    /// Child headers may appear later, so reverse-scanning transcript headers at
+    /// completion would attribute parent usage to the wrong CLI.
+    active_usage_source: Option<String>,
     /// Prompt owned by the active run, retained only long enough to offer an
     /// explicit retry after a transient failure.
     active_prompt: Option<String>,
@@ -208,12 +382,7 @@ pub fn farewell(app: &App) -> Option<String> {
     }
 
     let id = summary.id.to_string();
-    // The short form is what the picker shows and is unambiguous in practice; the
-    // full id is given too so it can be scripted without a lookup.
-    let short = id.split('-').next().unwrap_or(&id);
-    Some(format!(
-        "\nsession {short}\n  resume here:      argo tui   then  /resume {short}\n  or from a shell:  argo send --conversation-id {id} \"...\"\n  transcript:       argo show {id}"
-    ))
+    Some(format!("argo --resume {id}"))
 }
 
 /// What the running agent appears to be doing.
@@ -256,6 +425,7 @@ impl App {
             conversation: None,
             conversations: Vec::new(),
             agents: Vec::new(),
+            default_selection: None,
             lines: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -263,16 +433,24 @@ impl App {
             overlay: Overlay::None,
             status: "Type a message, or /help for commands".to_string(),
             should_quit: false,
+            quit_confirmation_deadline: None,
             scroll_back: 0,
             mouse_scroll_mode: false,
+            mouse_selection: None,
+            selected_screen_text: None,
+            startup_save_default: false,
+            mcp_draft: None,
             scroll_limit: std::cell::Cell::new(0),
             history: Vec::new(),
             history_cursor: None,
             multiline_paste: false,
+            edit_undo: None,
+            thinking_visible: true,
             streaming: String::new(),
             thinking_streaming: String::new(),
             active_tools: std::collections::HashMap::new(),
             child_agents: std::collections::HashMap::new(),
+            active_children: std::collections::HashSet::new(),
             child_tools: std::collections::HashMap::new(),
             followed_children: std::collections::HashSet::new(),
             completions: Vec::new(),
@@ -283,6 +461,7 @@ impl App {
             context_tokens: 0,
             version: env!("CARGO_PKG_VERSION").to_string(),
             queued: std::collections::VecDeque::new(),
+            active_usage_source: None,
             active_prompt: None,
             retry_prompt: None,
             active_error_retryable: false,
@@ -387,6 +566,33 @@ impl App {
         }
     }
 
+    /// Rotating shortcut hint shown only while a turn is active.
+    pub fn shortcut_tip(&self) -> &'static str {
+        const TIPS: &[&str] = &[
+            "Shift+Enter adds a line",
+            "Option+Backspace deletes a word",
+            "Cmd+Backspace deletes to line start",
+            "Ctrl+Y restores the last edit",
+            "F2 toggles wheel/selection mode",
+            "Shift+Tab cycles the agent mode",
+            "/thinking hides or shows reasoning",
+            "/usage shows reported token data",
+            "Esc cancels the active turn",
+        ];
+        // Change roughly every three seconds. Mixing in the run id keeps the
+        // first tip from being identical on every turn without needing an RNG.
+        let run_hash = self
+            .active_run
+            .as_ref()
+            .map(|run| {
+                run.as_str()
+                    .bytes()
+                    .fold(0usize, |a, b| a.wrapping_add(b as usize))
+            })
+            .unwrap_or(0);
+        TIPS[(self.tick / 33 + run_hash) % TIPS.len()]
+    }
+
     /// True while a turn is streaming.
     pub fn is_busy(&self) -> bool {
         self.active_run.is_some()
@@ -405,6 +611,30 @@ impl App {
         self.status = text.into();
     }
 
+    /// Arms exit on the first Ctrl+C and exits only on a prompt second press.
+    ///
+    /// The daemon owns active runs, so leaving the TUI never cancels them. The
+    /// short deadline prevents an old, forgotten warning from turning a much
+    /// later Ctrl+C into an accidental exit.
+    pub fn request_ctrl_c_exit(&mut self) {
+        let now = std::time::Instant::now();
+        if self
+            .quit_confirmation_deadline
+            .is_some_and(|deadline| now <= deadline)
+        {
+            self.should_quit = true;
+            self.quit_confirmation_deadline = None;
+            return;
+        }
+        self.quit_confirmation_deadline = Some(now + std::time::Duration::from_secs(3));
+        self.set_status("press Ctrl+C again to exit Argo · running agents will continue");
+    }
+
+    /// Disarms a pending Ctrl+C exit when the user continues interacting.
+    pub fn clear_ctrl_c_exit_confirmation(&mut self) {
+        self.quit_confirmation_deadline = None;
+    }
+
     /// Reports an error in both the transcript and the status line.
     pub fn report_error(&mut self, text: impl Into<String>) {
         let text = text.into();
@@ -416,6 +646,7 @@ impl App {
 
     /// Inserts a character at the caret.
     pub fn insert(&mut self, ch: char) {
+        self.remember_edit();
         let index = self.byte_index(self.cursor);
         self.input.insert(index, ch);
         self.cursor += 1;
@@ -503,6 +734,10 @@ impl App {
     /// are normalized to `\n` to match the internal composer representation.
     pub fn paste(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        self.remember_edit();
         let index = self.byte_index(self.cursor);
         self.input.insert_str(index, &normalized);
         self.cursor += normalized.chars().count();
@@ -547,6 +782,7 @@ impl App {
         if self.cursor == 0 {
             return;
         }
+        self.remember_edit();
         let start = self.byte_index(self.cursor - 1);
         let end = self.byte_index(self.cursor);
         self.input.replace_range(start..end, "");
@@ -559,9 +795,79 @@ impl App {
         if self.cursor >= self.input.chars().count() {
             return;
         }
+        self.remember_edit();
         let start = self.byte_index(self.cursor);
         let end = self.byte_index(self.cursor + 1);
         self.input.replace_range(start..end, "");
+        self.refresh_completions();
+    }
+
+    /// Deletes the previous whitespace-delimited word (Option+Backspace/Ctrl+W).
+    pub fn backspace_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.delete_char_range(start, self.cursor);
+    }
+
+    /// Deletes from the caret to the start of its logical line (Cmd+Backspace).
+    pub fn backspace_to_line_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = chars[..self.cursor]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        if start < self.cursor {
+            self.delete_char_range(start, self.cursor);
+        }
+    }
+
+    /// Restores the composer state immediately before the latest edit.
+    pub fn undo_edit(&mut self) -> bool {
+        let Some(previous) = self.edit_undo.take() else {
+            return false;
+        };
+        let current = EditSnapshot {
+            input: std::mem::replace(&mut self.input, previous.input),
+            cursor: std::mem::replace(&mut self.cursor, previous.cursor),
+            multiline_paste: std::mem::replace(&mut self.multiline_paste, previous.multiline_paste),
+        };
+        self.edit_undo = Some(current);
+        self.history_cursor = None;
+        self.refresh_completions();
+        true
+    }
+
+    fn remember_edit(&mut self) {
+        self.edit_undo = Some(EditSnapshot {
+            input: self.input.clone(),
+            cursor: self.cursor,
+            multiline_paste: self.multiline_paste,
+        });
+    }
+
+    fn delete_char_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.remember_edit();
+        let start_byte = self.byte_index(start);
+        let end_byte = self.byte_index(end);
+        self.input.replace_range(start_byte..end_byte, "");
+        self.cursor = start;
+        self.refresh_completions();
     }
 
     /// Moves the caret left.
@@ -592,6 +898,7 @@ impl App {
         self.multiline_paste = false;
         self.completions.clear();
         self.completion_index = 0;
+        self.edit_undo = None;
         if !taken.trim().is_empty() {
             self.history.push(taken.clone());
         }
@@ -667,6 +974,7 @@ impl App {
         self.active_tools.clear();
         self.scroll_back = 0;
         let model = model.unwrap_or("default");
+        self.active_usage_source = Some(format!("{agent}/{model}"));
         let mode = if resumed {
             "resumed session"
         } else {
@@ -679,10 +987,21 @@ impl App {
                 format!("↻ context transferred to a fresh session — {reason}"),
             );
         }
+        let final_only = is_plain_text_adapter(agent);
+        if final_only {
+            self.push(
+                LineKind::Notice,
+                "· final output only — this CLI does not stream intermediate activity",
+            );
+        }
         self.activity = Activity::Starting;
-        self.activity_detail = None;
+        self.activity_detail = final_only.then(|| "waiting for final output".to_string());
         self.tick = 0;
-        self.set_status(format!("{agent} · Esc to cancel"));
+        self.set_status(if final_only {
+            format!("{agent} · final output only (no streaming) · Esc to cancel")
+        } else {
+            format!("{agent} · waiting for first output · Esc to cancel")
+        });
     }
 
     /// Folds one streamed event into the transcript.
@@ -759,12 +1078,13 @@ impl App {
             } => {
                 self.child_agents
                     .insert(child_run_id.clone(), child_agent_id.to_string());
+                self.active_children.insert(child_run_id.clone());
                 self.activity = Activity::Working;
                 self.activity_detail = Some(format!("subagent {child_agent_id}"));
                 self.push(
                     LineKind::Activity,
                     format!(
-                        "↳ subagent {} ({}) — {}",
+                        "↳ delegated agent {} ({}) — {} · /children to inspect",
                         child_agent_id,
                         child_run_id,
                         compact_activity(&task)
@@ -785,9 +1105,10 @@ impl App {
                 child_run_id,
                 status,
             } => {
+                self.active_children.remove(&child_run_id);
                 self.push(
                     LineKind::Activity,
-                    format!("✓ subagent {child_run_id} — {status:?}"),
+                    format!("✓ delegated agent {child_run_id} — {status:?} · /children"),
                 );
                 self.streaming.clear();
                 self.thinking_streaming.clear();
@@ -848,13 +1169,13 @@ impl App {
                 self.streaming.clear();
                 self.thinking_streaming.clear();
                 self.active_tools.clear();
-                self.last_usage_source = self
-                    .lines
-                    .iter()
-                    .rev()
-                    .find(|line| line.kind == LineKind::AgentHeader)
-                    .map(|line| line.text.split(" · ").take(2).collect::<Vec<_>>().join("/"));
-                self.last_usage = (!usage.is_empty()).then_some(usage);
+                // Only update usage/source on Succeeded; failure/cancellation
+                // leaves previous successful usage intact.
+                if status == RunStatus::Succeeded {
+                    self.last_usage_source = self.active_usage_source.clone();
+                    self.last_usage = (!usage.is_empty()).then_some(usage);
+                }
+                self.active_usage_source = None;
                 self.recompute_context();
                 let mut note = match status {
                     RunStatus::Succeeded => "done".to_string(),
@@ -876,7 +1197,13 @@ impl App {
     /// Registers one child stream for following, returning true only once.
     pub fn follow_child(&mut self, run_id: RunId, agent_id: impl Into<String>) -> bool {
         self.child_agents.insert(run_id.clone(), agent_id.into());
+        self.active_children.insert(run_id.clone());
         self.followed_children.insert(run_id)
+    }
+
+    /// Number of delegated agents known in this live TUI session.
+    pub fn delegated_agent_counts(&self) -> (usize, usize) {
+        (self.active_children.len(), self.child_agents.len())
     }
 
     /// Applies an event from a delegated child without mutating parent run state.
@@ -978,10 +1305,11 @@ impl App {
             } => {
                 self.child_agents
                     .insert(child_run_id.clone(), child_agent_id.to_string());
+                self.active_children.insert(child_run_id.clone());
                 self.push(
                     LineKind::Activity,
                     format!(
-                        "[{known_agent} subagent] ↳ subagent {} ({}) — {}",
+                        "[{known_agent} subagent] ↳ delegated agent {} ({}) — {} · /children",
                         child_agent_id,
                         child_run_id,
                         compact_activity(&task)
@@ -991,10 +1319,13 @@ impl App {
             RunEventKind::ChildCompleted {
                 child_run_id,
                 status,
-            } => self.push(
-                LineKind::Activity,
-                format!("[{known_agent} subagent] ✓ subagent {child_run_id} — {status:?}"),
-            ),
+            } => {
+                self.active_children.remove(&child_run_id);
+                self.push(
+                    LineKind::Activity,
+                    format!("[{known_agent} subagent] ✓ delegated agent {child_run_id} — {status:?} · /children"),
+                );
+            }
             RunEventKind::SessionReseeded { reason } => self.push(
                 LineKind::Notice,
                 format!("[{known_agent} subagent] · {reason}; retrying with full context"),
@@ -1021,6 +1352,7 @@ impl App {
                 format!("[{known_agent} subagent] ! {message}"),
             ),
             RunEventKind::RunFinished { status, usage } => {
+                self.active_children.remove(&run_id);
                 let mut detail =
                     format!("[{known_agent} subagent] · child commit barrier — {status:?}");
                 if let (Some(input), Some(output)) = (usage.input, usage.output) {
@@ -1072,6 +1404,49 @@ impl App {
             filter: String::new(),
             action,
         };
+    }
+
+    /// Opens one field in a guided form.
+    pub fn open_input(
+        &mut self,
+        title: impl Into<String>,
+        prompt: impl Into<String>,
+        secret: bool,
+        action: InputAction,
+    ) {
+        self.overlay = Overlay::Input {
+            title: title.into(),
+            prompt: prompt.into(),
+            value: String::new(),
+            secret,
+            action,
+        };
+    }
+
+    /// Inserts text into a guided form field.
+    pub fn overlay_input_push_str(&mut self, text: &str) {
+        if let Overlay::Input { value, .. } = &mut self.overlay {
+            value.push_str(text);
+        }
+    }
+
+    /// Deletes one character from a guided form field.
+    pub fn overlay_input_pop(&mut self) {
+        if let Overlay::Input { value, .. } = &mut self.overlay {
+            value.pop();
+        }
+    }
+
+    /// Takes a guided field value and closes it.
+    pub fn overlay_submit_input(&mut self) -> Option<(InputAction, String)> {
+        let submitted = match &self.overlay {
+            Overlay::Input { value, action, .. } => Some((*action, value.clone())),
+            _ => None,
+        };
+        if submitted.is_some() {
+            self.close_overlay();
+        }
+        submitted
     }
 
     /// Opens a picker when the latest assistant response asks the user to choose.
@@ -1153,6 +1528,17 @@ impl App {
         };
     }
 
+    /// Appends live progress when the matching read-only pane is still open.
+    pub fn append_text_overlay(&mut self, expected_title: &str, line: String) -> bool {
+        match &mut self.overlay {
+            Overlay::Text { title, lines, .. } if title == expected_title => {
+                lines.push(line);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Closes any overlay.
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
@@ -1189,6 +1575,7 @@ impl App {
                     (*scroll + delta as usize).min(last)
                 };
             }
+            Overlay::Input { .. } => {}
             Overlay::None => {}
         }
     }
@@ -1295,6 +1682,15 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Replaces one adapter after its selected-agent deep probe completes.
+    pub fn update_agent(&mut self, agent: argo_runtime::AgentInfo) {
+        if let Some(existing) = self.agents.iter_mut().find(|item| item.id == agent.id) {
+            *existing = agent;
+        } else {
+            self.agents.push(agent);
+        }
+    }
+
     /// Modes the selected adapter can actually enforce.
     pub fn mode_support(&self) -> argo_core::mode::ModeSupport {
         self.conversation
@@ -1322,23 +1718,72 @@ impl App {
         let Some(conversation) = &self.conversation else {
             return "no conversation".to_string();
         };
-        let agent = conversation
-            .selected_agent_id
-            .clone()
-            .unwrap_or_else(|| "auto".into());
+        let Some(agent) = conversation.selected_agent_id.clone() else {
+            return "choose CLI".into();
+        };
         let model = conversation
             .selected_model
             .clone()
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| "choose model".into());
         format!("{agent}/{model}")
+    }
+
+    /// Starts an application-owned selection without giving up wheel events.
+    pub fn begin_mouse_selection(&mut self, column: u16, row: u16) {
+        let point = ScreenPoint { column, row };
+        self.mouse_selection = Some(MouseSelection {
+            anchor: point,
+            focus: point,
+            dragging: true,
+        });
+        self.selected_screen_text = None;
+    }
+
+    /// Extends the current visible selection.
+    pub fn update_mouse_selection(&mut self, column: u16, row: u16) {
+        if let Some(selection) = &mut self.mouse_selection {
+            selection.focus = ScreenPoint { column, row };
+        }
+    }
+
+    /// Finishes a selection and remembers its visible text for the copy chord.
+    pub fn finish_mouse_selection(&mut self, column: u16, row: u16, text: Option<String>) {
+        self.update_mouse_selection(column, row);
+        if let Some(selection) = &mut self.mouse_selection {
+            selection.dragging = false;
+        }
+        self.selected_screen_text = text.filter(|value| !value.is_empty());
+    }
+
+    /// Removes the application-owned selection.
+    pub fn clear_mouse_selection(&mut self) {
+        self.mouse_selection = None;
+        self.selected_screen_text = None;
+    }
+
+    /// Text captured by the most recent completed drag.
+    pub fn selected_screen_text(&self) -> Option<&str> {
+        self.selected_screen_text.as_deref()
+    }
+
+    /// Changes whether reasoning lines are drawn without deleting canonical data.
+    pub fn set_thinking_visible(&mut self, visible: bool) {
+        self.thinking_visible = visible;
+        self.set_status(if visible {
+            "thinking is visible · /thinking hide to collapse it"
+        } else {
+            "thinking is hidden · /thinking show to reveal it"
+        });
     }
 
     /// Exact last-turn token accounting reported by the selected CLI stream.
     pub fn usage_report(&self) -> Vec<String> {
-        let source = self
-            .last_usage_source
-            .as_deref()
-            .unwrap_or("no completed turn");
+        let Some(source) = self.last_usage_source.as_deref() else {
+            return vec![
+                "No successful completed turn yet.".to_string(),
+                "Send a message first, then check /usage.".to_string(),
+            ];
+        };
         let mut lines = vec![format!("Last completed turn: {source}")];
         let agent_id = source.split('/').next().unwrap_or("");
         match self.last_usage {
@@ -1417,7 +1862,8 @@ impl App {
         }
         lines.push(String::new());
         lines.push(
-            "Provider account quota/status is not exposed by the installed CLI interfaces.".into(),
+            "Use /usage for provider allowance when the selected CLI exposes a safe status interface."
+                .into(),
         );
         lines
     }
@@ -1427,18 +1873,21 @@ impl App {
         self.lines.clear();
         self.history.clear();
         self.history_cursor = None;
-        for message in messages {
+        // Clear usage — will be restored from the last assistant message with Some(usage).
+        self.last_usage = None;
+        self.last_usage_source = None;
+        for message in &messages {
             match message.role.as_str() {
                 "user" => {
                     if !message.text.trim().is_empty() {
                         self.history.push(message.text.clone());
                     }
                     if message.blocks.is_empty() {
-                        self.push(LineKind::User, message.text);
+                        self.push(LineKind::User, message.text.clone());
                     } else {
-                        for block in message.blocks {
+                        for block in &message.blocks {
                             if let ContentBlock::Text { text } = block {
-                                self.push(LineKind::User, text);
+                                self.push(LineKind::User, text.clone());
                             }
                         }
                     }
@@ -1449,19 +1898,19 @@ impl App {
                         self.push(LineKind::AgentHeader, format!("{agent} · {model}"));
                     }
                     if message.blocks.is_empty() {
-                        self.push(LineKind::Assistant, message.text);
+                        self.push(LineKind::Assistant, message.text.clone());
                         continue;
                     }
-                    for block in message.blocks {
+                    for block in &message.blocks {
                         match block {
                             ContentBlock::Text { text } => {
                                 if !text.trim().is_empty() {
-                                    self.push(LineKind::Assistant, text);
+                                    self.push(LineKind::Assistant, text.clone());
                                 }
                             }
                             ContentBlock::Thinking { text } => {
                                 if !text.trim().is_empty() {
-                                    self.push(LineKind::Thinking, text);
+                                    self.push(LineKind::Thinking, text.clone());
                                 }
                             }
                             ContentBlock::Tool { call } => {
@@ -1509,7 +1958,7 @@ impl App {
                                     LineKind::Activity,
                                     format!(
                                         "↳ subagent {agent_id} ({run_id}) — {}",
-                                        compact_activity(&task)
+                                        compact_activity(task)
                                     ),
                                 );
                                 for child_block in blocks {
@@ -1570,16 +2019,37 @@ impl App {
                 }
                 _ => {
                     if message.blocks.is_empty() {
-                        self.push(LineKind::Notice, message.text);
+                        self.push(LineKind::Notice, message.text.clone());
                     } else {
-                        for block in message.blocks {
+                        for block in &message.blocks {
                             if let ContentBlock::Text { text } = block {
-                                self.push(LineKind::Notice, text);
+                                self.push(LineKind::Notice, text.clone());
                             }
                         }
                     }
                 }
             }
+        }
+        // Restore usage from the last assistant message that reports it (Succeeded).
+        if let Some(last_with_usage) = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && m.usage.is_some())
+        {
+            let usage = last_with_usage.usage.unwrap();
+            let source = format!(
+                "{}/{}",
+                last_with_usage
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+                last_with_usage
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "default".into())
+            );
+            self.last_usage_source = Some(source);
+            self.last_usage = (!usage.is_empty()).then_some(usage);
         }
         self.scroll_back = 0;
         self.recompute_context();
@@ -1630,13 +2100,19 @@ impl App {
             .clone()
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| "(untitled)".to_string());
+        let description = summary
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty() && *description != title)
+            .map(|description| format!(" — {description}"))
+            .unwrap_or_default();
         let agents = if summary.agents_with_sessions.is_empty() {
             "no agent yet".to_string()
         } else {
             summary.agents_with_sessions.join("+")
         };
         format!(
-            "{title}  ·  {} msg  ·  {agents}  ·  {}",
+            "{title}{description}  ·  {} msg  ·  {agents}  ·  {}",
             summary.message_count,
             relative_time(summary.updated_at)
         )
@@ -1701,7 +2177,7 @@ fn relative_time(at: i64) -> String {
     }
 }
 
-/// Extracts a deliberate numbered choice request from an assistant response.
+/// Extracts a deliberate numbered, lettered, or bulleted choice request.
 ///
 /// Numbered prose alone is not enough: a nearby choice phrase is required so
 /// ordinary explanations and plans do not unexpectedly become interactive.
@@ -1730,6 +2206,11 @@ fn response_options(response: &str) -> Option<Vec<String>> {
         "choose an option",
         "select one",
         "select an option",
+        "choose from",
+        "select from",
+        "reply with",
+        "respond with",
+        "pick between",
         "what would you like",
         "how would you like",
         "would you like me to",
@@ -1788,7 +2269,7 @@ fn response_options(response: &str) -> Option<Vec<String>> {
     }
 
     if options.len() < 2 {
-        return None;
+        return terminal_bulleted_options(&stripped, &lower, CHOICE_PHRASES);
     }
 
     // Terminal check: only trailing whitespace after the last option.
@@ -1799,6 +2280,61 @@ fn response_options(response: &str) -> Option<Vec<String>> {
     // Proximity check: a choice phrase must appear within the last 200 chars
     // before the first numbered item.
     let first_byte = first_option_byte.unwrap_or(0);
+    if !choice_phrase_near(&lower, first_byte, CHOICE_PHRASES) {
+        return None;
+    }
+
+    Some(options)
+}
+
+/// Extracts a contiguous terminal list such as `A) ...` or `- ...`.
+fn terminal_bulleted_options(stripped: &str, lower: &str, phrases: &[&str]) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut byte = 0usize;
+    for segment in stripped.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        lines.push((byte, line));
+        byte += segment.len();
+    }
+    while lines.last().is_some_and(|(_, line)| line.trim().is_empty()) {
+        lines.pop();
+    }
+
+    let mut options = Vec::new();
+    let mut first_byte = 0usize;
+    for (line_byte, line) in lines.into_iter().rev() {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))
+            .or_else(|| {
+                let mut chars = trimmed.chars();
+                let letter = chars.next()?;
+                let delimiter = chars.next()?;
+                (letter.is_ascii_alphabetic() && matches!(delimiter, '.' | ')'))
+                    .then(|| chars.as_str().trim_start())
+            });
+        let Some(rest) = rest else {
+            break;
+        };
+        if rest.is_empty() || rest.chars().count() > 150 {
+            return None;
+        }
+        first_byte = line_byte;
+        options.push(trimmed.to_string());
+        if options.len() > 12 {
+            return None;
+        }
+    }
+    options.reverse();
+    if options.len() < 2 || !choice_phrase_near(lower, first_byte, phrases) {
+        return None;
+    }
+    Some(options)
+}
+
+fn choice_phrase_near(lower: &str, first_byte: usize, phrases: &[&str]) -> bool {
     let prefix = &lower[..first_byte];
     let window_start = prefix
         .char_indices()
@@ -1806,14 +2342,9 @@ fn response_options(response: &str) -> Option<Vec<String>> {
         .nth(199)
         .map_or(0, |(index, _)| index);
     let proximity_window = &lower[window_start..first_byte];
-    let has_choice_phrase = CHOICE_PHRASES
+    phrases
         .iter()
-        .any(|phrase| proximity_window.contains(phrase));
-    if !has_choice_phrase {
-        return None;
-    }
-
-    Some(options)
+        .any(|phrase| proximity_window.contains(phrase))
 }
 
 /// Removes fenced code blocks (``` … ```) so their content does not trigger
@@ -1846,6 +2377,33 @@ mod tests {
 
     fn new_app() -> App {
         App::new("/repo")
+    }
+
+    #[test]
+    fn startup_capabilities_distinguish_presets_and_delegation_mechanisms() {
+        let claude = argo_runtime::find("claude").expect("claude definition");
+        let claude = AgentInfo::unavailable(claude, "test fixture");
+        let summary = agent_capability_summary(&claude);
+        assert!(summary.contains("7 model presets"), "{summary}");
+        assert!(summary.contains("native resume"), "{summary}");
+        assert!(summary.contains("Argo MCP delegation"), "{summary}");
+        assert!(!summary.contains("agent tools"), "{summary}");
+
+        let grok = argo_runtime::find("grok").expect("grok definition");
+        let grok = AgentInfo::unavailable(grok, "test fixture");
+        let summary = agent_capability_summary(&grok);
+        assert!(summary.contains("context replay"), "{summary}");
+        assert!(summary.contains("Argo command delegation"), "{summary}");
+    }
+
+    #[test]
+    fn a_successful_model_probe_is_labeled_as_live() {
+        let codex = argo_runtime::find("codex").expect("codex definition");
+        let mut codex = AgentInfo::unavailable(codex, "test fixture");
+        codex.models_live = true;
+        let summary = agent_capability_summary(&codex);
+        assert!(summary.contains("2 live models"), "{summary}");
+        assert!(!summary.contains("presets"), "{summary}");
     }
 
     #[test]
@@ -2155,16 +2713,13 @@ mod tests {
 
         app.push(LineKind::User, "hello".to_string());
         let message = farewell(&app).expect("farewell");
-        assert!(message.contains("abcd1234"), "short id: {message}");
-        assert!(
-            message.contains("/resume abcd1234"),
-            "resume hint: {message}"
+        // Must be exactly one line: argo --resume <full-id>
+        assert_eq!(
+            message,
+            "argo --resume abcd1234-5678-90ab-cdef-1234567890ab"
         );
-        assert!(
-            message.contains("abcd1234-5678-90ab-cdef-1234567890ab"),
-            "full id for scripting: {message}"
-        );
-        assert!(message.contains("argo show"), "transcript hint: {message}");
+        // No blank prefix.
+        assert!(!message.starts_with('\n'));
     }
 
     #[test]
@@ -2304,6 +2859,7 @@ mod tests {
         );
 
         assert_eq!(app.active_run, Some(parent));
+        assert_eq!(app.delegated_agent_counts(), (0, 1));
         assert_eq!(app.queue_depth(), 1);
         assert_eq!(app.last_usage.and_then(|usage| usage.input), Some(7));
         assert!(app.lines.iter().any(|line| {
@@ -2596,6 +3152,7 @@ mod tests {
         app.insert('/');
         app.insert('d');
         app.insert('e');
+        app.insert('l');
         assert!(app.accept_completion());
         assert_eq!(app.input, "/delegate ");
         assert_eq!(app.cursor, app.input.chars().count());
@@ -2696,6 +3253,29 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_requires_two_prompt_presses_to_exit() {
+        let mut app = new_app();
+
+        app.request_ctrl_c_exit();
+        assert!(!app.should_quit);
+        assert!(app.status.contains("Ctrl+C again"));
+
+        app.request_ctrl_c_exit();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn continuing_to_interact_disarms_ctrl_c_exit() {
+        let mut app = new_app();
+
+        app.request_ctrl_c_exit();
+        app.clear_ctrl_c_exit_confirmation();
+        app.request_ctrl_c_exit();
+
+        assert!(!app.should_quit);
+    }
+
+    #[test]
     fn text_overlay_scroll_is_bounded() {
         let mut app = new_app();
         app.open_text("Context", vec!["a".into(), "b".into(), "c".into()]);
@@ -2735,6 +3315,7 @@ mod tests {
         ConversationSummary {
             id: argo_core::ids::ConversationId::new("c1"),
             title: title.map(str::to_string),
+            description: None,
             selected_agent_id: Some("codex".into()),
             selected_model: model.map(str::to_string),
             selected_reasoning: None,
@@ -2742,6 +3323,7 @@ mod tests {
             message_count: messages,
             agents_with_sessions: agents.iter().map(|a| a.to_string()).collect(),
             parent_conversation_id: None,
+            workspace: Some("/test".into()),
             updated_at: argo_core::now_millis(),
         }
     }
@@ -2752,6 +3334,7 @@ mod tests {
         app.set_conversation_summary(summary(None, 0, &[], None));
 
         let mut updated = summary(Some("fix immediate metadata"), 2, &["codex"], Some("gpt-5"));
+        updated.description = Some("Started with setup. Current focus: metadata".into());
         updated.updated_at += 1;
         app.set_conversation_summary(updated);
 
@@ -2765,6 +3348,10 @@ mod tests {
         let description = App::describe(&app.conversations[0]);
         assert!(
             description.contains("fix immediate metadata"),
+            "{description}"
+        );
+        assert!(
+            description.contains("Current focus: metadata"),
             "{description}"
         );
         assert!(description.contains("2 msg"), "{description}");
@@ -2782,6 +3369,7 @@ mod tests {
                 blocks: vec![ContentBlock::text("run it")],
                 agent_id: None,
                 model: None,
+                usage: None,
                 created_at: 1,
             },
             MessageView {
@@ -2808,6 +3396,7 @@ mod tests {
                 ],
                 agent_id: Some("antigravity".into()),
                 model: Some("sonnet".into()),
+                usage: None,
                 created_at: 2,
             },
         ]);
@@ -3011,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn status_report_uses_current_argo_state_without_claiming_provider_quota() {
+    fn status_report_uses_current_argo_state_and_points_to_usage() {
         let mut app = new_app();
         app.conversation = Some(summary(Some("network retry"), 4, &["codex"], Some("gpt-5")));
         app.enqueue("follow-up".into());
@@ -3019,7 +3608,10 @@ mod tests {
         assert!(report.contains("network retry"), "{report}");
         assert!(report.contains("codex/gpt-5"), "{report}");
         assert!(report.contains("Queued follow-ups: 1"), "{report}");
-        assert!(report.contains("not exposed"), "{report}");
+        assert!(
+            report.contains("Use /usage for provider allowance"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -3111,6 +3703,22 @@ mod tests {
         ] {
             assert!(response_options(prompt).is_some(), "{prompt}");
         }
+    }
+
+    #[test]
+    fn lettered_and_bulleted_terminal_choices_trigger_picker() {
+        for prompt in [
+            "Choose from these:\nA) Keep the current implementation\nB) Replace it",
+            "Reply with one:\n- Keep the current implementation\n- Replace it",
+        ] {
+            let options = response_options(prompt).expect(prompt);
+            assert_eq!(options.len(), 2);
+        }
+    }
+
+    #[test]
+    fn ordinary_bulleted_steps_do_not_become_a_picker() {
+        assert!(response_options("Next steps:\n- Run tests\n- Review the diff").is_none());
     }
 
     #[test]
@@ -3421,5 +4029,239 @@ second
         assert!(stripped.contains("Before"));
         assert!(stripped.contains("After"));
         assert!(!stripped.contains("inside"));
+    }
+}
+
+#[cfg(test)]
+mod new_feature_tests {
+    use super::*;
+    use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
+    use argo_core::ids::RunId;
+    use argo_daemon::protocol::{ConversationSummary, MessageView};
+
+    fn new_app() -> App {
+        App::new("/repo")
+    }
+
+    fn summary_with_id(id: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: argo_core::ids::ConversationId::new(id),
+            title: Some("test".into()),
+            description: None,
+            selected_agent_id: Some("codex".into()),
+            selected_model: Some("gpt-5".into()),
+            selected_reasoning: None,
+            selected_mode: None,
+            message_count: 2,
+            agents_with_sessions: vec![],
+            parent_conversation_id: None,
+            workspace: Some("/repo".into()),
+            updated_at: 42,
+        }
+    }
+
+    #[test]
+    fn usage_reopen_exact_values_from_message_view() {
+        let mut app = new_app();
+        let usage = TokenUsage {
+            input: Some(500),
+            output: Some(200),
+            cached_input: Some(100),
+            reasoning: Some(50),
+        };
+        app.replace_transcript(vec![
+            MessageView {
+                id: "m1".into(),
+                role: "user".into(),
+                text: "hello".into(),
+                blocks: vec![],
+                agent_id: None,
+                model: None,
+                usage: None,
+                created_at: 1,
+            },
+            MessageView {
+                id: "m2".into(),
+                role: "assistant".into(),
+                text: "hi".into(),
+                blocks: vec![],
+                agent_id: Some("claude".into()),
+                model: Some("sonnet".into()),
+                usage: Some(usage),
+                created_at: 2,
+            },
+        ]);
+        assert_eq!(app.last_usage, Some(usage));
+        assert_eq!(app.last_usage_source.as_deref(), Some("claude/sonnet"));
+    }
+
+    #[test]
+    fn usage_reopen_empty_kiro_plain_sets_source_but_no_values() {
+        let mut app = new_app();
+        // Kiro/plain adapters report empty usage on success.
+        let empty_usage = TokenUsage::default();
+        app.replace_transcript(vec![
+            MessageView {
+                id: "m1".into(),
+                role: "user".into(),
+                text: "do it".into(),
+                blocks: vec![],
+                agent_id: None,
+                model: None,
+                usage: None,
+                created_at: 1,
+            },
+            MessageView {
+                id: "m2".into(),
+                role: "assistant".into(),
+                text: "done".into(),
+                blocks: vec![],
+                agent_id: Some("kiro".into()),
+                model: Some("default".into()),
+                usage: Some(empty_usage),
+                created_at: 2,
+            },
+        ]);
+        // Source is set (the turn succeeded), but last_usage is None because
+        // the usage was empty.
+        assert_eq!(app.last_usage_source.as_deref(), Some("kiro/default"));
+        assert_eq!(app.last_usage, None);
+    }
+
+    #[test]
+    fn usage_no_completed_turn_shows_appropriate_message() {
+        let app = new_app();
+        let report = app.usage_report();
+        assert!(
+            report
+                .iter()
+                .any(|l| l.contains("No successful completed turn")),
+            "should say no completed turn: {:?}",
+            report
+        );
+        // Must never contain the old problematic phrasing.
+        let joined = report.join(" ");
+        assert!(
+            !joined.contains("no completed turn did not report"),
+            "problematic phrasing: {joined}"
+        );
+    }
+
+    #[test]
+    fn usage_cancellation_preserves_previous_successful_usage() {
+        let mut app = new_app();
+        // First: a successful turn sets usage.
+        app.begin_run(RunId::new("r1"), "codex", Some("gpt-5"), false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage {
+                input: Some(100),
+                output: Some(50),
+                ..Default::default()
+            },
+        });
+        assert_eq!(app.last_usage.unwrap().input, Some(100));
+
+        // Second: a cancelled turn should NOT clear the previous usage.
+        app.begin_run(RunId::new("r2"), "codex", Some("gpt-5"), false);
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Cancelled,
+            usage: TokenUsage::default(),
+        });
+        // Previous successful usage is preserved.
+        assert_eq!(app.last_usage.unwrap().input, Some(100));
+        assert_eq!(app.last_usage_source.as_deref(), Some("codex/gpt-5"));
+    }
+
+    #[test]
+    fn new_conversation_clears_usage() {
+        let mut app = new_app();
+        app.last_usage = Some(TokenUsage {
+            input: Some(999),
+            ..Default::default()
+        });
+        app.last_usage_source = Some("old/model".into());
+        // replace_transcript with empty messages simulates new conversation.
+        app.replace_transcript(vec![]);
+        assert_eq!(app.last_usage, None);
+        assert_eq!(app.last_usage_source, None);
+    }
+
+    #[test]
+    fn farewell_format_is_exactly_one_line() {
+        let mut app = new_app();
+        app.conversation = Some(summary_with_id("abc-def-ghi"));
+        app.push(LineKind::User, "hello".to_string());
+        let msg = farewell(&app).expect("farewell");
+        assert_eq!(msg.matches('\n').count(), 0, "must be one line: {msg}");
+        assert!(msg.starts_with("argo --resume "), "format: {msg}");
+        assert!(msg.contains("abc-def-ghi"), "full id: {msg}");
+    }
+
+    #[test]
+    fn plain_text_adapter_shows_no_streaming_notice() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "grok", None, false);
+        let last_notice = app.lines.iter().rev().find(|l| l.kind == LineKind::Notice);
+        assert!(
+            last_notice
+                .map(|l| l.text.contains("final output only"))
+                .unwrap_or(false),
+            "plain adapter should show 'final output only' notice: {:?}",
+            app.lines
+        );
+    }
+
+    #[test]
+    fn structured_adapter_does_not_show_no_streaming_notice() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("r1"), "claude", None, false);
+        let has_notice = app
+            .lines
+            .iter()
+            .any(|l| l.kind == LineKind::Notice && l.text.contains("final output only"));
+        assert!(!has_notice, "structured adapter should NOT show the notice");
+    }
+
+    #[test]
+    fn word_and_line_deletion_are_unicode_safe_and_undoable() {
+        let mut app = new_app();
+        app.paste("alpha café\nsecond line");
+        app.backspace_word();
+        assert_eq!(app.input, "alpha café\nsecond ");
+        assert!(app.undo_edit());
+        assert_eq!(app.input, "alpha café\nsecond line");
+
+        app.backspace_to_line_start();
+        assert_eq!(app.input, "alpha café\n");
+        assert!(app.undo_edit());
+        assert_eq!(app.input, "alpha café\nsecond line");
+    }
+
+    #[test]
+    fn busy_shortcut_tips_rotate_slowly() {
+        let mut app = new_app();
+        app.begin_run(RunId::new("tip-run"), "codex", Some("default"), false);
+        let initial = app.shortcut_tip();
+        for _ in 0..32 {
+            app.advance_tick();
+        }
+        assert_eq!(app.shortcut_tip(), initial);
+        app.advance_tick();
+        assert_ne!(app.shortcut_tip(), initial);
+    }
+
+    #[test]
+    fn thinking_visibility_does_not_delete_reasoning() {
+        let mut app = new_app();
+        app.push(LineKind::Thinking, "retained reasoning");
+        app.set_thinking_visible(false);
+        assert!(!app.thinking_visible);
+        assert!(app
+            .lines
+            .iter()
+            .any(|line| { line.kind == LineKind::Thinking && line.text == "retained reasoning" }));
+        app.set_thinking_visible(true);
+        assert!(app.thinking_visible);
     }
 }

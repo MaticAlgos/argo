@@ -44,8 +44,16 @@ pub struct Client {
 impl Client {
     /// Connects, starting the daemon if it is not already listening.
     pub async fn connect(paths: &ArgoPaths) -> Result<Self> {
-        if let Ok(client) = Self::try_connect(paths).await {
-            return Ok(client);
+        match Self::try_connect(paths).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                if let Some(protocol) = argo_daemon::mismatched_daemon_protocol(&error) {
+                    // A binary upgrade commonly leaves the previous detached
+                    // daemon alive. Stop it through its own compatible handshake
+                    // before starting this build.
+                    argo_daemon::stop_older_daemon(paths, protocol, "argo-cli").await?;
+                }
+            }
         }
 
         spawn_daemon(paths)?;
@@ -189,9 +197,9 @@ pub async fn doctor(paths: &ArgoPaths) -> Result<()> {
         }
         Err(error) => {
             println!("  daemon   : not running ({error})");
-            // Detection still works without the daemon, so the report stays useful.
+            // Filesystem-only discovery keeps diagnostics side-effect free.
             println!();
-            for info in argo_runtime::detect_all().await {
+            for info in argo_runtime::discover_all_lightweight() {
                 print_agent_line(&info);
             }
         }
@@ -245,6 +253,7 @@ pub async fn chats(paths: &ArgoPaths, root: Option<String>) -> Result<()> {
                 println!("no conversations yet");
             }
             for summary in conversations {
+                let description = summary.description.clone();
                 let title = summary.title.unwrap_or_else(|| "(untitled)".into());
                 let agent = summary.selected_agent_id.unwrap_or_else(|| "-".into());
                 println!(
@@ -255,7 +264,28 @@ pub async fn chats(paths: &ArgoPaths, root: Option<String>) -> Result<()> {
                     summary.message_count,
                     summary.agents_with_sessions.join(",")
                 );
+                if let Some(description) = description.filter(|value| !value.trim().is_empty()) {
+                    println!("  {}", description);
+                }
             }
+            Ok(())
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    }
+}
+
+/// Deletes stored conversations, either for one workspace or globally.
+pub async fn clear_history(paths: &ArgoPaths, all: bool, root: Option<String>) -> Result<()> {
+    let root = if all { None } else { Some(resolve_root(root)?) };
+    let mut client = Client::connect(paths).await?;
+    match client.request(Request::ClearConversations { root }).await? {
+        Response::Cleared { count } => {
+            println!("cleared {count} conversation(s)");
             Ok(())
         }
         Response::Error {
@@ -740,11 +770,15 @@ pub async fn show(paths: &ArgoPaths, conversation_id: &str) -> Result<()> {
         .await?
     {
         Response::Conversation { summary, messages } => {
+            let description = summary.description.clone();
             println!(
                 "# {} ({} messages)",
                 summary.title.unwrap_or_else(|| summary.id.to_string()),
                 summary.message_count
             );
+            if let Some(description) = description.filter(|value| !value.trim().is_empty()) {
+                println!("\n{description}");
+            }
             for message in messages {
                 let who = match message.agent_id {
                     Some(agent) => format!("{} ({agent})", message.role),

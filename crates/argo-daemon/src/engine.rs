@@ -247,25 +247,10 @@ pub async fn run_turn(
     };
 
     // 1. The user's message becomes canonical history immediately, so it survives
-
-    // A TUI-created conversation starts untitled. Persist a deterministic title
-    // from the first real request before spawning, so even a failed turn remains
-    // recognizable in `/resume`. Explicit `/new <title>` values are never replaced.
-    if conversation
-        .title
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .is_empty()
-    {
-        let title = argo_core::conversation_title(&request.prompt);
-        lock(store)?.set_title(&request.conversation_id, &title)?;
-    }
-    //    even if the agent never responds.
-    lock(store)?.append_message(
-        &request.conversation_id,
-        NewMessage::user(request.prompt.clone()),
-    )?;
+    //    even if the agent never responds. Refresh the title from the latest focus
+    //    on every turn; the summary description separately preserves where the
+    //    conversation began.
+    append_user_and_refresh_title(store, &request.conversation_id, &request.prompt)?;
 
     // 2. Pin the assistant placeholder before spawning.
     let assistant_id = MessageId::generate();
@@ -555,6 +540,16 @@ pub async fn run_turn(
     })
 }
 
+fn append_user_and_refresh_title(
+    store: &SharedStore,
+    conversation_id: &ConversationId,
+    prompt: &str,
+) -> Result<()> {
+    let store = lock(store)?;
+    store.append_message(conversation_id, NewMessage::user(prompt))?;
+    store.set_title(conversation_id, &argo_core::conversation_title(prompt))
+}
+
 /// Generates a fresh session identifier.
 ///
 /// Claude accepts `--session-id <uuid>`, which makes the next turn's resume
@@ -741,6 +736,32 @@ mod tests {
         let ws = store.ensure_workspace(dir.path()).expect("workspace");
         let conv = store.create_conversation(&ws, None).expect("conversation");
         (Arc::new(Mutex::new(store)), paths, conv, ws, dir)
+    }
+
+    #[test]
+    fn every_user_turn_refreshes_the_conversation_title() {
+        let (store, _paths, conv, _ws, _dir) = setup();
+        append_user_and_refresh_title(&store, &conv, "build authentication").expect("first");
+        assert_eq!(
+            lock(&store)
+                .expect("lock")
+                .get_conversation(&conv)
+                .expect("conversation")
+                .title
+                .as_deref(),
+            Some("build authentication")
+        );
+
+        append_user_and_refresh_title(&store, &conv, "now fix keyboard shortcuts").expect("second");
+        assert_eq!(
+            lock(&store)
+                .expect("lock")
+                .get_conversation(&conv)
+                .expect("conversation")
+                .title
+                .as_deref(),
+            Some("now fix keyboard shortcuts")
+        );
     }
 
     /// Appends a message through the shared store.

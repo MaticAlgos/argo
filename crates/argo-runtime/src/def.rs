@@ -173,8 +173,16 @@ pub struct AgentInfo {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// True when the binary was found and could be executed.
+    /// True when an executable file was found on PATH.
+    ///
+    /// Availability discovery never launches the binary; `probed` distinguishes
+    /// that filesystem result from a completed deep probe.
     pub available: bool,
+    /// True when a deep probe (version/help/models/auth) has been performed.
+    ///
+    /// A lightweight-discovered adapter has `available = true` but `probed = false`.
+    #[serde(default)]
+    pub probed: bool,
     /// Resolved absolute path to the executable.
     pub path: Option<String>,
     /// Version string, when the CLI reported one.
@@ -198,6 +206,12 @@ pub struct AgentInfo {
     pub diagnostics: Vec<String>,
     /// Install URL, shown when unavailable.
     pub install_url: String,
+    /// Capability flags observed in the installed binary's help output.
+    ///
+    /// Populated only after a deep probe (`probed = true`). Used by arg builders
+    /// so Argo never passes a flag an older build would reject.
+    #[serde(default)]
+    pub help_flags: Vec<String>,
 }
 
 impl AgentInfo {
@@ -213,6 +227,7 @@ impl AgentInfo {
             id: def.id.to_string(),
             name: def.name.to_string(),
             available: false,
+            probed: false,
             path: None,
             version: None,
             authenticated: None,
@@ -223,6 +238,7 @@ impl AgentInfo {
             capabilities: def.capabilities.clone(),
             diagnostics,
             install_url: def.install_url.to_string(),
+            help_flags: Vec::new(),
         }
     }
 

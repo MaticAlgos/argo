@@ -99,6 +99,34 @@ cd argo
 ./install.sh
 ```
 
+Use SSH instead when your GitHub account is configured with an SSH key:
+
+```bash
+git clone git@github.com:MaticAlgos/argo.git
+cd argo
+./install.sh
+```
+
+Check which remote and revision you are about to build before installation:
+
+```bash
+git remote -v
+git status --short --branch
+git log -1 --oneline
+```
+
+For a reproducible checkout, detach at a release tag or full commit SHA instead
+of building a moving branch:
+
+```bash
+git fetch --tags origin
+git switch --detach v0.1.0
+./install.sh
+```
+
+Detached checkouts are suitable for installation, not development. Create a
+branch first if you intend to edit the source.
+
 To build and install manually:
 
 ```bash
@@ -160,6 +188,46 @@ curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | b
 For stable environments, update between explicit release tags instead of `main`.
 Conversation data is stored outside the executable and is preserved across
 updates.
+
+### Update an existing Git checkout
+
+Do not pull blindly over local changes. First inspect the checkout and fetch the
+remote without modifying the working tree:
+
+```bash
+cd /path/to/argo
+git status --short --branch
+git fetch origin
+git log --oneline --decorate HEAD..origin/main
+```
+
+If the working tree is clean and the local branch has no unpublished commits,
+fast-forward and reinstall:
+
+```bash
+git switch main
+git pull --ff-only origin main
+./install.sh
+```
+
+`--ff-only` refuses to create an accidental merge commit. Contributors with
+local commits should follow the rebase workflow in
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#sync-before-pushing) instead.
+
+To move between pinned releases:
+
+```bash
+git fetch --tags origin
+git switch --detach v0.2.0
+./install.sh
+```
+
+Verify the installed binary after every update:
+
+```bash
+argo --version
+argo doctor
+```
 
 ## Uninstall
 

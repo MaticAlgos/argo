@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<String>,
 
+    /// Resume a conversation directly by its full id.
+    #[arg(long)]
+    resume: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -95,6 +99,15 @@ enum Command {
     },
     /// List conversations in a workspace.
     Chats {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Delete stored conversation history.
+    ClearHistory {
+        /// Clear every workspace instead of only the selected root.
+        #[arg(long)]
+        all: bool,
         /// Workspace root. Defaults to the current directory.
         #[arg(long)]
         root: Option<String>,
@@ -233,6 +246,16 @@ fn exit_code(error: &ArgoError) -> i32 {
 async fn run(cli: Cli) -> Result<()> {
     let paths = ArgoPaths::resolve()?;
 
+    // --resume takes priority over a subcommand when no subcommand is given.
+    if let Some(resume_id) = cli.resume {
+        if cli.command.is_some() {
+            return Err(ArgoError::Invalid(
+                "--resume cannot be combined with a subcommand".into(),
+            ));
+        }
+        return argo_tui::run_with_conversation(&paths, resume_id).await;
+    }
+
     match cli.command.unwrap_or(Command::Tui { root: None }) {
         Command::Tui { root } => {
             let root = match root {
@@ -249,6 +272,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor => client::doctor(&paths).await,
         Command::Agents { refresh } => client::agents(&paths, refresh).await,
         Command::Chats { root } => client::chats(&paths, root).await,
+        Command::ClearHistory { all, root } => client::clear_history(&paths, all, root).await,
         Command::New { root, title } => client::new_conversation(&paths, root, title).await,
         Command::Select {
             conversation_id,
@@ -465,5 +489,19 @@ mod tests {
         assert_eq!(exit_code(&ArgoError::Cancelled), 130);
         assert_eq!(exit_code(&ArgoError::Timeout(1)), 124);
         assert_eq!(exit_code(&ArgoError::Invalid("x".into())), 1);
+    }
+
+    #[test]
+    fn resume_flag_opens_tui_with_conversation() {
+        let cli = Cli::try_parse_from(["argo", "--resume", "abc-def-123"]).expect("parse");
+        assert_eq!(cli.resume.as_deref(), Some("abc-def-123"));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn resume_flag_is_a_global_option() {
+        // --resume must work without a subcommand.
+        let cli = Cli::try_parse_from(["argo", "--resume", "conv-id"]).expect("parse");
+        assert_eq!(cli.resume.as_deref(), Some("conv-id"));
     }
 }

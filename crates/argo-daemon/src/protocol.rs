@@ -34,6 +34,14 @@ pub enum Request {
         /// Re-probe instead of returning the cached inventory.
         refresh: bool,
     },
+    /// Deep-probe a single agent, populating version/models/help flags.
+    ProbeAgent {
+        /// Which adapter to probe.
+        agent_id: String,
+        /// Force re-probe even if already probed.
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Open or create the workspace for a directory.
     OpenWorkspace {
         /// Directory to use as the workspace root.
@@ -43,6 +51,11 @@ pub enum Request {
     ListConversations {
         /// Workspace root.
         root: String,
+    },
+    /// Delete canonical conversation history for one workspace or all workspaces.
+    ClearConversations {
+        /// Workspace root to clear; `None` clears every workspace.
+        root: Option<String>,
     },
     /// Create a conversation.
     NewConversation {
@@ -101,7 +114,7 @@ pub enum Request {
         /// Last sequence the client already has.
         after_seq: EventSeq,
     },
-    /// List child conversations spawned by delegation.
+    /// List descendant conversations spawned by delegation.
     ListChildren {
         /// Parent conversation.
         conversation_id: ConversationId,
@@ -153,6 +166,11 @@ pub enum Response {
         /// Detected adapters.
         agents: Vec<AgentInfo>,
     },
+    /// Single deep-probed agent result.
+    Agent {
+        /// The probed adapter info.
+        agent: AgentInfo,
+    },
     /// Workspace opened.
     Workspace {
         /// Canonical root.
@@ -164,6 +182,11 @@ pub enum Response {
     Conversations {
         /// Summaries, newest first.
         conversations: Vec<ConversationSummary>,
+    },
+    /// Conversation history was cleared.
+    Cleared {
+        /// Number of conversations removed.
+        count: usize,
     },
     /// Conversation contents.
     Conversation {
@@ -210,7 +233,7 @@ pub enum Response {
     },
     /// Child conversations.
     Children {
-        /// Direct children.
+        /// All orchestrated descendants, parent before nested children.
         children: Vec<ConversationSummary>,
     },
     /// A delegated child finished.
@@ -244,6 +267,9 @@ pub struct ConversationSummary {
     pub id: ConversationId,
     /// Title, when set.
     pub title: Option<String>,
+    /// Bounded summary of how the conversation's focus has evolved.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Selected agent for the next turn.
     pub selected_agent_id: Option<String>,
     /// Selected model for the next turn.
@@ -258,6 +284,9 @@ pub struct ConversationSummary {
     pub agents_with_sessions: Vec<String>,
     /// Parent conversation, for delegated children.
     pub parent_conversation_id: Option<ConversationId>,
+    /// Authoritative workspace root, filled server-side.
+    #[serde(default)]
+    pub workspace: Option<String>,
     /// Last activity in epoch millis.
     pub updated_at: i64,
 }
@@ -278,6 +307,13 @@ pub struct MessageView {
     pub agent_id: Option<String>,
     /// Producing model, for assistant turns.
     pub model: Option<String>,
+    /// Token usage reported for this assistant turn.
+    ///
+    /// `Some(usage)` when the turn finished with Succeeded status (usage fields
+    /// may still be None when the CLI does not report them).
+    /// `None` for failed/cancelled turns or non-assistant messages.
+    #[serde(default)]
+    pub usage: Option<argo_core::event::TokenUsage>,
     /// Creation time in epoch millis.
     pub created_at: i64,
 }
@@ -351,6 +387,7 @@ mod tests {
         let summary = ConversationSummary {
             id: ConversationId::new("c1"),
             title: Some("first task".into()),
+            description: Some("Current focus: first task".into()),
             selected_agent_id: Some("codex".into()),
             selected_model: Some("gpt-5".into()),
             selected_reasoning: None,
@@ -358,6 +395,7 @@ mod tests {
             message_count: 2,
             agents_with_sessions: vec![],
             parent_conversation_id: None,
+            workspace: Some("/repo".into()),
             updated_at: 42,
         };
         let response = Response::RunStarted {
@@ -379,6 +417,7 @@ mod tests {
             panic!("missing authoritative summary");
         };
         assert_eq!(actual.title, summary.title);
+        assert_eq!(actual.description, summary.description);
         assert_eq!(actual.message_count, 2);
     }
 

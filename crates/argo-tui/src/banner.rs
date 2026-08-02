@@ -66,6 +66,16 @@ const AGENT_NAME_COLOR: Color = Color::Rgb(170, 180, 200);
 /// `agents` is the rendered detected-agent summary, and `version` identifies the
 /// build so a bug report can name it.
 pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'static>> {
+    splash_with_selection(width, version, agents, None)
+}
+
+/// Builds the splash and names the configured startup target when one exists.
+pub fn splash_with_selection(
+    width: u16,
+    version: &str,
+    agents: &[String],
+    default_selection: Option<&str>,
+) -> Vec<TextLine<'static>> {
     let (art, is_hero): (&[&str], bool) = if width >= HERO_MIN_WIDTH {
         (HERO, true)
     } else if width >= WIDE_MIN_WIDTH {
@@ -133,6 +143,34 @@ pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'sta
         Span::styled(tagline, Style::default().fg(TAGLINE_COLOR)),
     ]));
 
+    if let Some(selection) = default_selection {
+        lines.push(TextLine::from(""));
+        let label = format!("default  ·  {selection}");
+        let pad = " ".repeat(w.saturating_sub(label.chars().count()) / 2);
+        lines.push(TextLine::from(vec![
+            Span::raw(pad),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(AGENT_DOT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(TextLine::from(""));
+        let prompt = "type a message, or /agent to change CLI";
+        let pad = " ".repeat(w.saturating_sub(prompt.chars().count()) / 2);
+        lines.push(TextLine::from(vec![
+            Span::raw(pad),
+            Span::styled(
+                prompt.to_string(),
+                Style::default()
+                    .fg(TAGLINE_COLOR)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        return lines;
+    }
+
     // ── Detected agents ─────────────────────────────────────────────────
     if !agents.is_empty() {
         lines.push(TextLine::from(""));
@@ -194,7 +232,7 @@ pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'sta
         lines.push(TextLine::from(""));
 
         // Centred prompt.
-        let prompt = "type a message to begin";
+        let prompt = "choose a CLI to begin";
         let prompt_w = prompt.chars().count();
         let prompt_pad = " ".repeat(w.saturating_sub(prompt_w) / 2);
         lines.push(TextLine::from(vec![
@@ -209,8 +247,9 @@ pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'sta
         lines.push(TextLine::from(""));
 
         let hints: &[(&str, &str)] = &[
-            ("/agent", "switch CLI mid-conversation"),
+            ("/agent", "choose or switch CLI"),
             ("/model", "choose a model"),
+            ("/default", "configure startup CLI and model"),
             ("/chats", "reopen an earlier session"),
             ("/help", "everything else"),
         ];
@@ -234,7 +273,7 @@ pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'sta
             ]));
         }
     } else {
-        let commands: &[&str] = &["/agent", "/model", "/chats", "/help"];
+        let commands: &[&str] = &["/agent", "/model", "/default", "/chats", "/help"];
         for cmd in commands {
             lines.push(TextLine::from(Span::styled(
                 format!("  {cmd}"),
@@ -245,6 +284,37 @@ pub fn splash(width: u16, version: &str, agents: &[String]) -> Vec<TextLine<'sta
 
     lines.push(TextLine::from(""));
 
+    lines
+}
+
+/// Compact logo used above launch-time selection pickers.
+pub fn welcome_header(width: u16, version: &str) -> Vec<TextLine<'static>> {
+    let art: &[&str] = if width >= WIDE_MIN_WIDTH {
+        WIDE
+    } else {
+        NARROW
+    };
+    let w = width as usize;
+    let mut lines = Vec::new();
+    for (index, row) in art.iter().enumerate() {
+        let pad = " ".repeat(w.saturating_sub(row.chars().count()) / 2);
+        lines.push(TextLine::from(vec![
+            Span::raw(pad),
+            Span::styled(
+                (*row).to_string(),
+                Style::default()
+                    .fg(GRADIENT[index.min(GRADIENT.len() - 1)])
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    let tagline = format!("choose your coding CLI  ·  v{version}");
+    let pad = " ".repeat(w.saturating_sub(tagline.chars().count()) / 2);
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(vec![
+        Span::raw(pad),
+        Span::styled(tagline, Style::default().fg(TAGLINE_COLOR)),
+    ]));
     lines
 }
 
@@ -337,7 +407,20 @@ mod tests {
         // The splash is where a new user learns Argo's point.
         let rendered = text(&splash(90, "0.1.0", &[]));
         assert!(rendered.contains("/agent"));
-        assert!(rendered.contains("switch CLI mid-conversation"));
+        assert!(rendered.contains("choose or switch CLI"));
+        assert!(rendered.contains("/default"));
         assert!(rendered.contains("/chats"));
+    }
+
+    #[test]
+    fn a_configured_default_is_named_on_the_intro_screen() {
+        let rendered = text(&splash_with_selection(
+            90,
+            "0.1.0",
+            &[],
+            Some("codex/gpt-5.6-sol · high"),
+        ));
+        assert!(rendered.contains("default  ·  codex/gpt-5.6-sol · high"));
+        assert!(rendered.contains("type a message, or /agent to change CLI"));
     }
 }

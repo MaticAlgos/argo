@@ -1,346 +1,259 @@
+<div align="center">
+
 # Argo
 
-**One conversation. Many coding-agent CLIs.**
+### One conversation. Many coding CLIs.
 
-Argo is a terminal-first orchestrator for the coding agents you already have
-installed. Start a conversation with Claude Code, switch to Codex mid-task, and
-Codex picks up where Claude left off—because Argo owns the conversation, not the
-CLI.
+Switch coding agents without losing the thread. Argo keeps the conversation,
+workspace context, tools, and child-agent lineage while each CLI does what it
+does best.
 
-```text
-$ argo
- █████╗ ██████╗  ██████╗  ██████╗
-██╔══██╗██╔══██╗██╔════╝ ██╔═══██╗
-███████║██████╔╝██║  ███╗██║   ██║
-██╔══██║██╔══██╗██║   ██║██║   ██║
-██║  ██║██║  ██║╚██████╔╝╚██████╔╝
-╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝
+[![CI](https://github.com/MaticAlgos/argo/actions/workflows/ci.yml/badge.svg)](https://github.com/MaticAlgos/argo/actions/workflows/ci.yml)
+[![Rust 1.82+](https://img.shields.io/badge/Rust-1.82%2B-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![macOS + Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-59636e)](#installation)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-2ea44f)](LICENSE)
 
-one conversation · many coding CLIs
-```
+[Install](#installation) · [How it works](#how-context-is-managed) ·
+[Shortcuts](#keyboard-and-mouse) · [Commands](#in-chat-commands) ·
+[Usage guide](docs/usage.md) · [Contributing](CONTRIBUTING.md)
 
-## Quick install
+</div>
 
-Argo currently supports macOS and Linux and builds from source with Rust 1.82 or
-newer:
+![Argo home screen](docs/assets/screenshots/argo-home.svg)
+
+<table>
+  <tr align="center">
+    <td width="14%"><img src="docs/assets/agents/claude.png" alt="Claude" height="44"></td>
+    <td width="14%"><img src="docs/assets/agents/codex.svg" alt="Codex" height="44"></td>
+    <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/opencode-dark.svg"><img src="docs/assets/agents/opencode-light.svg" alt="OpenCode" height="44"></picture></td>
+    <td width="14%"><img src="docs/assets/agents/kiro.png" alt="Kiro" height="44"></td>
+    <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/command-code-dark.svg"><img src="docs/assets/agents/command-code-light.svg" alt="Command Code" height="44"></picture></td>
+    <td width="14%"><img src="docs/assets/agents/antigravity.png" alt="Antigravity" height="44"></td>
+    <td width="14%"><img src="docs/assets/agents/grok-light.png" alt="Grok" height="44"></td>
+  </tr>
+  <tr align="center">
+    <td>Claude Code</td><td>Codex CLI</td><td>OpenCode</td><td>Kiro CLI</td>
+    <td>Command Code</td><td>Antigravity</td><td>Grok CLI</td>
+  </tr>
+</table>
+
+<sub>Agent marks identify compatible products; their owners retain all rights.
+Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.</sub>
+
+## What Argo does
+
+- Keeps one durable SQLite conversation across all supported coding CLIs.
+- Shows the exact active CLI, model, effort, and execution mode in the TUI.
+- Discovers live models where a CLI exposes them and uses verified presets where
+  it does not.
+- Offers reasoning effort only for the selected models that support it. For
+  example, Antigravity exposes effort for adjustable Claude models, not for
+  Gemini/GPT model IDs whose level is already part of the model choice.
+- Streams responses, CLI-emitted thinking, tools, file changes, plans, usage,
+  and delegated-agent activity without inventing hidden reasoning.
+- Lets you show or hide thinking with `/thinking`.
+- Recognizes deliberate numbered choices and presents a keyboard picker.
+- Keeps mouse-wheel scrolling and drag-to-select/copy active at the same time.
+- Shares skills and MCP servers across compatible agents.
+- Delegates work to another CLI while preserving parent/child lineage.
+- Updates the conversation title to the current request and keeps a short
+  description of the conversation's starting point and current focus.
+- Queues messages submitted during a run and starts them in FIFO order.
+
+## Installation
+
+Argo supports macOS and Linux and builds with Rust 1.82 or newer. The installer
+uses a locked release build, needs no `sudo`, and installs to `~/.local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | bash
 ```
 
-The installer uses no `sudo`, performs a locked release build, and installs to
-`~/.local/bin/argo`. To inspect the script first, pin a version, choose another
-install directory, update, uninstall, or install from a private repository, see
-the **[complete installation guide](docs/installation.md)**.
-
-After installation:
+Inspect the script first, pin a tag or commit, install from a Git clone, update,
+or uninstall using the [complete installation guide](docs/installation.md).
+Argo does not install or authenticate vendor CLIs for you.
 
 ```bash
-cd your-project
+cd /path/to/project
 argo doctor
 argo
 ```
 
-## Why Argo
+## Start screen and defaults
 
-Every coding CLI keeps its own session store. Switching tools normally means
-starting over: re-explaining the task, re-establishing decisions, and losing the
-thread. Skills configured for one agent are invisible to another, and an MCP
-server added to Claude does not automatically exist for Codex.
+With no saved default, Argo opens its CLI picker over the welcome screen. Pick a
+CLI, then a model, then an effort level only when that exact model supports one.
 
-Argo makes the conversation authoritative. Sessions, full message history,
-project conventions, shared skills, MCP servers, and agent selections live in
-Argo and are projected into whichever coding CLI handles the next turn.
+- `Enter` chooses the highlighted CLI for this conversation.
+- `Space` chooses it and saves the completed CLI + model + optional effort as the
+  startup default.
+- Typing filters any picker; `↑` and `↓` move the selection.
+- A saved default appears directly under the Argo logo. Start typing immediately,
+  use `/agent` to change it for the current chat, or `/default` to reconfigure it.
+- `/default current` saves the current exact selection; `/default clear` restores
+  the startup picker.
 
-## Feature overview
+Argo always displays the effective CLI and model. It never silently substitutes
+a different agent or applies an effort value to an incompatible model.
 
-### One durable conversation across agents
+## Keyboard and mouse
 
-- Switch agent, model, or reasoning effort without abandoning the conversation.
-- Reuse a CLI's native session only when its agent, model, workspace, and
-  conversation cursor still match.
-- Reseed safely from canonical history when a saved session is missing, stale,
-  unsupported, or behind another agent's completed turn.
-- Preserve the complete transcript in SQLite even when the context sent to a
-  model must be compacted.
-- Preview the exact projected next-turn context and the reason for a fresh or
-  resumed session with `/context` or `argo context`.
-- Show an explicit transcript alert whenever model/workspace/conversation changes
-  force canonical context into a fresh native session.
-- Preserve bounded tool results in transferred history, so identifiers returned
-  by MCP calls remain available after switching agents.
-- Persist readable conversation titles derived from the first meaningful prompt.
-
-### Native TUI designed for agent work
-
-- Stream assistant responses with a visible response rail and agent-specific
-  turn headers.
-- Render assistant Markdown as terminal-native presentation: headings, bold,
-  italics, strikethrough, inline and fenced code, ordered and unordered lists,
-  task lists, blockquotes, links, images, tables, rules, and footnotes.
-- Keep canonical Markdown unchanged in history; styling is presentation-only.
-- Show reasoning emitted by the CLI, tool starts/results, file writes, plans,
-  diagnostics, token usage, and child-agent activity as distinct transcript rows.
-  Argo never invents hidden chain-of-thought that a CLI did not emit.
-- Keep long and wrapped responses aligned with transcript scrollback.
-- Detect deliberate numbered choice questions and open a selectable response
-  picker; ordinary numbered explanations are left alone.
-- Filter large model and conversation pickers while typing.
-- Compose multiline prompts and navigate command suggestions and input history.
-
-### Deterministic FIFO message queue
-
-Messages submitted while an agent is running are retained in FIFO order. Argo
-uses a two-phase peek/commit protocol: a queued item is removed only after the
-daemon confirms that its run started.
-
-- Success starts the next queued message automatically.
-- Cancelling/stopping the active turn also continues with the next queued item.
-- Failure pauses the queue because a follow-up may depend on work that did not
-  happen; press `Enter` with an empty composer to retry.
-- Press `Esc` while idle to discard the paused queue.
-- Queue depth is visible in activity and status text.
-
-### Shared Agent Skills
-
-Argo discovers Agent Skills from Argo and vendor locations, including:
-
-- `.argo/skills`
-- `.claude/skills`
-- `.agents/skills`
-- `.opencode/skills`
-- `.kiro/skills`
-- corresponding user-level skill directories
-
-Workspace skills override global skills predictably. Skills are validated,
-staged as copies, and exposed across agents without allowing an agent to edit the
-original source. Side files are preserved, unchanged skills are not recopied,
-and generated staging directories are gitignored.
-
-### MCP once, available everywhere possible
-
-Configure an MCP server once in Argo and it is injected into every adapter with a
-verified MCP mechanism. Existing non-Argo server entries in vendor configs are
-preserved.
-
-- Add local stdio or remote HTTP MCP servers.
-- Import existing servers from supported agent configuration files.
-- Use repeatable headers and `{env:VARIABLE}` substitutions.
-- Check connectivity and authentication with `argo mcp check`.
-- Log in once to OAuth-protected MCP servers with `argo mcp login <name>`.
-- OAuth 2.1 support includes protected-resource and authorization-server
-  discovery, dynamic client registration, PKCE S256, loopback callbacks, token
-  exchange, expiry handling, and refresh tokens.
-- Stored bearer tokens are attached only when an explicit user Authorization
-  header is absent.
-- Token-bearing files are written atomically with owner-only (`0600`)
-  permissions; corrupt shared configs are reported and preserved rather than
-  overwritten.
-
-MCP delivery by adapter:
-
-| Agent | MCP delivery |
+| Shortcut | Action |
 |---|---|
-| Claude Code | generated per-turn configuration |
-| Codex CLI | generated configuration overrides |
-| Kiro CLI | ACP `session/new` descriptors |
-| Antigravity | merged Gemini MCP configuration |
-| OpenCode | merged OpenCode JSONC configuration |
-| Command Code | merged Command Code configuration |
-| Grok CLI | no verified MCP mechanism |
+| `Enter` | Send a message or choose the highlighted item |
+| `Shift+Enter` | Insert a new line; includes an Apple Terminal modifier fallback |
+| `Alt+Enter` / `Ctrl+J` | Portable alternate newline shortcuts |
+| `Shift+Tab` | Cycle modes supported by the selected CLI |
+| `Tab` | Accept the highlighted slash-command completion |
+| `↑` / `↓` | Move in a picker/completion list, or navigate composer history |
+| `Ctrl+P` / `Ctrl+N` | Navigate composer history explicitly |
+| `Option+Backspace` / `Ctrl+W` | Delete the previous word |
+| `Cmd+Backspace` / `Ctrl+U` | Delete to the start of the line |
+| `Ctrl+Y` | Restore the last composer edit |
+| Mouse wheel / `PageUp` / `PageDown` | Scroll rendered transcript rows |
+| Drag with the left mouse button | Select visible text and copy it on release |
+| `Cmd+C` / `Ctrl+Shift+C` | Copy the selection, or the latest response if none is selected |
+| `F2` | Toggle Argo wheel + drag mode and terminal-native selection mode |
+| `Home` / `End` | Move within input; with empty input, jump through the transcript |
+| `Esc` | Close an overlay, cancel a turn, or discard a paused queue |
+| `Ctrl+C`, twice within 3 seconds | Exit Argo; the first press only warns |
+| `Ctrl+D` with an empty composer | Exit immediately |
 
-### Cross-runtime delegation
+Paste uses the terminal's normal shortcut (`Cmd+V` on macOS or usually
+`Ctrl+Shift+V` on Linux). Bracketed paste preserves multiline text and works in
+MCP token/header input. Safe rendered HTTP(S) links use terminal-native links;
+Apple Terminal also supports clicking the exact displayed URL in Argo mouse mode.
 
-Every Argo-managed host turn can delegate exploratory work to any installed target
-CLI. Claude, Codex, and Kiro receive native `argo_delegate` MCP tools through safe
-per-run configuration. OpenCode, Antigravity, Command Code, Grok, and future
-adapters also receive a daemon-backed command fallback:
+While an agent is active, the status area rotates useful shortcut tips. See the
+[full interaction guide](docs/usage.md#keyboard-and-mouse-reference) for terminal
+details and queue behavior.
 
-```text
-"$ARGO_BIN" delegate <agent> <self-contained task>
-```
-
-The fallback carries parent conversation/run identity in the turn environment, so
-it does not rely on unsafe shared global MCP state. It requires the host CLI to
-execute its shell tool; plain-output hosts cannot expose that host tool invocation,
-but the delegated child's own Argo stream remains visible.
-
-Each delegated task runs in a child conversation with real parent/child run
-lineage, bounded nesting depth, its own native session, and the user's MCP servers.
-The parent transcript records durable spawn/completion events, while the TUI
-subscribes to the child run and shows its emitted reasoning, messages, tools,
-files, plans, errors, and completion with child-agent attribution. A child
-`RunFinished` is only the child's commit barrier and never finishes the parent or
-advances the parent's FIFO queue. `/children` lists spawned conversations and
-`/open <id>` opens the complete historical child transcript.
-
-Native CLI subagents are separate from Argo delegation. Claude nested frames are
-attributed when the installed build emits them with `--forward-subagent-text`.
-Kiro's current vendor extension has no verified child-event schema, and the other
-supported streams expose no stable native-child identity, so Argo reports those
-limits instead of inventing lifecycle or hidden reasoning.
-
-### Execution modes and process safety
-
-Argo offers `full`, `plan`, `accept-edits`, and `read-only` modes where adapters
-can honor them. Restrictions are expressed both through native CLI flags and in
-the projected prompt. Unsupported modes are reported honestly rather than
-pretended.
-
-Each turn runs as a supervised child process. On Unix, Argo owns the child's
-process group so cancellation and timeout handling terminate descendants instead
-of leaving compilers, language servers, or shell commands orphaned.
-
-## Supported agents
-
-| Agent | Transport | Native resume | Structured activity | Modes |
-|---|---|---:|---:|---|
-| Claude Code | `stream-json` | yes | yes | plan, accept-edits |
-| Codex CLI | JSONL events | yes | yes | accept-edits, read-only |
-| OpenCode | JSONL events | yes | yes | plan |
-| Kiro CLI | ACP over stdio | yes | yes | — |
-| Command Code | plain text + session sidecar | yes | no | plan, accept-edits |
-| Antigravity | stream JSON | yes | yes | plan, accept-edits |
-| Grok CLI | plain text | no | no | — |
-
-Command Code session IDs are discovered from its workspace JSONL sidecar and
-resumed with `--resume <id>` for every model. Argo never uses Command Code's
-ambiguous global `--continue` behavior. Grok is reseeded from Argo history
-because no verified native resume mechanism exists.
-
-Plain-text adapters can provide final prose but cannot expose structured tool
-activity through stdout. Argo states this limitation instead of fabricating
-activity.
-
-Adding an adapter is a declarative file under
-[`crates/argo-runtime/src/defs/`](crates/argo-runtime/src/defs/). A new parser is
-needed only when a CLI introduces a wire format Argo does not already support.
-
-## Installation
-
-For prerequisites, inspect-first installation, version pinning, updates,
-uninstallation, private-repository access, and troubleshooting, see the
-**[complete installation guide](docs/installation.md)**.
-
-Argo requires Rust 1.82 or newer and currently targets Unix-style environments
-(macOS and Linux).
-
-One-shot installation from GitHub after the repository is public:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh | bash
-```
-
-For a private checkout, use a fine-grained GitHub token with read-only **Contents**
-access (the token is passed to `curl`/the installer and is never stored):
-
-```bash
-curl -fsSL \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.raw+json" \
-  "https://api.github.com/repos/MaticAlgos/argo/contents/install.sh?ref=main" \
-  | GITHUB_TOKEN="$GITHUB_TOKEN" bash
-```
-
-The script downloads a clean source archive, performs a reproducible locked
-release build, installs `argo` to `~/.local/bin`, and removes its temporary build
-directory. Set `ARGO_INSTALL_DIR` to choose another destination or
-`ARGO_INSTALL_REF` to install a specific branch, tag, or commit:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh \
-  | ARGO_INSTALL_REF=<tag-or-commit> ARGO_INSTALL_DIR="$HOME/bin" bash
-```
-
-If you prefer to inspect remote scripts before execution:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MaticAlgos/argo/main/install.sh -o /tmp/argo-install.sh
-less /tmp/argo-install.sh
-bash /tmp/argo-install.sh
-```
-
-Installation from a clone uses the same script without downloading another copy:
-
-```bash
-git clone https://github.com/MaticAlgos/argo.git
-cd argo
-./install.sh
-```
-
-`install.sh` builds a release binary and installs it to `~/.local/bin/argo`. To
-install manually:
-
-```bash
-cargo build --release
-mkdir -p ~/.local/bin
-install -m 755 target/release/argo ~/.local/bin/argo
-```
-
-Ensure `~/.local/bin` is on `PATH`, and install/authenticate whichever coding-agent
-CLIs you want Argo to orchestrate. `argo doctor` reports what Argo detects.
-
-## Interactive use
-
-Start Argo from a project workspace:
-
-```bash
-cd your-project
-argo
-# or
-argo tui --root /path/to/project
-```
-
-### TUI commands
+## In-chat commands
 
 | Command | Purpose |
 |---|---|
-| `/help` | Show the complete in-app reference |
-| `/agent [id]` | Pick or directly select a coding CLI |
-| `/model [id]` | Filter/pick or directly select a model |
-| `/effort [level]` | Set model-specific reasoning effort |
-| `/mode [id]` | Set execution mode; `Shift+Tab` cycles supported modes |
-| `/usage` | Show exact token counts reported by the last CLI turn; missing fields stay unavailable |
-| `/status` | Show current Argo conversation, selection, context, run, and queue state |
-| `/agents` | Show detected CLIs, versions, and limitations |
-| `/skills` | List shared skills discovered for this workspace |
-| `/mcp` | List configured MCP servers |
-| `/context` | Show exactly what the next turn will send |
-| `/resume [n\|id]` | List or reopen an earlier conversation |
+| `/agent [id]` | Choose or switch CLI for the next turn |
+| `/model [id]` | Choose a model from the selected CLI's inventory |
+| `/effort [level]` | Set effort only when the current model supports it |
+| `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
+| `/mode [id]` | Choose an execution mode; `Shift+Tab` cycles it |
+| `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility |
+| `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
+| `/status` | Show conversation, selection, context, run, and queue state |
+| `/agents` | Show detected CLIs, versions, and verified limitations |
+| `/skills` | Show skills available to every agent |
+| `/context` | Preview exactly what the next CLI receives |
+| `/resume [n\|id]` | List or reopen conversations (`/open` is an alias) |
 | `/new [title]` | Start a new conversation |
-| `/children` | Show conversations created by delegation |
-| `/delegate <agent> <task>` | Delegate work to another CLI |
-| `/cancel` | Stop the active turn |
-| `/config` | Show settings and state file locations |
-| `/doctor` | Run diagnostics |
-| `/quit` | Leave the TUI; the daemon keeps running |
+| `/clear-history` | Delete stored chats for this workspace and start fresh |
+| `/children` | Inspect delegated conversations in a snapshot overlay |
+| `/parent` or `/back` | Return from an opened child conversation |
+| `/delegate <agent> <task>` | Run a self-contained task in a child conversation |
+| `/mcp ...` | Add, list, check, auth, reconnect, or delete MCP servers |
+| `/cancel` | Stop the active turn without dropping queued follow-ups |
+| `/config` | Show preferences and state paths |
+| `/doctor` | Run environment and adapter diagnostics |
+| `/help` | Open the complete in-app command reference |
+| `/quit` | Leave the TUI while the daemon and active agents continue |
 
-### TUI keys
+Opening a result from `/children` is non-blocking: `Esc` or `Enter` closes the
+snapshot and returns to the parent while agents continue working. Opening a real
+child chat with `/open <id>` lets you use `/parent` to navigate back.
 
-- `Tab`: accept a command completion.
-- `↑` / `↓`: navigate suggestions and pickers; otherwise recall the previous or
-  next user message in the composer.
-- `Shift+Enter` or `Ctrl+J`: insert a newline.
-- Mouse wheel or `PageUp` / `PageDown`: scroll the transcript by rendered rows;
-  `Home` / `End` jump to the beginning/end when the composer is empty.
-- `F2`: toggle between mouse-wheel mode and fully terminal-owned selection. Argo
-  starts in mouse-wheel mode so wheel events remain distinct from `↑` / `↓`;
-  press `F2` for ordinary terminal drag selection.
-- `Ctrl+P` / `Ctrl+N`: navigate composer history explicitly.
-- Web links: `Cmd+click` uses terminal-native OSC 8 handling when available. In
-  Apple Terminal mouse-wheel mode, clicking a rendered `http://` or `https://`
-  URL opens that exact validated destination in the default browser because the
-  terminal does not report the Command modifier to Argo. Other URL schemes are
-  never launched.
-- Outside mouse-wheel mode, drag normally to select and copy transcript text.
-- `Shift+Tab`: cycle the selected adapter's supported execution modes.
-- `Esc`: dismiss an overlay, cancel a running turn, or discard a paused queue
-  while idle.
-- `Ctrl+C`: quit the TUI.
+## Usage reporting
+
+`/usage` separates two different measurements:
+
+1. Exact per-turn token fields emitted by the most recently completed CLI turn.
+2. Provider allowance or local history obtained from a non-inference CLI surface.
+
+| CLI | Provider/local surface used by Argo |
+|---|---|
+| Codex | local app-server rate-limit endpoint |
+| Claude Code | local `/usage` command |
+| Kiro CLI | `kiro-cli chat --no-interactive /usage` |
+| Command Code | interactive local `/usage` panel |
+| Antigravity | interactive local `/usage` panel |
+| OpenCode | `opencode stats` local history; not presented as remaining quota |
+| Grok CLI | local historical totals only; no verified remaining-quota command |
+
+Unavailable values remain unavailable; Argo does not estimate billing balance or
+invent a quota from context-window usage.
+
+## MCP management
+
+Use `/mcp add` for guided setup from the TUI. It covers local stdio servers,
+remote HTTP servers, imports, OAuth, bearer tokens, and custom headers. Tokens
+can be pasted. During OAuth, Argo opens the browser when possible and always
+shows the authorization URL so it can be copied manually.
+
+```text
+/mcp list
+/mcp check [name]
+/mcp add
+/mcp reconnect <name>
+/mcp login <name>        # /mcp reauth is an alias
+/mcp logout <name>
+/mcp remove <name>       # /mcp delete is an alias
+```
+
+Existing non-Argo vendor configuration is preserved. Argo can project MCP
+servers through generated Claude/Codex configuration, Kiro ACP descriptors, and
+the supported shared configuration formats for OpenCode, Command Code, and
+Antigravity. Grok currently has no verified MCP injection mechanism.
+
+## Delegation and child agents
+
+Claude, Codex, and Kiro can receive Argo's native delegation tools through MCP.
+Other compatible hosts can use the daemon-backed command supplied in their turn
+environment. Each delegated task gets its own conversation, run, session, and
+events, linked to its parent.
+
+The parent and children keep running when you inspect another conversation or
+leave the TUI. Child completion is never mistaken for parent completion and does
+not incorrectly advance the parent's message queue. Argo reports only child
+identity exposed by a verified stream; it does not invent subagent frames.
+
+## How context is managed
+
+Argo's SQLite history is authoritative. A vendor CLI's native session is a cache,
+reused only while the agent, model, workspace, and canonical conversation cursor
+still match. If you switch CLI or model—or another agent advances the chat—Argo
+starts a fresh native session and projects a bounded context package containing:
+
+- project instructions and workspace facts;
+- active skills and MCP availability;
+- recent user/assistant/tool history with agent attribution; and
+- a compact summary of older turns when the target context window requires it.
+
+So the entire unbounded transcript is **not** blindly copied to every CLI. The
+canonical history remains complete in Argo, while each turn receives the largest
+useful bounded projection. `/context` previews that projection and explains
+whether the next turn will resume a native session or receive a fresh transfer.
+
+## Supported agents
+
+Capabilities below describe Argo's adapter, not every feature of the vendor UI.
+Model inventories may be discovered live and therefore change by installed CLI
+version.
+
+| Agent | Output transport | Native resume | Structured activity | Argo delegation host | Modes |
+|---|---|:---:|:---:|---|---|
+| Claude Code | stream JSON | yes | yes | MCP | plan, accept-edits |
+| Codex CLI | JSONL | yes | yes | MCP | accept-edits, read-only |
+| OpenCode | JSONL | yes | yes | command | plan |
+| Kiro CLI | ACP | yes | yes | MCP | — |
+| Command Code | plain text | yes | no | command | plan, accept-edits |
+| Antigravity | stream JSON | yes | yes | command | plan, accept-edits |
+| Grok CLI | plain text | context replay | no | command target only | — |
+
+Plain-text adapters can return final prose but cannot expose structured tool
+events. `argo agents --refresh` reports the exact detected version and current
+limitations instead of launching every CLI at startup.
 
 ## Scriptable CLI
 
-Every important operation is available without the TUI:
+The same operations are available outside the TUI:
 
 ```bash
 argo doctor
@@ -359,84 +272,34 @@ argo delegate codex "inspect this failure and report likely causes"
 argo skills --root /path/to/project
 argo mcp list
 argo mcp import --yes
-argo mcp add volrix --url https://mcp.volrix.ai/mcp
 argo mcp add local-tools -- command --arg
-argo mcp login volrix
+argo mcp add remote --url https://example.test/mcp
+argo mcp login remote
 argo mcp check
-argo mcp logout volrix
-argo mcp remove volrix
+argo mcp logout remote
+argo mcp remove remote
 
+argo clear-history --root /path/to/project
 argo stop
 ```
 
-Use `argo <command> --help` for every option. `argo daemon` runs the daemon in the
-foreground; `argo mcp-server` is an internal stdio endpoint launched by supported
-agents for delegation.
+Use `argo <command> --help` for all options.
 
-## How switching and context projection work
+## Safety and storage
 
-Argo's SQLite store is authoritative. Each CLI's native session store is treated
-as a reusable cache.
+Argo runs headless CLIs, so full-access mode may let the selected agent edit files
+and execute commands without an interactive vendor prompt. `/mode plan` reduces
+authority where supported, but it is not a sandbox.
 
-A native session is reused only when all of these remain true:
-
-1. The selected agent is unchanged.
-2. The selected model is unchanged.
-3. The canonical workspace is unchanged.
-4. No other completed conversation turn advanced beyond that session's cursor.
-5. The adapter supports resume and Argo has a valid session handle.
-
-If any check fails, Argo starts a fresh native session and sends a bounded context
-package containing project instructions, workspace facts, available skills, the
-recent transcript with per-agent attribution, and a compact summary of older
-turns when necessary. Stable instructions are not resent unnecessarily on a
-valid native resume.
-
-Nothing is deleted from canonical history to fit a model window. Only the
-projection sent for that turn is reduced. Session handles and cursors are saved
-only after successful turns, and the daemon emits terminal completion only after
-the assistant message, run status, and upstream session state are durable. This
-commit barrier makes immediate queued follow-ups safe.
-
-## Project instructions
-
-Argo discovers common project convention files while walking from the workspace
-toward the repository root, including cross-vendor and agent-specific instruction
-files such as `AGENTS.md` and `CLAUDE.md`. Their source paths and content are
-included in fresh context packages so switching agents does not drop project
-rules. Missing and empty files are harmless; oversized files are bounded safely.
-
-## Data, configuration, and security
-
-Default state directories:
+Default state locations:
 
 - macOS: `~/Library/Application Support/dev.argo.argo`
 - Linux: `~/.local/share/argo`
-- Override: `ARGO_DATA_DIR=/custom/path`
+- override: `ARGO_DATA_DIR=/custom/path`
 
-The state directory contains the SQLite database, daemon socket/lock, staged
-resources, MCP registry, and OAuth token store. SQLite runs in WAL mode. One
-per-user daemon owns database writes and child processes, preventing two clients
-from interleaving partial turns in one conversation.
-
-| Environment variable | Purpose |
-|---|---|
-| `ARGO_DATA_DIR` | Relocate all Argo state |
-| `ARGO_TURN_TIMEOUT_MS` | Per-turn ceiling in milliseconds; defaults to 15 minutes, `0` disables it |
-| `ARGO_STREAM_IDLE_TIMEOUT_MS` | Client stream inactivity budget; `0` disables it |
-| `ARGO_LOG` | Daemon log filter, for example `debug` |
-
-### Authority warning
-
-Argo runs headless coding CLIs with permission prompts bypassed where necessary,
-because a child process without a terminal cannot answer an interactive prompt.
-In full-access mode, an agent may edit files and run commands without asking. The
-TUI keeps this authority visible in its status bar.
-
-`/mode plan` is the intended mode when you want proposals rather than changes. It
-withholds bypass flags where supported and states the restriction in the prompt.
-That is meaningfully safer, but it is **not a sandbox**: Argo cannot guarantee
-that an external CLI will honor every requested boundary.
+SQLite uses WAL mode and a per-user daemon serializes writes. MCP secrets are
+written atomically with owner-only permissions. See [docs/usage.md](docs/usage.md)
+for context, queue, and recovery details.
 
 ## Architecture
 
@@ -444,50 +307,29 @@ that an external CLI will honor every requested boundary.
 argo (TUI / scriptable CLI)
       │  newline-delimited JSON over a private Unix socket
       ▼
-argo-daemon ──── SQLite (WAL): conversations, messages, runs, events, sessions
+argo-daemon ─── SQLite: conversations, messages, runs, events, sessions
       │
-      ├── argo-context     transcript flattening, budgets, context packages
-      ├── argo-runtime     adapter registry, detection, stream parsers, execution
-      └── argo-resources   skills, MCP/OAuth, staging, project instructions
+      ├── argo-context     context projection and compaction
+      ├── argo-runtime     CLI discovery, adapters, parsers, execution
+      └── argo-resources   skills, MCP/OAuth, project instructions
 ```
 
-| Crate | Responsibility |
-|---|---|
-| `argo-core` | Domain model, IDs, events, titles, resume policy, mode vocabulary |
-| `argo-store` | SQLite schema and repositories |
-| `argo-context` | Context assembly, transcript attribution, and compaction |
-| `argo-runtime` | Declarative adapters, detection, process supervision, parsers |
-| `argo-resources` | Skills, MCP/OAuth, staging, and project instructions |
-| `argo-daemon` | Orchestration, IPC, durable commit ordering, delegation MCP server |
-| `argo-tui` | Terminal interface, Markdown rendering, queues, pickers, transcript |
-| `argo-cli` | The `argo` executable and scriptable client commands |
+Adding an adapter is primarily declarative under
+[`crates/argo-runtime/src/defs`](crates/argo-runtime/src/defs). A new parser is
+needed only for a wire format Argo does not already support.
 
 ## Development
 
 ```bash
 cargo fmt --all --check
-cargo test --workspace
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
-The suite covers domain policy, storage, context transfer, adapter argument
-construction, stream normalization, MCP/OAuth handling, daemon orchestration,
-queue ordering, session resume, Markdown terminal styling, and TUI viewport
-regressions.
-
-When adding or changing an adapter, declare only capabilities verified against
-the real CLI. State what was tested and what could not be verified. Do not claim
-native resume, structured tools, MCP, or execution modes that the upstream CLI
-does not actually expose.
-
-## Prior art
-
-Argo's architecture follows [Open Design](https://github.com/opendesign-ai)'s
-approach: a local daemon as the authority, declarative adapters rather than
-subclasses, native session handles guarded by identity, and project-local staging
-of shared resources. Its context model also draws on OpenCode's separation of
-durable history from the projected turn.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the Git branch, commit, sync, and pull
+request workflow. Installation and update procedures are in
+[docs/installation.md](docs/installation.md).
 
 ## License
 

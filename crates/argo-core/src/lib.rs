@@ -28,14 +28,14 @@ pub use runtime::{
 pub use session::{
     AgentSessionRecord, InvalidationReason, ResumeDecision, ResumePlan, SelectionChange,
 };
-pub use title::conversation_title;
+pub use title::{conversation_description, conversation_title};
 
 /// Protocol version for the daemon <-> client IPC contract.
 ///
 /// The daemon refuses connections from clients advertising a different major
 /// version so that an upgraded binary can never be driven by a stale TUI that
 /// would misinterpret the event stream.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 /// Name of the per-project directory Argo owns inside a user workspace.
 pub const ARGO_WORKSPACE_DIR: &str = ".argo";

@@ -1,6 +1,6 @@
 //! Antigravity adapter.
 //!
-//! Verified against the installed CLI (`agy` 1.1.4). `agy -p` runs one prompt
+//! Verified against the installed CLI (`agy` 1.1.9). `agy -p` runs one prompt
 //! non-interactively, `--conversation <id>` resumes a previous conversation,
 //! `--mode` selects `plan` or `accept-edits`, and `--dangerously-skip-permissions`
 //! bypasses approval prompts for headless use.
@@ -14,8 +14,10 @@ use crate::def::{InvocationContext, ModelProbe, RuntimeDef};
 use argo_core::mode::{AgentMode, ModeSupport};
 use argo_core::runtime::{
     AgentCapabilities, McpInjection, ModelOption, PermissionPosture, PromptDelivery,
-    PromptEncoding, StreamFormat,
+    PromptEncoding, ReasoningOption, StreamFormat,
 };
+
+const EFFORT_LEVELS: &[(&str, &str)] = &[("low", "low"), ("medium", "medium"), ("high", "high")];
 
 fn build_args(ctx: &InvocationContext) -> Vec<String> {
     // `--print` is a string flag whose *next value is the prompt*. It must be
@@ -99,6 +101,28 @@ fn parse_models(stdout: &str) -> Vec<ModelOption> {
     out
 }
 
+/// Returns effort controls only for Antigravity models with adjustable effort.
+///
+/// The current Gemini and GPT-OSS inventory publishes separate model ids ending
+/// in `-low`, `-medium`, or `-high`; choosing one already fixes the effort. The
+/// Claude entries instead use the CLI's independent `--effort` session control.
+fn parse_model_reasoning(stdout: &str) -> Vec<(String, Vec<ReasoningOption>)> {
+    parse_models(stdout)
+        .into_iter()
+        .filter(|model| model.id.to_ascii_lowercase().starts_with("claude-"))
+        .map(|model| {
+            let levels = EFFORT_LEVELS
+                .iter()
+                .map(|(id, label)| ReasoningOption {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                })
+                .collect();
+            (model.id, levels)
+        })
+        .collect()
+}
+
 /// Antigravity adapter definition.
 pub const ANTIGRAVITY: RuntimeDef = RuntimeDef {
     id: "antigravity",
@@ -111,17 +135,24 @@ pub const ANTIGRAVITY: RuntimeDef = RuntimeDef {
         args: &["models"],
         timeout_ms: 15_000,
         parse: parse_models,
-        parse_reasoning: None,
+        parse_reasoning: Some(parse_model_reasoning),
     }),
     fallback_models: &[
         ("default", "default (CLI configured)"),
-        ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
-        (
-            "Claude Sonnet 4.6 (Thinking)",
-            "Claude Sonnet 4.6 (Thinking)",
-        ),
+        ("gemini-3.6-flash-high", "gemini-3.6-flash-high"),
+        ("gemini-3.6-flash-medium", "gemini-3.6-flash-medium"),
+        ("gemini-3.6-flash-low", "gemini-3.6-flash-low"),
+        ("gemini-3.5-flash-high", "gemini-3.5-flash-high"),
+        ("gemini-3.5-flash-medium", "gemini-3.5-flash-medium"),
+        ("gemini-3.5-flash-low", "gemini-3.5-flash-low"),
+        ("gemini-3.1-pro-high", "gemini-3.1-pro-high"),
+        ("gemini-3.1-pro-low", "gemini-3.1-pro-low"),
+        ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+        ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking"),
+        ("gpt-oss-120b-medium", "gpt-oss-120b-medium"),
     ],
-    reasoning_options: &[("low", "low"), ("medium", "medium"), ("high", "high")],
+    // Antigravity effort is model-specific; see `parse_model_reasoning`.
+    reasoning_options: &[],
     auth_probe: None,
     build_args,
     capture_session: None,
@@ -192,13 +223,13 @@ mod tests {
     #[test]
     fn model_and_conversation_are_forwarded() {
         let args = ANTIGRAVITY.args_for(&InvocationContext {
-            model: Some("Gemini 3.1 Pro (High)".into()),
+            model: Some("gemini-3.1-pro-high".into()),
             resume_session: Some("conv-42".into()),
             ..ctx()
         });
         assert!(args
             .windows(2)
-            .any(|w| w == ["--model", "Gemini 3.1 Pro (High)"]));
+            .any(|w| w == ["--model", "gemini-3.1-pro-high"]));
         assert!(args.windows(2).any(|w| w == ["--conversation", "conv-42"]));
     }
 
@@ -212,19 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn model_discovery_keeps_names_verbatim() {
-        // The displayed name is also what --model expects.
-        let stdout = "Gemini 3.6 Flash (High)\n\
-                      Gemini 3.1 Pro (Low)\n\
-                      Claude Sonnet 4.6 (Thinking)\n";
+    fn model_discovery_keeps_ids_verbatim() {
+        let stdout = "gemini-3.6-flash-high\n\
+                      gemini-3.1-pro-low\n\
+                      claude-sonnet-4-6\n";
         let ids: Vec<String> = parse_models(stdout).into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
             vec![
                 "default".to_string(),
-                "Gemini 3.6 Flash (High)".to_string(),
-                "Gemini 3.1 Pro (Low)".to_string(),
-                "Claude Sonnet 4.6 (Thinking)".to_string(),
+                "gemini-3.6-flash-high".to_string(),
+                "gemini-3.1-pro-low".to_string(),
+                "claude-sonnet-4-6".to_string(),
             ]
         );
     }
@@ -232,13 +262,34 @@ mod tests {
     #[test]
     fn model_discovery_rejects_banners_and_prose() {
         let stdout = "Available models:\n\
-                      Gemini 3.1 Pro (High)\n\
+                      gemini-3.1-pro-high\n\
                       this line is a long sentence that is clearly not a model name\n";
         let ids: Vec<String> = parse_models(stdout).into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
-            vec!["default".to_string(), "Gemini 3.1 Pro (High)".to_string()]
+            vec!["default".to_string(), "gemini-3.1-pro-high".to_string()]
         );
+    }
+
+    #[test]
+    fn effort_is_offered_only_for_adjustable_antigravity_models() {
+        let stdout = "gemini-3.6-flash-high\n\
+                      claude-sonnet-4-6\n\
+                      claude-opus-4-6-thinking\n\
+                      gpt-oss-120b-medium\n";
+        let reasoning = parse_model_reasoning(stdout);
+        let models: Vec<&str> = reasoning.iter().map(|(model, _)| model.as_str()).collect();
+        assert_eq!(
+            models,
+            vec!["claude-sonnet-4-6", "claude-opus-4-6-thinking"]
+        );
+        assert!(reasoning.iter().all(|(_, levels)| {
+            levels
+                .iter()
+                .map(|level| level.id.as_str())
+                .collect::<Vec<_>>()
+                == ["low", "medium", "high"]
+        }));
     }
 
     #[test]
