@@ -55,6 +55,8 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
   additional enforcement layer.
 - Streams responses, CLI-emitted thinking, tools, file changes, plans, usage,
   and delegated-agent activity without inventing hidden reasoning.
+- Separates user prompts from agent responses with a quiet full-width prompt
+  surface and preserves Markdown list hierarchy when narrow terminals wrap it.
 - Lets you show or hide thinking with `/thinking` or `Ctrl+T`, including while a
   model is running.
 - Recognizes deliberate numbered choices and presents a keyboard picker.

@@ -184,7 +184,55 @@ impl MarkdownBuilder {
         if self.lines.is_empty() {
             self.lines.push(Vec::new());
         }
+        repair_orphaned_ordered_markers(&mut self.lines);
         self.lines
+    }
+}
+
+/// Models occasionally emit an ordered marker as its own paragraph followed by
+/// a bold item title. Markdown treats those as unrelated blocks, producing the
+/// distracting `1.`-on-one-row/title-on-the-next shape. Join that recognizable
+/// form at presentation time while leaving canonical assistant text untouched.
+fn repair_orphaned_ordered_markers(lines: &mut Vec<Vec<Segment>>) {
+    let mut index = 0;
+    while index < lines.len() {
+        let marker = lines[index]
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        let trimmed = marker.trim();
+        let is_ordered_marker = trimmed
+            .strip_suffix('.')
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+        if !is_ordered_marker {
+            index += 1;
+            continue;
+        }
+
+        let Some(next) = ((index + 1)..lines.len()).find(|next| !lines[*next].is_empty()) else {
+            break;
+        };
+        let next_text = lines[next]
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        if ordered_marker_width(&next_text).is_some() {
+            index = next;
+            continue;
+        }
+
+        let base = lines[index]
+            .first()
+            .map(|segment| segment.style)
+            .unwrap_or_default();
+        let mut joined = vec![Segment {
+            text: format!("{trimmed} "),
+            style: base.fg(BULLET).add_modifier(Modifier::BOLD),
+        }];
+        joined.extend(lines[next].clone());
+        lines[index] = joined;
+        lines.drain((index + 1)..=next);
+        index += 1;
     }
 }
 
@@ -363,7 +411,7 @@ pub(crate) fn render(
         for (index, row) in wrap_segments(&logical, text_width).into_iter().enumerate() {
             let marker = if index == 0 { prefix } else { &indent };
             let mut spans = Vec::with_capacity(row.len() + 1);
-            spans.push(Span::styled(marker.to_string(), base));
+            spans.push(Span::styled(marker.to_string(), base.fg(QUOTE)));
             spans.extend(
                 row.into_iter()
                     .map(|segment| Span::styled(segment.text, segment.style)),
@@ -382,13 +430,28 @@ fn wrap_segments(segments: &[Segment], width: usize) -> Vec<Vec<Segment>> {
         .iter()
         .flat_map(|segment| segment.text.chars().map(move |ch| (ch, segment.style)))
         .collect();
+    let hanging_indent = ordered_marker_width(
+        &segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>(),
+    )
+    .filter(|indent| *indent < width)
+    .unwrap_or(0);
+    let indent_style = segments
+        .first()
+        .map(|segment| segment.style)
+        .unwrap_or_default();
     let mut rows = Vec::new();
     let mut start = 0;
+    let mut first = true;
     while start < chars.len() {
+        let row_indent = if first { 0 } else { hanging_indent };
+        let capacity = width.saturating_sub(row_indent).max(1);
         let available = chars.len() - start;
-        let mut end = start + available.min(width);
+        let mut end = start + available.min(capacity);
         let mut next = end;
-        if available > width {
+        if available > capacity {
             if let Some(space) = (start..end).rev().find(|index| chars[*index].0 == ' ') {
                 if space > start {
                     end = space;
@@ -399,13 +462,44 @@ fn wrap_segments(segments: &[Segment], width: usize) -> Vec<Vec<Segment>> {
         while next < chars.len() && chars[next].0 == ' ' {
             next += 1;
         }
-        rows.push(coalesce(&chars[start..end]));
+        let mut row = Vec::new();
+        if row_indent > 0 {
+            row.push(Segment {
+                text: " ".repeat(row_indent),
+                style: indent_style,
+            });
+        }
+        row.extend(coalesce(&chars[start..end]));
+        rows.push(row);
         start = next;
+        first = false;
     }
     if rows.is_empty() {
         rows.push(Vec::new());
     }
     rows
+}
+
+/// Width of a leading ordered-list marker, including nested indentation and the
+/// following space (`"  12. "` -> 6).
+fn ordered_marker_width(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    while bytes.get(cursor) == Some(&b' ') {
+        cursor += 1;
+    }
+    let number_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == number_start || bytes.get(cursor) != Some(&b'.') {
+        return None;
+    }
+    cursor += 1;
+    if bytes.get(cursor) != Some(&b' ') {
+        return None;
+    }
+    Some(cursor + 1)
 }
 
 fn coalesce(chars: &[(char, Style)]) -> Vec<Segment> {
@@ -536,5 +630,58 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(text, "one two three four five");
+    }
+
+    #[test]
+    fn orphaned_ordered_marker_is_joined_to_the_following_title() {
+        let lines = render(
+            "1.\n\n**Split tools by market**\n\n- Separate profiles",
+            "│ ",
+            base(),
+            50,
+        );
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("1. Split tools by market")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.trim() == "│ 1."), "{rows:?}");
+    }
+
+    #[test]
+    fn wrapped_ordered_items_use_a_hanging_indent() {
+        let lines = render(
+            "1. Route requests by market before retrieving a strategy section",
+            "│ ",
+            base(),
+            24,
+        );
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows[0].starts_with("│ 1. "), "{rows:?}");
+        assert!(rows[1].starts_with("  ".to_string().as_str()), "{rows:?}");
+        assert!(
+            rows[1]
+                .strip_prefix("  ")
+                .is_some_and(|row| row.starts_with("   ")),
+            "{rows:?}"
+        );
     }
 }

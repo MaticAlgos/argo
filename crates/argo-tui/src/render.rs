@@ -22,6 +22,9 @@ const ACCENT: Color = Color::Rgb(94, 200, 255);
 const NOTICE: Color = Color::Rgb(255, 196, 92);
 /// Muted colour for secondary detail.
 const MUTED: Color = Color::Rgb(120, 130, 145);
+/// Soft full-width surface separating a user prompt from assistant prose.
+const USER_BG: Color = Color::Rgb(43, 51, 66);
+const USER_FG: Color = Color::Rgb(235, 238, 244);
 
 /// A stable colour per agent, so a multi-agent transcript is scannable.
 ///
@@ -266,6 +269,15 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
             continue;
         }
         collapsed_thinking = false;
+        // A prompt begins a new conversational beat. The shaded row does the
+        // role separation; one quiet row above it keeps long answers from running
+        // directly into the next request.
+        if line.kind == LineKind::User
+            && !rendered.is_empty()
+            && rendered.last().is_some_and(|row| !row.spans.is_empty())
+        {
+            rendered.push(TextLine::from(""));
+        }
         rendered.extend(render_line(line, inner_width));
     }
 
@@ -417,18 +429,16 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 
 /// Styles one transcript line, wrapped to `inner_width`.
 fn render_line(line: &crate::app::Line, inner_width: usize) -> Vec<TextLine<'static>> {
+    if line.kind == LineKind::User {
+        return render_user_message(&line.text, inner_width);
+    }
     if line.kind == LineKind::Assistant {
         let style = Style::default().fg(Color::Rgb(228, 228, 235));
         return crate::markdown::render(&line.text, "│ ", style, inner_width);
     }
 
     let (prefix, style) = match line.kind {
-        LineKind::User => (
-            "▌ ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        LineKind::User => unreachable!("user messages have a dedicated renderer"),
         // A visible rail keeps a multi-line response distinct from tool activity and
         // from the next user turn. Explicit colour avoids terminal themes where
         // Color::Reset is nearly the background.
@@ -473,6 +483,37 @@ fn render_line(line: &crate::app::Line, inner_width: usize) -> Vec<TextLine<'sta
             out.push(TextLine::from(vec![
                 Span::styled(marker, style),
                 Span::styled(row, style),
+            ]));
+        }
+    }
+    out
+}
+
+/// Renders a calm, full-width prompt surface inspired by editorial chat UIs.
+///
+/// Background fill is explicit because terminal widgets style only occupied
+/// cells; without the padding, a short prompt looks like a highlighted fragment
+/// rather than a coherent message row.
+fn render_user_message(text: &str, inner_width: usize) -> Vec<TextLine<'static>> {
+    let prefix = "› ";
+    let prefix_width = prefix.chars().count();
+    let text_width = inner_width.saturating_sub(prefix_width);
+    let prefix_style = Style::default()
+        .fg(ACCENT)
+        .bg(USER_BG)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(USER_FG).bg(USER_BG);
+    let mut out = Vec::new();
+
+    for paragraph in text.split('\n') {
+        for (index, row) in wrap_words(paragraph, text_width).into_iter().enumerate() {
+            let marker = if index == 0 { prefix } else { "  " };
+            let occupied = prefix_width + row.chars().count();
+            let padding = " ".repeat(inner_width.saturating_sub(occupied));
+            out.push(TextLine::from(vec![
+                Span::styled(marker.to_string(), prefix_style),
+                Span::styled(row, text_style),
+                Span::styled(padding, text_style),
             ]));
         }
     }
@@ -1107,6 +1148,53 @@ mod tests {
             .iter()
             .any(|cell| { cell.symbol() == "C" && cell.bg == Color::Rgb(38, 43, 52) }));
         assert_eq!(app.lines.last().expect("assistant").text, source);
+    }
+
+    #[test]
+    fn user_prompt_has_a_full_width_quiet_surface() {
+        let mut app = App::new("/repo");
+        app.push(LineKind::User, "why did this agent delegate?");
+        app.push(LineKind::AgentHeader, "kiro · auto · resumed session");
+        app.push(LineKind::Assistant, "It used an outdated instruction.");
+
+        let width = 64usize;
+        let backend = TestBackend::new(width as u16, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let cells = terminal.backend().buffer().content();
+        let prompt_cell = cells
+            .iter()
+            .position(|cell| cell.symbol() == "›")
+            .expect("prompt marker");
+        let row = prompt_cell / width;
+        let inner = &cells[(row * width + 1)..(row * width + width - 1)];
+        assert!(inner.iter().all(|cell| cell.bg == USER_BG));
+        assert!(inner
+            .iter()
+            .any(|cell| cell.symbol() == "w" && !cell.modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn reference_transcript_keeps_roles_and_numbered_titles_together() {
+        let mut app = App::new("/repo");
+        app.push(
+            LineKind::User,
+            "Can you summarize the upgrades needed for the MCP?",
+        );
+        app.push(
+            LineKind::AgentHeader,
+            "kiro · gpt-5.6-sol · resumed session",
+        );
+        app.push(
+            LineKind::Assistant,
+            "## Priority upgrades\n\n1.\n\n**Split tools by market**\n\n- Separate profiles for index, MCX, and crypto.\n\n2. **Retrieve skills by section**",
+        );
+
+        let output = render(&app, 92, 24);
+        assert!(output.contains("› Can you summarize"), "{output}");
+        assert!(output.contains("1. Split tools by market"), "{output}");
+        assert!(!output.contains("│ 1.\n"), "{output}");
+        assert!(output.contains("2. Retrieve skills by section"), "{output}");
     }
 
     #[test]
