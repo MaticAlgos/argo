@@ -8,9 +8,9 @@ logos, and trademarks belong to their respective owners.
 |---|---|
 | `agents/antigravity.png` | [Google Antigravity press assets](https://www.antigravity.google/press) |
 | `agents/claude.png` | [Claude website favicon](https://claude.com/) |
-| `agents/codex.svg` | [OpenAI mark from Simple Icons](https://simpleicons.org/?q=openai); project reference: [OpenAI Codex](https://github.com/openai/codex) |
+| `agents/codex-*.svg` | Light/dark OpenAI mark from [Simple Icons](https://simpleicons.org/?q=openai); project reference: [OpenAI Codex](https://github.com/openai/codex) |
 | `agents/command-code-*.svg` | [Command Code repository](https://github.com/CommandCodeAI/command-code/tree/main/.github/commandcode/logo) |
-| `agents/grok-light.png` | [xAI-hosted Grok Build mark](https://github.com/xai-org/grok-build) |
+| `agents/grok-*.png` | Official light/dark marks referenced by the [Grok Build repository](https://github.com/xai-org/grok-build) |
 | `agents/kiro.png` | [Kiro repository](https://github.com/kirodotdev/Kiro/blob/main/assets/kiro-icon.png) |
 | `agents/opencode-*.svg` | [OpenCode repository](https://github.com/anomalyco/opencode/tree/dev/packages/console/app/src/asset) |
 

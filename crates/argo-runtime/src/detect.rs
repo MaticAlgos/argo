@@ -471,9 +471,13 @@ mod tests {
 
         let info = detect_one(&SH).await;
         assert!(info.available);
-        // detect_one resolves to absolute path now.
+        // Canonicalization may resolve `/bin/sh` to the implementation binary
+        // (for example `/usr/bin/dash` on Ubuntu), but the result must be an
+        // absolute executable path on every platform.
         assert!(
-            info.path.as_ref().unwrap().ends_with("/sh"),
+            info.path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).is_absolute()),
             "path should be absolute: {:?}",
             info.path
         );

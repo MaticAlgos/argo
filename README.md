@@ -24,12 +24,12 @@ does best.
 <table>
   <tr align="center">
     <td width="14%"><img src="docs/assets/agents/claude.png" alt="Claude" height="44"></td>
-    <td width="14%"><img src="docs/assets/agents/codex.svg" alt="Codex" height="44"></td>
+    <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/codex-dark.svg"><img src="docs/assets/agents/codex-light.svg" alt="Codex" height="44"></picture></td>
     <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/opencode-dark.svg"><img src="docs/assets/agents/opencode-light.svg" alt="OpenCode" height="44"></picture></td>
     <td width="14%"><img src="docs/assets/agents/kiro.png" alt="Kiro" height="44"></td>
     <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/command-code-dark.svg"><img src="docs/assets/agents/command-code-light.svg" alt="Command Code" height="44"></picture></td>
     <td width="14%"><img src="docs/assets/agents/antigravity.png" alt="Antigravity" height="44"></td>
-    <td width="14%"><img src="docs/assets/agents/grok-light.png" alt="Grok" height="44"></td>
+    <td width="14%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/agents/grok-dark.png"><img src="docs/assets/agents/grok-light.png" alt="Grok" height="44"></picture></td>
   </tr>
   <tr align="center">
     <td>Claude Code</td><td>Codex CLI</td><td>OpenCode</td><td>Kiro CLI</td>
