@@ -317,7 +317,7 @@ version.
 | Codex CLI | JSONL | yes | yes | MCP | accept-edits, read-only |
 | OpenCode | JSONL | yes | yes | command | plan |
 | Kiro CLI | ACP | yes | yes | MCP | plan |
-| Command Code | plain text | yes | no | command | plan, accept-edits |
+| Command Code | stream JSON | yes | yes | command | plan, accept-edits |
 | Antigravity | stream JSON | yes | yes | command | plan, accept-edits |
 | Grok CLI | plain text | context replay | no | command target only | — |
 

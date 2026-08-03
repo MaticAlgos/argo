@@ -1,12 +1,11 @@
 //! Command Code adapter.
-//! Verified against the installed CLI (0.41.1). `cmd -p "<query>"` runs one
-//! non-interactive turn, `--yolo` bypasses permission prompts, `-m` selects a
-//! model, and `--list-models` reports provider-qualified models.
+//! Verified against the installed CLI (1.9.0). `cmd -p --output-format json`
+//! emits an NDJSON event stream, `--yolo` bypasses permission prompts, `-m`
+//! selects a model, and `--list-models` reports provider-qualified models.
 //!
-//! Command Code has no structured stdout format, so tool events are not
-//! available. It does, however, persist each session under
-//! `~/.commandcode/projects/<workspace-slug>/<session-id>.jsonl`. Argo discovers
-//! the file created by a successful fresh turn and uses its id with `--resume`.
+//! The stream reports the session id directly. Command Code also persists each
+//! session under `~/.commandcode/projects/<workspace-slug>/<session-id>.jsonl`,
+//! which remains a fallback when a successful turn omits the stream record.
 
 use crate::def::{AuthProbe, InvocationContext, ModelProbe, RuntimeDef};
 use argo_core::mode::{AgentMode, ModeSupport};
@@ -20,8 +19,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 fn build_args(ctx: &InvocationContext) -> Vec<String> {
-    // `-p` enables one non-interactive turn; the engine supplies the prompt.
-    let mut args: Vec<String> = vec!["-p".into()];
+    // `-p` enables one non-interactive turn; JSON exposes incremental text,
+    // tool activity, usage, and the durable session id.
+    let mut args: Vec<String> = vec!["-p".into(), "--output-format".into(), "json".into()];
 
     if let Some(session_id) = &ctx.resume_session {
         args.push("--resume".into());
@@ -204,7 +204,7 @@ pub const COMMAND_CODE: RuntimeDef = RuntimeDef {
     build_args,
     capture_session: Some(capture_session),
     capabilities: AgentCapabilities {
-        stream_format: StreamFormat::Plain,
+        stream_format: StreamFormat::JsonEventStream,
         // `-p` enables one non-interactive turn; the prompt is written to stdin.
         prompt_delivery: PromptDelivery::Stdin,
         prompt_encoding: PromptEncoding::Raw,
@@ -234,6 +234,9 @@ mod tests {
     fn a_turn_runs_non_interactively_without_prompts() {
         let args = COMMAND_CODE.args_for(&ctx());
         assert_eq!(args[0], "-p");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--output-format", "json"]));
         // Any of these prompts would hang a headless turn.
         assert!(args.contains(&"--yolo".to_string()));
         assert!(args.contains(&"--skip-onboarding".to_string()));
@@ -380,10 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_reflect_sidecar_resume() {
-        // Plain stdout still has no per-tool events.
+    fn capabilities_reflect_streaming_and_sidecar_resume() {
         const {
-            assert!(!COMMAND_CODE
+            assert!(COMMAND_CODE
                 .capabilities
                 .stream_format
                 .has_structured_tool_events())

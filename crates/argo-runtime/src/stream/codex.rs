@@ -1,10 +1,9 @@
-//! Codex JSONL event-stream parser.
+//! Typed JSONL event-stream parser.
 //!
-//! Verified against OpenAI's documented `codex exec --json` output: each stdout
-//! line is a JSON object with a `type` such as `thread.started`, `turn.started`,
-//! `turn.completed`, `turn.failed`, `item.started`, `item.completed`, or `error`.
-//! Item types cover agent messages, reasoning, command execution, file changes,
-//! MCP tool calls, web searches, and plan updates.
+//! Codex emits top-level `thread`, `turn`, and `item` records; OpenCode uses
+//! `sessionID` plus text/tool records; Command Code wraps run, text, and tool
+//! records in `{ "type": "event", "event": ... }`. All three are normalized
+//! here because they share the same newline-delimited transport and lifecycle.
 
 use super::{truncate, StreamSink, TerminalOutcome};
 use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
@@ -65,6 +64,14 @@ impl CodexStreamParser {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
         {
+            // Command Code wraps incremental records in `{type:"event", event}`
+            // and finishes with a top-level `{type:"result", ...}` record.
+            "event" => {
+                if let Some(event) = value.get("event") {
+                    self.handle_command_code_event(event, sink);
+                }
+            }
+            "result" => self.handle_command_code_result(&value, sink),
             // The thread id is the handle `codex exec resume <id>` needs.
             "thread.started" => {
                 if let Some(id) = value.get("thread_id").and_then(|v| v.as_str()) {
@@ -194,6 +201,169 @@ impl CodexStreamParser {
                 });
             }
             _ => {}
+        }
+    }
+
+    fn capture_session_once(&mut self, session: &str, sink: &mut dyn StreamSink) {
+        if session.is_empty() || self.session_seen {
+            return;
+        }
+        self.session_seen = true;
+        sink.emit(RunEventKind::SessionCaptured {
+            session_id: SessionId::new(session),
+        });
+    }
+
+    fn handle_command_code_event(&mut self, event: &serde_json::Value, sink: &mut dyn StreamSink) {
+        match event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+        {
+            "run_start" => {
+                if let Some(session) = event.get("sessionId").and_then(|value| value.as_str()) {
+                    self.capture_session_once(session, sink);
+                }
+            }
+            "text_delta" => {
+                if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
+                    if !delta.is_empty() {
+                        self.agent_items
+                            .entry("command-code".into())
+                            .or_default()
+                            .push_str(delta);
+                        sink.emit(RunEventKind::TextDelta {
+                            text: delta.to_string(),
+                        });
+                    }
+                }
+            }
+            "thinking_delta" | "reasoning_delta" => {
+                if let Some(delta) = event
+                    .get("delta")
+                    .or_else(|| event.get("text"))
+                    .and_then(|value| value.as_str())
+                {
+                    if !delta.is_empty() {
+                        sink.emit(RunEventKind::ThinkingDelta {
+                            text: delta.to_string(),
+                        });
+                    }
+                }
+            }
+            "tool_queued" => {
+                let id = event
+                    .get("toolCallId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let name = event
+                    .get("toolName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                sink.emit(RunEventKind::ToolStarted {
+                    id,
+                    name,
+                    input: event
+                        .get("input")
+                        .map(|value| truncate(&value.to_string(), 2_000)),
+                });
+            }
+            "tool_completed" | "tool_failed" => {
+                let id = event
+                    .get("toolCallId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                sink.emit(RunEventKind::ToolCompleted {
+                    id,
+                    output: event
+                        .get("result")
+                        .or_else(|| event.get("error"))
+                        .map(|value| truncate(&value.to_string(), 4_000)),
+                    ok: event.get("type").and_then(|value| value.as_str())
+                        == Some("tool_completed"),
+                });
+            }
+            "run_end" => {
+                if let Some(result) = event.get("result") {
+                    self.handle_command_code_result(result, sink);
+                }
+            }
+            "run_error" | "error" => {
+                let message = extract_error_message(event)
+                    .unwrap_or_else(|| "Command Code reported an error".to_string());
+                let missing = is_missing_thread(&message);
+                sink.emit(RunEventKind::Error {
+                    code: if missing {
+                        "RESUME_TARGET_MISSING".into()
+                    } else {
+                        "AGENT_ERROR".into()
+                    },
+                    message: truncate(&message, 500),
+                    retryable: missing,
+                });
+                self.outcome = Some(TerminalOutcome {
+                    status: RunStatus::Failed,
+                    usage: parse_command_code_usage(event.get("usage")),
+                    resume_target_missing: missing,
+                    message: Some(truncate(&message, 500)),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_command_code_result(
+        &mut self,
+        result: &serde_json::Value,
+        sink: &mut dyn StreamSink,
+    ) {
+        if let Some(session) = result.get("sessionId").and_then(|value| value.as_str()) {
+            self.capture_session_once(session, sink);
+        }
+
+        let subtype = result
+            .get("subtype")
+            .and_then(|value| value.as_str())
+            .unwrap_or("success");
+        let succeeded = subtype == "success";
+        let usage = parse_command_code_usage(result.get("usage"));
+        if succeeded {
+            // Command Code repeats the complete answer in both `run_end` and the
+            // final result line. Use it only when no text_delta was observed.
+            let streamed = self
+                .agent_items
+                .get("command-code")
+                .is_some_and(|text| !text.is_empty());
+            if !streamed {
+                if let Some(text) = result.get("finalText").and_then(|value| value.as_str()) {
+                    if !text.is_empty() {
+                        self.agent_items
+                            .insert("command-code".into(), text.to_string());
+                        sink.emit(RunEventKind::TextDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            self.outcome = Some(TerminalOutcome {
+                status: RunStatus::Succeeded,
+                usage,
+                resume_target_missing: false,
+                message: None,
+            });
+        } else {
+            let message = extract_error_message(result)
+                .unwrap_or_else(|| format!("Command Code result: {subtype}"));
+            let missing = is_missing_thread(&message);
+            self.outcome = Some(TerminalOutcome {
+                status: RunStatus::Failed,
+                usage,
+                resume_target_missing: missing,
+                message: Some(truncate(&message, 500)),
+            });
         }
     }
 
@@ -350,6 +520,23 @@ fn unseen_suffix(
     delta.filter(|delta| !delta.is_empty())
 }
 
+/// Reads Command Code's camel-case token shape.
+fn parse_command_code_usage(usage: Option<&serde_json::Value>) -> TokenUsage {
+    let Some(usage) = usage else {
+        return TokenUsage::default();
+    };
+    TokenUsage {
+        input: usage.get("inputTokens").and_then(|value| value.as_u64()),
+        output: usage.get("outputTokens").and_then(|value| value.as_u64()),
+        cached_input: usage
+            .get("cacheReadTokens")
+            .and_then(|value| value.as_u64()),
+        reasoning: usage
+            .get("reasoningTokens")
+            .and_then(|value| value.as_u64()),
+    }
+}
+
 /// Reads OpenCode's nested token shape.
 fn parse_opencode_usage(tokens: Option<&serde_json::Value>) -> TokenUsage {
     let Some(tokens) = tokens else {
@@ -480,6 +667,65 @@ mod tests {
             parser.push_line(line, &mut sink);
         }
         (sink.events, parser.outcome().cloned())
+    }
+
+    #[test]
+    fn command_code_events_are_understood_by_the_shared_parser() {
+        // Captured from Command Code 1.9.0 `-p --output-format json`.
+        let (events, outcome) = parse(&[
+            r#"{"type":"event","event":{"type":"run_start","sessionId":"cmd-session"}}"#,
+            r#"{"type":"event","event":{"type":"tool_queued","toolCallId":"tool-1","toolName":"shell_command","input":{"command":"printf TOOL_OK"}}}"#,
+            r#"{"type":"event","event":{"type":"tool_completed","toolCallId":"tool-1","toolName":"shell_command","result":[{"type":"text","text":"TOOL_OK"}]}}"#,
+            r#"{"type":"event","event":{"type":"text_delta","delta":"STREAM"}}"#,
+            r#"{"type":"event","event":{"type":"text_delta","delta":"_OK"}}"#,
+            r#"{"type":"event","event":{"type":"run_end","result":{"finalText":"STREAM_OK","usage":{"inputTokens":41,"outputTokens":7,"cacheReadTokens":13}}}}"#,
+            r#"{"type":"result","subtype":"success","sessionId":"cmd-session","finalText":"STREAM_OK","usage":{"inputTokens":41,"outputTokens":7,"cacheReadTokens":13}}"#,
+        ]);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEventKind::SessionCaptured { .. }))
+                .count(),
+            1
+        );
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "STREAM_OK", "final records must not duplicate deltas");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEventKind::ToolStarted { id, name, .. }
+                if id == "tool-1" && name == "shell_command"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEventKind::ToolCompleted { id, ok: true, .. } if id == "tool-1"
+        )));
+
+        let outcome = outcome.expect("terminal outcome");
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(outcome.usage.input, Some(41));
+        assert_eq!(outcome.usage.output, Some(7));
+        assert_eq!(outcome.usage.cached_input, Some(13));
+    }
+
+    #[test]
+    fn command_code_result_only_turn_still_yields_text() {
+        let (events, outcome) = parse(&[
+            r#"{"type":"result","subtype":"success","sessionId":"cmd-session","finalText":"only in result","usage":{"inputTokens":3,"outputTokens":2}}"#,
+        ]);
+        assert!(events.contains(&RunEventKind::TextDelta {
+            text: "only in result".into()
+        }));
+        assert_eq!(
+            outcome.expect("terminal outcome").status,
+            RunStatus::Succeeded
+        );
     }
 
     #[test]

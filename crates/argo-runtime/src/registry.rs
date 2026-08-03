@@ -127,6 +127,7 @@ mod tests {
     fn transport_coverage_matches_the_mvp_plan() {
         let claude = find("claude").expect("claude");
         let codex = find("codex").expect("codex");
+        let command_code = find("cmd").expect("command code");
         let kiro = find("kiro").expect("kiro");
         let grok = find("grok").expect("grok");
 
@@ -136,6 +137,10 @@ mod tests {
         );
         assert_eq!(
             codex.capabilities.stream_format,
+            StreamFormat::JsonEventStream
+        );
+        assert_eq!(
+            command_code.capabilities.stream_format,
             StreamFormat::JsonEventStream
         );
         assert_eq!(kiro.capabilities.stream_format, StreamFormat::AcpJsonRpc);

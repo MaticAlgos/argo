@@ -3836,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_report_for_command_code_says_plain_text() {
+    fn usage_report_for_command_code_reflects_structured_streaming() {
         let mut app = new_app();
         app.begin_run(RunId::new("r1"), "cmd", Some("gemini"), false);
         app.apply_event(RunEventKind::RunFinished {
@@ -3845,9 +3845,12 @@ mod tests {
         });
         let report = app.usage_report().join("\n");
         assert!(report.contains("cmd/gemini"), "{report}");
-        assert!(report.contains("Command Code"), "{report}");
-        assert!(report.contains("plain-text output"), "{report}");
-        assert!(report.contains("structurally unavailable"), "{report}");
+        assert!(
+            report.contains("Command Code did not report exact token counts"),
+            "{report}"
+        );
+        assert!(!report.contains("plain-text output"), "{report}");
+        assert!(!report.contains("structurally unavailable"), "{report}");
         assert!(!report.contains("quota"), "{report}");
         assert!(!report.contains("opencode"), "{report}");
     }
@@ -4184,14 +4187,18 @@ mod new_feature_tests {
     }
 
     #[test]
-    fn structured_adapter_does_not_show_no_streaming_notice() {
-        let mut app = new_app();
-        app.begin_run(RunId::new("r1"), "claude", None, false);
-        let has_notice = app
-            .lines
-            .iter()
-            .any(|l| l.kind == LineKind::Notice && l.text.contains("final output only"));
-        assert!(!has_notice, "structured adapter should NOT show the notice");
+    fn structured_adapters_do_not_show_no_streaming_notice() {
+        for agent in ["claude", "cmd"] {
+            let mut app = new_app();
+            app.begin_run(RunId::new(format!("{agent}-run")), agent, None, false);
+            let has_notice = app.lines.iter().any(|line| {
+                line.kind == LineKind::Notice && line.text.contains("final output only")
+            });
+            assert!(
+                !has_notice,
+                "structured adapter {agent} should NOT show the notice"
+            );
+        }
     }
 
     #[test]
