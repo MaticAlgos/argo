@@ -2770,7 +2770,15 @@ async fn kiro_usage() -> Result<Vec<String>> {
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
-    let clean = strip_terminal_sequences(&String::from_utf8_lossy(&output.stdout));
+    kiro_usage_lines(&output.stdout, &output.stderr)
+}
+
+/// Kiro renders the /usage panel to stderr and keeps stdout empty, so both
+/// streams must be read or the summary is never found.
+fn kiro_usage_lines(stdout: &[u8], stderr: &[u8]) -> Result<Vec<String>> {
+    let mut raw = String::from_utf8_lossy(stdout).into_owned();
+    raw.push_str(&String::from_utf8_lossy(stderr));
+    let clean = strip_terminal_sequences(&raw);
     let lines = useful_usage_lines(&clean, "Kiro");
     if lines.iter().any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -4019,11 +4027,23 @@ mod tests {
 
     #[test]
     fn kiro_native_usage_panel_is_recognized() {
-        let raw = "\x1b[1mEstimated Usage\x1b[0m | resets on 2026-09-01 | KIRO POWER\nCredits (285.33 of 10000 covered in plan)\n2%\nTip: to see context window usage, run /context\n";
+        // Real 2.16.0 output of `kiro-cli chat --no-interactive /usage`, with
+        // its 256-color sequences and trailing cursor-show codes.
+        let raw = "\x1b[1mEstimated Usage\x1b[0m | resets on 2026-09-01 | \x1b[38;5;141mKIRO POWER\x1b[0m\n\x1b[1mCredits\x1b[0m (442.81 of 10000 covered in plan)\n\x1b[38;5;141m███\x1b[38;5;244m█████\x1b[0m 4%\n\nTip: to see context window usage, run \x1b[38;5;141m/context\x1b[0m\n\n\x1b[1G\x1b[0m\x1b[0m\x1b[?25h";
         let clean = strip_terminal_sequences(raw);
         let lines = useful_usage_lines(&clean, "Kiro");
         assert!(lines.iter().any(|line| line.contains("Estimated Usage")));
         assert!(lines.iter().any(|line| line.contains("Credits")));
+    }
+
+    #[test]
+    fn kiro_usage_panel_on_stderr_is_still_found() {
+        // kiro-cli writes the /usage panel to stderr and leaves stdout empty,
+        // so reading stdout alone reported no usage summary.
+        let stderr = "\x1b[1mEstimated Usage\x1b[0m | resets on 2026-09-01\nCredits (442.81 of 10000 covered in plan)\n";
+        let lines = kiro_usage_lines(b"", stderr.as_bytes()).expect("panel found");
+        assert!(lines.iter().any(|line| line.contains("Estimated Usage")));
+        assert!(lines.iter().any(|line| line.contains("442.81")));
     }
 
     #[test]
