@@ -420,7 +420,7 @@ async fn event_loop(
                         }
                         Response::Error { code, message, .. } if code == "TIMEOUT" => {
                             app.report_error(format!(
-                                "{message} — run /telegram setup for a fresh challenge"
+                                "{message} — run /telegram setup for a fresh link_id"
                             ));
                         }
                         Response::Error { code, .. } if code == "CANCELLED" => {
@@ -936,9 +936,9 @@ async fn handle_key(
             if app.has_completions() {
                 // Dismiss the list without abandoning what was typed.
                 app.completions.clear();
-            } else if let Some(challenge) = app.cancel_telegram_link() {
+            } else if let Some(link_id) = app.cancel_telegram_link() {
                 let response = connection
-                    .request(Request::TelegramCancelLink { challenge })
+                    .request(Request::TelegramCancelLink { link_id })
                     .await?;
                 apply_telegram_cancel_response(app, response);
             } else if app.is_busy() {
@@ -2243,22 +2243,20 @@ async fn telegram_command(
                 other => app.report_error(format!("unexpected reply: {other:?}")),
             }
         }
-        "remove" | "delete" | "disconnect" | "reset" => {
-            match connection.request(Request::TelegramRemove).await? {
-                Response::Telegram { .. } => {
-                    app.push(
-                        LineKind::Notice,
-                        "· Telegram setup removed — stored token and settings deleted".to_string(),
-                    );
-                    app.set_status("Telegram setup removed");
-                }
-                Response::Error { message, .. } => app.report_error(message),
-                other => app.report_error(format!("unexpected reply: {other:?}")),
+        "remove" => match connection.request(Request::TelegramRemove).await? {
+            Response::Telegram { .. } => {
+                app.push(
+                    LineKind::Notice,
+                    "· Telegram setup removed — stored token and settings deleted".to_string(),
+                );
+                app.set_status("Telegram setup removed");
             }
-        }
-        "setup" | "connect" | "link" => telegram_begin_setup(app),
+            Response::Error { message, .. } => app.report_error(message),
+            other => app.report_error(format!("unexpected reply: {other:?}")),
+        },
+        "setup" => telegram_begin_setup(app),
         other => app.report_error(format!(
-            "unknown /telegram argument '{other}'; expected status, setup, connect, link, allow, remove, or reset"
+            "unknown /telegram argument '{other}'; expected status, setup, allow, or remove"
         )),
     }
     Ok(())
@@ -2422,10 +2420,10 @@ async fn telegram_connect(
         LineKind::Notice,
         format!("· connected to @{username} — now prove it's you"),
     );
-    let challenge = argo_daemon::protocol::telegram_link_challenge();
+    let link_id = argo_daemon::protocol::telegram_link_id();
     match connection
         .request(Request::TelegramPrepareLink {
-            challenge: challenge.clone(),
+            link_id: link_id.clone(),
         })
         .await?
     {
@@ -2442,10 +2440,13 @@ async fn telegram_connect(
 
     app.push(
         LineKind::Notice,
-        format!("· open https://t.me/{username} and send this exact command within 90 seconds"),
+        format!("· open https://t.me/{username} and send it any message within 90 seconds"),
     );
-    app.push(LineKind::Notice, format!("  /link {challenge}"));
-    app.set_status("waiting for the Telegram /link challenge · Esc cancels");
+    app.push(
+        LineKind::Notice,
+        "  tapping Start is enough — the first message authorizes that account".to_string(),
+    );
+    app.set_status("waiting for your first Telegram message · Esc cancels");
 
     // Wait on a separate daemon connection so the terminal event loop remains
     // responsive. Escape aborts this local task, then explicitly cancels and
@@ -2453,13 +2454,13 @@ async fn telegram_connect(
     let root = app.workspace.clone();
     let paths = paths.clone();
     let sender = telegram_tx.clone();
-    let task_challenge = challenge.clone();
+    let task_challenge = link_id.clone();
     let task = tokio::spawn(async move {
         let outcome: Result<Response> = async {
             let mut connection = Connection::connect(&paths).await?;
             connection
                 .request(Request::TelegramLink {
-                    challenge: task_challenge,
+                    link_id: task_challenge,
                     timeout_ms: TELEGRAM_LINK_TIMEOUT_MS,
                     root,
                 })
@@ -2472,7 +2473,7 @@ async fn telegram_connect(
         };
         let _ = sender.send(event);
     });
-    app.begin_telegram_link(challenge, task.abort_handle());
+    app.begin_telegram_link(link_id, task.abort_handle());
     Ok(())
 }
 

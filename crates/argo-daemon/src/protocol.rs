@@ -11,11 +11,13 @@
 use argo_core::event::{EventSeq, RunEvent};
 use argo_core::ids::{AgentId, ConversationId, RunId};
 
-/// Generates a fresh challenge for one Telegram linking window.
+/// Names one Telegram linking window so prepare, wait, and cancel agree on it.
 ///
-/// UUID v4 generation is backed by the operating system CSPRNG. Keeping the
-/// full identifier preserves its random bits while remaining easy to copy.
-pub fn telegram_link_challenge() -> String {
+/// This is an internal correlation id, never shown to the user and never sent
+/// through Telegram: the sender proves nothing by knowing it. What bounds a
+/// claim is the window itself — opened deliberately, time-boxed, and starting
+/// from a fresh update high-water mark.
+pub fn telegram_link_id() -> String {
     RunId::generate().to_string()
 }
 use argo_core::message::ContentBlock;
@@ -184,31 +186,32 @@ pub enum Request {
         /// Bot token issued by BotFather.
         token: String,
     },
-    /// Prepare one Telegram linking window before displaying its challenge.
+    /// Prepare one Telegram linking window before the user is told to message.
     ///
-    /// The daemon stops ordinary polling and records a high-water mark first, so
-    /// a command sent immediately after the client displays the challenge cannot
-    /// be mistaken for stale traffic.
+    /// The daemon stops ordinary polling and records an update high-water mark
+    /// first. That baseline is what makes a claim meaningful: only traffic that
+    /// arrives *after* the window opens can take it, so a message already sitting
+    /// in the bot's queue cannot silently authorize its sender.
     TelegramPrepareLink {
-        /// Cryptographically unpredictable one-time challenge generated locally.
-        challenge: String,
+        /// Correlation id for this window. Not a secret and never sent to Telegram.
+        link_id: String,
     },
-    /// Wait for the exact challenge-bearing `/link` command and authorize its sender.
+    /// Authorize the sender of the first private message to arrive in this window.
     ///
-    /// [`Request::TelegramPrepareLink`] must complete before the challenge is
-    /// displayed and this wait begins.
+    /// [`Request::TelegramPrepareLink`] must complete before this wait begins, or
+    /// the claim would have no baseline to be "first" relative to.
     TelegramLink {
-        /// Challenge prepared for this attempt.
-        challenge: String,
-        /// How long to watch for the matching command.
+        /// Window opened by [`Request::TelegramPrepareLink`].
+        link_id: String,
+        /// How long to stay open for a claim.
         timeout_ms: u64,
         /// Workspace to allow once linking succeeds.
         root: String,
     },
     /// Cancel a prepared or active linking window and restore ordinary polling.
     TelegramCancelLink {
-        /// Challenge identifying the window to cancel.
-        challenge: String,
+        /// Window to cancel.
+        link_id: String,
     },
     /// Allow a workspace root to be opened from Telegram.
     TelegramAllowWorkspace {
@@ -227,8 +230,6 @@ pub enum Request {
     },
     /// Start the Telegram poll loop now, without restarting the daemon.
     TelegramStart,
-    /// Forget the bot token and all Telegram settings (legacy reset spelling).
-    TelegramReset,
     /// Remove Telegram phone access, deleting its token and all bridge settings.
     TelegramRemove,
     /// Ask the daemon to shut down.

@@ -192,13 +192,13 @@ fn spawn_daemon(paths: &ArgoPaths) -> Result<()> {
 }
 
 /// Builds the required two-phase link exchange in protocol order.
-fn telegram_link_sequence(challenge: String, timeout_ms: u64, root: String) -> (Request, Request) {
+fn telegram_link_sequence(link_id: String, timeout_ms: u64, root: String) -> (Request, Request) {
     (
         Request::TelegramPrepareLink {
-            challenge: challenge.clone(),
+            link_id: link_id.clone(),
         },
         Request::TelegramLink {
-            challenge,
+            link_id,
             timeout_ms,
             root,
         },
@@ -227,57 +227,24 @@ fn telegram_link_prepared(response: Response) -> Result<()> {
 pub async fn telegram(paths: &ArgoPaths, action: crate::TelegramAction) -> Result<()> {
     use crate::TelegramAction;
 
-    if let TelegramAction::Setup { root } = &action {
-        return telegram_setup(paths, resolve_root(root.clone())?).await;
+    if let TelegramAction::Setup { root, token_file } = &action {
+        return telegram_setup(paths, resolve_root(root.clone())?, token_file.as_deref()).await;
     }
-
-    let connect_token = match &action {
-        TelegramAction::Connect { token_file } => {
-            Some(read_bot_token(token_file.as_deref()).await?)
-        }
-        _ => None,
-    };
-    let link_challenge = matches!(action, TelegramAction::Link { .. })
-        .then(argo_daemon::protocol::telegram_link_challenge);
 
     let mut client = Client::connect(paths).await?;
     let request = match &action {
         TelegramAction::Status | TelegramAction::Qr => Request::TelegramStatus,
-        TelegramAction::Connect { .. } => Request::TelegramConnect {
-            token: connect_token.clone().unwrap_or_default(),
-        },
-        TelegramAction::Link { secs, root } => {
-            let (prepare, wait) = telegram_link_sequence(
-                link_challenge.clone().unwrap_or_default(),
-                secs.saturating_mul(1000).max(1_000),
-                resolve_root(root.clone())?,
-            );
-            telegram_link_prepared(client.request(prepare).await?)?;
-            wait
-        }
         TelegramAction::Allow { user_id, root } => Request::TelegramAllowUser {
             user_id: *user_id,
             root: resolve_root(root.clone())?,
         },
         TelegramAction::Start => Request::TelegramStart,
         TelegramAction::Remove => Request::TelegramRemove,
-        TelegramAction::Reset => Request::TelegramReset,
         // Handled above, before a client is opened.
         TelegramAction::Setup { .. } => unreachable!("setup returns earlier"),
     };
 
-    // Linking deliberately blocks while the daemon watches for the user's first
-    // message, so it needs a budget larger than the default request timeout.
-    let budget = match &action {
-        TelegramAction::Link { secs, .. } => {
-            let challenge = link_challenge.as_deref().unwrap_or_default();
-            println!("send this exact command to the bot:");
-            println!("  /link {challenge}");
-            println!("waiting up to {secs}s for that command…");
-            std::time::Duration::from_secs(secs.saturating_add(20))
-        }
-        _ => std::time::Duration::from_millis(REQUEST_TIMEOUT_MS),
-    };
+    let budget = std::time::Duration::from_millis(REQUEST_TIMEOUT_MS);
 
     match client.request_within(request, Some(budget)).await? {
         Response::Telegram {
@@ -289,13 +256,11 @@ pub async fn telegram(paths: &ArgoPaths, action: crate::TelegramAction) -> Resul
             active_workspace,
         } => {
             match &action {
-                TelegramAction::Connect { .. } | TelegramAction::Qr => {
-                    match bot_username.as_deref() {
-                        Some(username) => print_bot_invite(username),
-                        None => println!("no bot is connected yet"),
-                    }
-                }
-                TelegramAction::Remove | TelegramAction::Reset => {
+                TelegramAction::Qr => match bot_username.as_deref() {
+                    Some(username) => print_bot_invite(username),
+                    None => println!("no bot is connected yet"),
+                },
+                TelegramAction::Remove => {
                     println!("telegram setup removed; stored token and settings deleted")
                 }
                 _ => {}
@@ -419,7 +384,11 @@ impl Drop for EchoGuard {
 /// API for it, and BotFather only talks to humans. Everything after the token is
 /// handled here, including discovering the user's id, so nobody has to go
 /// looking for it.
-async fn telegram_setup(paths: &ArgoPaths, root: String) -> Result<()> {
+async fn telegram_setup(
+    paths: &ArgoPaths,
+    root: String,
+    token_file: Option<&std::path::Path>,
+) -> Result<()> {
     println!("Connect Telegram");
     println!();
     println!("1. Open https://t.me/BotFather and send /newbot");
@@ -433,7 +402,7 @@ async fn telegram_setup(paths: &ArgoPaths, root: String) -> Result<()> {
         println!();
     }
 
-    let token = read_bot_token(None).await?;
+    let token = read_bot_token(token_file).await?;
 
     let mut client = Client::connect(paths).await?;
     let username = match client
@@ -459,14 +428,13 @@ async fn telegram_setup(paths: &ArgoPaths, root: String) -> Result<()> {
     println!();
     println!("Connected to @{username}.");
     print_bot_invite(&username);
-    let challenge = argo_daemon::protocol::telegram_link_challenge();
+    let link_id = argo_daemon::protocol::telegram_link_id();
     const TOTAL_SECS: u64 = 180;
-    let (prepare, wait) =
-        telegram_link_sequence(challenge.clone(), TOTAL_SECS * 1000, root.clone());
+    let (prepare, wait) = telegram_link_sequence(link_id.clone(), TOTAL_SECS * 1000, root.clone());
     telegram_link_prepared(client.request(prepare).await?)?;
 
-    println!("Scan that (or open the link), then send this exact command:");
-    println!("  /link {challenge}");
+    println!("Scan that (or open the link), then send the bot any message.");
+    println!("Tapping Start is enough — the first private message to arrive is authorized.");
     println!();
     println!("Waiting for your message (up to {TOTAL_SECS}s). Press Ctrl-C to stop.");
 
@@ -484,9 +452,9 @@ async fn telegram_setup(paths: &ArgoPaths, root: String) -> Result<()> {
             Ok(())
         }
         Response::Error { code, .. } if code == "TIMEOUT" => {
-            println!("No matching /link command arrived.");
-            println!("Start a fresh challenge, then send the exact command it prints:");
-            println!("  argo telegram link");
+            println!("No message arrived in time.");
+            println!("Open another window and message the bot while it waits:");
+            println!("  argo telegram setup");
             println!("or, if you already know your Telegram user id:");
             println!("  argo telegram allow <USER_ID>");
             Ok(())
@@ -515,7 +483,6 @@ fn print_bot_invite(username: &str) {
     }
     println!();
     println!("scan that, or open {link}");
-    println!("then run `argo telegram link` and send the exact /link challenge it prints");
     println!();
 }
 
@@ -1599,16 +1566,15 @@ mod tests {
 
     #[test]
     fn telegram_link_sequence_prepares_the_exact_challenge_before_waiting() {
-        let (prepare, wait) =
-            telegram_link_sequence("challenge".into(), 12_000, "/workspace".into());
+        let (prepare, wait) = telegram_link_sequence("link_id".into(), 12_000, "/workspace".into());
         assert!(matches!(
             prepare,
-            Request::TelegramPrepareLink { challenge } if challenge == "challenge"
+            Request::TelegramPrepareLink { link_id } if link_id == "link_id"
         ));
         assert!(matches!(
             wait,
-            Request::TelegramLink { challenge, timeout_ms: 12_000, root }
-                if challenge == "challenge" && root == "/workspace"
+            Request::TelegramLink { link_id, timeout_ms: 12_000, root }
+                if link_id == "link_id" && root == "/workspace"
         ));
     }
 

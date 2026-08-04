@@ -1218,7 +1218,6 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
         | Request::TelegramAllowWorkspace { .. }
         | Request::TelegramAllowUser { .. }
         | Request::TelegramStart
-        | Request::TelegramReset
         | Request::TelegramRemove => crate::telegram::handle(daemon, request).await,
 
         Request::SetBackupAgent {

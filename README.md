@@ -179,7 +179,7 @@ details and queue behavior.
 | `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
 | `/mode [id]` | Set Argo's execution mode directly; Plan works with every CLI and `Shift+Tab` cycles it |
 | `/backup [id [model]\|none]` | Configure or clear a standby CLI for quota-exhaustion failover |
-| `/telegram [status\|setup\|connect\|link\|allow\|remove\|reset]` | Set up, inspect, or remove Telegram phone access |
+| `/telegram [status|setup|allow|remove]` | Set up, inspect, or remove Telegram phone access |
 | `/thinking [show\|hide\|toggle]` | Control visibility of CLI-emitted thinking and tool activity (`Ctrl+T`) |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
 | `/status` | Show conversation, selection, context, run state with elapsed time, and queue state |
@@ -217,39 +217,46 @@ subsequent status and usage attribution name the CLI that actually answered.
 Use `/backup none` to disable failover.
 
 Bare `/telegram` shows status when linked and otherwise opens guided setup. The
-wizard validates a BotFather token, shows a bot link, and prints a fresh one-time
-`/link <challenge>` command. The TUI remains responsive while it waits for up to
-90 seconds; `Esc` cancels the wait. Linking starts the bridge immediately, so no
-Argo restart is required. `/telegram allow` adds the current workspace and
-`/telegram remove` stops the bridge and deletes the stored token and Telegram
-configuration (`/telegram reset` remains a compatibility alias).
+wizard validates a BotFather token, shows a bot link, then opens a 90-second
+window and authorizes the sender of the first private message to arrive in it —
+tapping *Start* in Telegram is enough, and nothing needs to be typed. The TUI
+remains responsive while it waits; `Esc` cancels. Linking starts the bridge
+immediately, so no Argo restart is required. `/telegram allow` adds the current
+workspace and `/telegram remove` stops the bridge and deletes the stored token
+and Telegram configuration.
 
 **Security warning:** Telegram is remote access to coding agents. An authorized
 Telegram user can select full-access mode and run commands or modify files in
-every allowlisted workspace with the permissions of your local account. Use a
-private bot, authorize only trusted user IDs, keep the workspace allowlist
-minimal, and run `/telegram remove` immediately if the bot token or account is
-compromised.
+every allowlisted workspace with the permissions of your local account.
+
+Because linking authorizes whoever messages first, **the 90-second window is the
+security boundary**: open it only when you are ready to message the bot yourself,
+and use a freshly created bot whose username nobody else knows. Argo narrows the
+window as far as it can — the claim is time-boxed, it ignores group chats, and it
+only counts traffic arriving after the window opens, so a message already queued
+cannot take it. If the wrong account claims the link, run `/telegram remove` and
+set up again. Otherwise: authorize only trusted user IDs, keep the workspace
+allowlist minimal, and remove the setup immediately if the bot token or account
+is compromised.
 
 The scriptable equivalents include:
 
 ```bash
 argo telegram setup --root /path/to/project
 argo telegram status
-argo telegram link --secs 120 --root /path/to/project
+argo telegram setup --token-file /secure/path/token   # unattended
 argo telegram allow <USER_ID> --root /path/to/project
 argo telegram qr
 argo telegram remove
-argo telegram reset       # compatibility alias
 ```
 
 Turn timeouts are opt-in. `ARGO_TURN_TIMEOUT_MS` limits daemon-owned agent turns;
 unset, invalid, or `0` means no daemon turn deadline. Scriptable streaming also
 accepts `ARGO_STREAM_IDLE_TIMEOUT_MS`; unset, invalid, or `0` waits indefinitely,
 while a positive value stops that client after that many milliseconds without an
-event but leaves the daemon-owned turn running. Telegram linking uses the TUI's
-90-second window or scriptable `argo telegram link --secs <seconds>`, independent
-of those environment variables.
+event but leaves the daemon-owned turn running. Telegram linking has its own
+window — 90 seconds in the TUI, or the duration `argo telegram setup` announces —
+independent of those environment variables.
 
 ## Usage reporting
 

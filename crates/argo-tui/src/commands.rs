@@ -418,10 +418,7 @@ const SUBCOMMAND_COMPLETIONS: &[&str] = &[
     "/mcp reconnect",
     "/mcp remove",
     "/telegram allow",
-    "/telegram connect",
-    "/telegram link",
     "/telegram remove",
-    "/telegram reset",
     "/telegram setup",
     "/telegram status",
     "/thinking hide",
@@ -508,7 +505,7 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "pick the CLI and model to continue on if this one runs out of quota",
         },
         HelpEntry {
-            usage: "/telegram [status|setup|connect|link|allow|remove|reset]",
+            usage: "/telegram [status|setup|allow|remove]",
             detail: "set up, inspect, or remove phone access; reset remains an alias",
         },
         HelpEntry {
@@ -723,13 +720,20 @@ mod tests {
     #[test]
     fn telegram_help_and_completions_match_the_guided_actions() {
         let completions = complete("/telegram ");
-        for action in [
-            "status", "setup", "connect", "link", "allow", "remove", "reset",
-        ] {
+        for action in ["status", "setup", "allow", "remove"] {
             let expected = format!("/telegram {action}");
             assert!(
                 completions.iter().any(|candidate| *candidate == expected),
                 "missing {action}: {completions:?}"
+            );
+        }
+        // Retired spellings must not be suggested: `connect` and `link` were
+        // aliases of `setup`, and linking no longer has a separate step at all.
+        for retired in ["connect", "link", "reset"] {
+            let gone = format!("/telegram {retired}");
+            assert!(
+                !completions.iter().any(|candidate| *candidate == gone),
+                "{retired} should no longer be offered: {completions:?}"
             );
         }
         let entry = help()

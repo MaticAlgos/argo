@@ -34,14 +34,14 @@ const POLL_SECS: u64 = 25;
 /// One prepared authorization window shared across prepare, wait, and cancel requests.
 #[derive(Debug, Clone)]
 pub(crate) struct LinkAttempt {
-    challenge: String,
+    link_id: String,
     token: String,
     cancel: CancelToken,
 }
 
 impl LinkAttempt {
-    fn matches(&self, challenge: &str) -> bool {
-        self.challenge == challenge
+    fn matches(&self, link_id: &str) -> bool {
+        self.link_id == link_id
     }
 }
 
@@ -1835,26 +1835,26 @@ enum Selection {
 
 /// Payload marking the "no backup" button, which no real agent id can collide with.
 const BACKUP_NONE: &str = "\u{0}none";
-fn validate_link_challenge(challenge: &str) -> Result<()> {
-    if challenge.len() < 20
-        || !challenge
+fn validate_link_id(link_id: &str) -> Result<()> {
+    if link_id.len() < 20
+        || !link_id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
     {
         return Err(argo_core::error::ArgoError::Invalid(
-            "Telegram link challenge is malformed".into(),
+            "Telegram link window id is malformed".into(),
         ));
     }
     Ok(())
 }
 
 /// Signals the current link window without waiting for its poll to unwind.
-async fn signal_link_cancel(daemon: &Arc<Daemon>, challenge: Option<&str>) -> bool {
+async fn signal_link_cancel(daemon: &Arc<Daemon>, link_id: Option<&str>) -> bool {
     let attempt = daemon.telegram_link.lock().await.clone();
     let Some(attempt) = attempt else {
         return false;
     };
-    if challenge.is_some_and(|expected| !attempt.matches(expected)) {
+    if link_id.is_some_and(|expected| !attempt.matches(expected)) {
         return false;
     }
     attempt.cancel.cancel();
@@ -1862,11 +1862,11 @@ async fn signal_link_cancel(daemon: &Arc<Daemon>, challenge: Option<&str>) -> bo
 }
 
 /// Removes a link window only when it is still the named attempt.
-async fn clear_link_attempt(daemon: &Arc<Daemon>, challenge: &str) -> bool {
+async fn clear_link_attempt(daemon: &Arc<Daemon>, link_id: &str) -> bool {
     let mut current = daemon.telegram_link.lock().await;
     if current
         .as_ref()
-        .is_some_and(|attempt| attempt.matches(challenge))
+        .is_some_and(|attempt| attempt.matches(link_id))
     {
         *current = None;
         true
@@ -1876,13 +1876,13 @@ async fn clear_link_attempt(daemon: &Arc<Daemon>, challenge: &str) -> bool {
 }
 
 /// Cancels one window, waits until it owns no poll, and restores the bridge.
-async fn cancel_link_and_restore(daemon: &Arc<Daemon>, challenge: &str) -> bool {
-    if !signal_link_cancel(daemon, Some(challenge)).await {
+async fn cancel_link_and_restore(daemon: &Arc<Daemon>, link_id: &str) -> bool {
+    if !signal_link_cancel(daemon, Some(link_id)).await {
         return false;
     }
     let ownership = POLLING.lock().await;
     stop_bridge().await;
-    let cleared = clear_link_attempt(daemon, challenge).await;
+    let cleared = clear_link_attempt(daemon, link_id).await;
     drop(ownership);
     spawn(Arc::clone(daemon));
     cleared
@@ -1943,8 +1943,8 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
             Ok(status(daemon))
         }
 
-        Request::TelegramPrepareLink { challenge } => {
-            validate_link_challenge(&challenge)?;
+        Request::TelegramPrepareLink { link_id } => {
+            validate_link_id(&link_id)?;
             signal_link_cancel(daemon, None).await;
             let ownership = POLLING.lock().await;
             // A superseded wait may have restored the bridge while this request
@@ -1961,7 +1961,7 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                 let bot = Bot::with_token(token.clone());
                 bot.delete_webhook().await?;
 
-                // Establish the baseline before the client displays the challenge.
+                // Establish the baseline before the user is told to message the bot.
                 // Anything arriving afterwards belongs to this exact window.
                 let mut offset = config::load(&paths)?.unwrap_or_default().update_offset;
                 let stale = bot.get_updates(offset, 0).await?;
@@ -1972,7 +1972,7 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                     })?;
                 }
                 Ok(LinkAttempt {
-                    challenge: challenge.clone(),
+                    link_id: link_id.clone(),
                     token,
                     cancel: CancelToken::new(),
                 })
@@ -1994,11 +1994,11 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
         }
 
         Request::TelegramLink {
-            challenge,
+            link_id,
             timeout_ms,
             root,
         } => {
-            validate_link_challenge(&challenge)?;
+            validate_link_id(&link_id)?;
             if timeout_ms == 0 {
                 return Err(argo_core::error::ArgoError::Invalid(
                     "Telegram link timeout must be positive".into(),
@@ -2009,10 +2009,10 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                 .lock()
                 .await
                 .clone()
-                .filter(|attempt| attempt.matches(&challenge))
+                .filter(|attempt| attempt.matches(&link_id))
                 .ok_or_else(|| {
                     argo_core::error::ArgoError::Invalid(
-                        "prepare this Telegram link challenge before waiting for it".into(),
+                        "prepare this Telegram link window before waiting on it".into(),
                     )
                 })?;
 
@@ -2022,13 +2022,13 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                 .lock()
                 .await
                 .as_ref()
-                .is_some_and(|current| current.matches(&challenge));
+                .is_some_and(|current| current.matches(&link_id));
             if !still_current || attempt.cancel.is_cancelled() {
                 drop(ownership);
                 return Err(argo_core::error::ArgoError::Cancelled);
             }
             if config::load_token(&paths)?.as_deref() != Some(attempt.token.as_str()) {
-                clear_link_attempt(daemon, &challenge).await;
+                clear_link_attempt(daemon, &link_id).await;
                 drop(ownership);
                 spawn(Arc::clone(daemon));
                 return Err(argo_core::error::ArgoError::Invalid(
@@ -2065,17 +2065,16 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                     let next_offset = batch
                         .high_water
                         .map(|high_water| high_water.saturating_add(1));
+                    // First one wins, in arrival order within the batch.
                     let linked = batch.updates.into_iter().find_map(|update| match update {
-                        Update::Message(message) if is_link_message(&message, &challenge) => {
-                            Some(message)
-                        }
+                        Update::Message(message) if can_claim_link(&message) => Some(message),
                         _ => None,
                     });
 
                     if let Some(message) = linked {
-                        // Authorization and acknowledgement of its proof are one
-                        // disk mutation: a crash cannot consume the command without
-                        // also recording the user and workspace it authorized.
+                        // Authorization and the offset that consumed the claiming
+                        // message are one disk mutation: a crash cannot consume the
+                        // message without also recording who it authorized.
                         let linked_config = config::mutate(&paths, |saved| {
                             saved.allow_user(message.from_id);
                             saved.allow_workspace(root.clone());
@@ -2097,7 +2096,7 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
             }
             .await;
 
-            clear_link_attempt(daemon, &challenge).await;
+            clear_link_attempt(daemon, &link_id).await;
             let outcome = match link_result {
                 Ok((linked_config, message)) => {
                     if let Err(error) = bot.set_my_commands(COMMANDS).await {
@@ -2117,21 +2116,27 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
                             false,
                         )
                         .await;
-                    Ok(status(daemon))
+                    Ok(())
                 }
                 Err(error) => Err(error),
             };
             drop(ownership);
             spawn(Arc::clone(daemon));
-            outcome
+            // Status is read *after* the bridge is spawned, and after the same
+            // brief settle `TelegramStart` uses. Reading it earlier reported
+            // "linked but not polling" on a link that had in fact just started
+            // the bridge, and sent the user off to run `argo telegram start`
+            // for nothing.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            outcome.map(|()| status(daemon))
         }
 
-        Request::TelegramCancelLink { challenge } => {
-            validate_link_challenge(&challenge)?;
+        Request::TelegramCancelLink { link_id } => {
+            validate_link_id(&link_id)?;
             // Report whether cancellation actually won. If authorization or
             // timeout completed first, return current status so a client cannot
             // claim remote access was cancelled when it remains linked.
-            if cancel_link_and_restore(daemon, &challenge).await {
+            if cancel_link_and_restore(daemon, &link_id).await {
                 Ok(Response::Ok)
             } else {
                 Ok(status(daemon))
@@ -2194,7 +2199,7 @@ pub(crate) async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Res
             Ok(status(daemon))
         }
 
-        Request::TelegramReset | Request::TelegramRemove => {
+        Request::TelegramRemove => {
             signal_link_cancel(daemon, None).await;
             let ownership = POLLING.lock().await;
             stop_bridge().await;
@@ -2262,14 +2267,20 @@ async fn announce_workspace(
     }
 }
 
-/// Accepts only the complete command generated for this linking window.
-fn is_link_command(text: &str, challenge: &str) -> bool {
-    text == format!("/link {challenge}")
-}
-
-/// Linking is valid only in the sender's private bot chat.
-fn is_link_message(message: &IncomingMessage, challenge: &str) -> bool {
-    message.is_private_chat() && is_link_command(&message.text, challenge)
+/// Whether this message may claim an open linking window.
+///
+/// Any private message will do — tapping *Start* in Telegram sends `/start`, so
+/// the common path needs no typing at all. What makes that safe enough to offer
+/// is not the content but the window: it is opened deliberately from the local
+/// machine, it is time-boxed, and [`Request::TelegramPrepareLink`] has already
+/// moved the update offset past everything that existed beforehand, so only
+/// genuinely new traffic can claim it.
+///
+/// Group chats are excluded. A bot added to a group receives messages from
+/// everyone in it, and authorizing on those would hand remote access to whoever
+/// happened to be talking.
+fn can_claim_link(message: &IncomingMessage) -> bool {
+    message.is_private_chat()
 }
 
 /// The first message the bot ever sends.
@@ -2477,23 +2488,33 @@ mod tests {
     }
 
     #[test]
-    fn linking_requires_the_senders_private_chat() {
-        let challenge = "abcdefghijklmnopqrst";
+    fn any_private_message_can_claim_a_window_but_group_traffic_cannot() {
+        // No typed proof is required: tapping Start sends `/start`, and plain
+        // text is just as valid. The window itself is the control.
         let private = IncomingMessage {
             update_id: 1,
             chat_id: 42,
             message_id: 2,
             from_id: 42,
-            text: format!("/link {challenge}"),
+            text: "/start".into(),
         };
-        assert!(is_link_message(&private, challenge));
+        assert!(can_claim_link(&private));
+        assert!(can_claim_link(&IncomingMessage {
+            text: "hello".into(),
+            ..private.clone()
+        }));
+        assert!(can_claim_link(&IncomingMessage {
+            text: String::new(),
+            ..private.clone()
+        }));
 
+        // A bot in a group hears everyone in it; authorizing on that would hand
+        // remote access to whoever happened to be talking.
         let group = IncomingMessage {
             chat_id: -100,
             ..private.clone()
         };
-        assert!(!is_link_message(&group, challenge));
-        assert!(!is_link_message(&private, "different-challenge"));
+        assert!(!can_claim_link(&group));
     }
 
     #[test]

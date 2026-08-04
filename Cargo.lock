@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "argo-cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "argo-daemon",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "argo-context"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "serde",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "argo-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "directories",
  "serde",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "argo-daemon"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-context",
  "argo-core",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "argo-resources"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "serde",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "argo-runtime"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "futures",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "argo-store"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-context",
  "argo-core",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "argo-telegram"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "pulldown-cmark",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "argo-tui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argo-core",
  "argo-daemon",

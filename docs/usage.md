@@ -107,7 +107,7 @@ prints a copyable `argo --resume <conversation-id>` command when applicable.
 | `/default [configure\|current\|clear]` | Manage launch selection |
 | `/mode [full\|plan\|accept-edits\|read-only]` | Set a supported mode directly; use `/mode plan` to plan without cycling |
 | `/backup [id [model]\|none]` | Configure or clear quota-exhaustion failover |
-| `/telegram [status\|setup\|connect\|link\|allow\|remove\|reset]` | Set up, inspect, or remove phone access |
+| `/telegram [status|setup|allow|remove]` | Set up, inspect, or remove phone access |
 | `/thinking [show\|hide\|toggle]` | Control rendered CLI-emitted thinking and tool activity |
 | `/status` | Show selection, context, active run and how long it has run, and queue |
 | `/update [check\|install\|force]` | Check for updates, or exit and update directly |
@@ -214,37 +214,41 @@ the backup.
 ## Telegram phone access
 
 Bare `/telegram` reports a linked bridge and otherwise opens guided setup. The
-wizard sends the bot token through a masked field, validates it, displays the bot
-link, and generates a fresh one-time command of the form `/link <challenge>`.
-Only that exact command can authorize its sender. The 90-second TUI wait runs in
-the background, so the interface remains usable; press `Esc` to cancel it.
-Linking starts the bridge immediately—there is no restart step.
+wizard sends the bot token through a masked field, validates it, and shows the
+bot link. Then it opens a 90-second window and authorizes **the sender of the
+first private message to arrive in it** — tapping *Start* in Telegram sends
+`/start`, so nothing has to be typed. The wait runs in the background, so the
+interface stays usable; press `Esc` to cancel it. Linking starts the bridge
+immediately—there is no restart step.
+
+What bounds that claim is the window, not the message. It is opened deliberately
+from your machine, it is time-boxed, and Argo advances the bot's update offset
+past everything that existed beforehand, so a message already sitting in the
+queue cannot claim it. Group chats are ignored entirely: a bot in a group hears
+everyone in it. The practical consequence is that **whoever messages the bot
+first during those 90 seconds gets access**, so open the window only when you are
+ready to message it yourself, and prefer a freshly created bot nobody else knows.
+If someone else claims it, run `/telegram remove` and set up again.
 
 TUI actions are:
 
 ```text
 /telegram status       # bare /telegram is equivalent when already linked
 /telegram setup        # connect and link a bot
-/telegram connect      # alias that reopens guided setup
-/telegram link         # alias that reopens guided setup with a fresh challenge
 /telegram allow        # allow the current workspace
 /telegram remove       # stop the bridge and delete token/settings
-/telegram reset        # compatibility alias for remove
 ```
 
 For scripts and headless hosts:
 
 ```bash
 argo telegram setup --root /path/to/project
+argo telegram setup --token-file /secure/path/token   # unattended token supply
 argo telegram status
-argo telegram connect                 # token from masked terminal input or stdin
-argo telegram connect --token-file /secure/path/token
-argo telegram link --secs 120 --root /path/to/project
 argo telegram allow <USER_ID> --root /path/to/project
 argo telegram qr
 argo telegram start                   # recovery only; linking normally starts it
 argo telegram remove
-argo telegram reset                   # compatibility alias
 ```
 
 **Security warning:** this is remote access to coding agents, not a notification
@@ -254,8 +258,8 @@ permissions. Use a private bot, authorize only trusted IDs, minimize allowlisted
 workspaces, protect the BotFather token, and run `/telegram remove` immediately if
 the bot token or authorized account is compromised.
 
-Telegram linking has its own explicit window: 90 seconds in the TUI and `--secs`
-for `argo telegram link`. Agent turn deadlines are separate and opt-in:
+Telegram linking has its own explicit window: 90 seconds in the TUI, or the
+duration `argo telegram setup` announces. Agent turn deadlines are separate and opt-in:
 `ARGO_TURN_TIMEOUT_MS=<milliseconds>` limits daemon-owned turns, while unset,
 invalid, or `0` means unlimited. Scriptable `argo send`/delegation streaming can
 also set `ARGO_STREAM_IDLE_TIMEOUT_MS=<milliseconds>`; unset, invalid, or `0`

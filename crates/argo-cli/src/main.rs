@@ -244,31 +244,18 @@ enum TelegramAction {
     /// Guided end-to-end setup: token, QR, then linking.
     ///
     /// The same flow as `/telegram` in the TUI, for terminals and headless hosts.
+    /// Token and workspace can be supplied for unattended use.
     Setup {
         /// Workspace root to allow. Defaults to the current directory.
         #[arg(long)]
         root: Option<String>,
-    },
-    /// Validate a BotFather token and store it.
-    ///
-    /// Prints a QR code that opens the bot, so the next step is a scan.
-    Connect {
-        /// Read the token from this file instead of standard input.
+        /// Read the token from this file instead of prompting.
         #[arg(long, value_name = "PATH")]
         token_file: Option<std::path::PathBuf>,
     },
-    /// Wait for the first message sent to the bot and authorize its sender.
-    Link {
-        /// How long to watch, in seconds.
-        #[arg(long, default_value_t = 120)]
-        secs: u64,
-        /// Workspace root to allow. Defaults to the current directory.
-        #[arg(long)]
-        root: Option<String>,
-    },
     /// Authorize a Telegram user id directly, skipping the linking wait.
     Allow {
-        /// Numeric Telegram user id (what `/link` would have discovered).
+        /// Numeric Telegram user id.
         user_id: i64,
         /// Workspace root to allow. Defaults to the current directory.
         #[arg(long)]
@@ -280,8 +267,6 @@ enum TelegramAction {
     Start,
     /// Remove Telegram phone access and delete every stored bridge setting.
     Remove,
-    /// Legacy spelling for `remove`.
-    Reset,
 }
 
 fn main() {
@@ -614,18 +599,21 @@ mod tests {
     }
 
     #[test]
-    fn telegram_remove_is_explicit_and_reset_stays_compatible() {
-        for (name, expected_remove) in [("remove", true), ("reset", false)] {
-            let cli = Cli::try_parse_from(["argo", "telegram", name]).expect("parse");
-            match cli.command.expect("command") {
-                Command::Telegram {
-                    action: Some(TelegramAction::Remove),
-                } => assert!(expected_remove),
-                Command::Telegram {
-                    action: Some(TelegramAction::Reset),
-                } => assert!(!expected_remove),
-                other => panic!("unexpected: {other:?}"),
+    fn telegram_removal_has_exactly_one_spelling() {
+        let cli = Cli::try_parse_from(["argo", "telegram", "remove"]).expect("parse");
+        assert!(matches!(
+            cli.command.expect("command"),
+            Command::Telegram {
+                action: Some(TelegramAction::Remove),
             }
+        ));
+        // The old aliases are gone rather than quietly accepted, so a script
+        // still calling one fails loudly instead of appearing to work.
+        for retired in ["reset", "connect", "link"] {
+            assert!(
+                Cli::try_parse_from(["argo", "telegram", retired]).is_err(),
+                "`argo telegram {retired}` must no longer parse"
+            );
         }
     }
 
