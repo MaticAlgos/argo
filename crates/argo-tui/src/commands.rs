@@ -23,6 +23,10 @@ pub enum Command {
     Default(DefaultCommand),
     /// Set or cycle the execution mode.
     Mode(Option<String>),
+    /// Choose the standby CLI this conversation fails over to, or clear it.
+    Backup(Option<String>),
+    /// Set up or inspect the Telegram bridge.
+    Telegram(Option<String>),
     /// Show exact token usage reported for the last completed turn.
     Usage,
     /// Show current Argo conversation/run state.
@@ -35,12 +39,17 @@ pub enum Command {
     Skills,
     /// Manage project-local automatic instructions.
     Instructions(InstructionsCommand),
-    /// Show or change whether agent thinking is rendered.
+    /// Show or change whether agent thinking and tool activity are rendered.
+    ///
+    /// One toggle covers both: they are the same class of intermediate detail,
+    /// and hiding reasoning while leaving tool calls on screen hides nothing.
     Thinking(ThinkingCommand),
     /// Inspect or manage configured MCP servers.
     Mcp(McpCommand),
     /// Show what the next turn would send.
     Context,
+    /// Fold the conversation so far into a summary to free context.
+    Compact,
     /// Resume a session: list them, or open one directly.
     Resume(Option<String>),
     /// Start a new conversation.
@@ -59,6 +68,8 @@ pub enum Command {
         /// Task description.
         task: String,
     },
+    /// Review the messages waiting to be sent.
+    Queue,
     /// Cancel the active run.
     Cancel,
     /// Show settings and paths.
@@ -72,9 +83,9 @@ pub enum Command {
 /// A visibility change requested through `/thinking`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThinkingCommand {
-    /// Render thinking blocks in the transcript.
+    /// Render thinking and tool-activity lines in the transcript.
     Show,
-    /// Hide thinking blocks from the transcript.
+    /// Hide thinking and tool-activity lines from the transcript.
     Hide,
     /// Invert the current visibility setting.
     Toggle,
@@ -179,13 +190,22 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// True when `line` should be treated as a command rather than a message.
+/// The command name a line opens with, when it opens with one at all.
 ///
-/// A lone `/` is treated as text so a user typing a path fragment is not told
-/// their message is an unknown command.
+/// `None` for a lone `/`, and for anything carrying a separator inside the name:
+/// dragging a file into the composer pastes an absolute path, and
+/// `/var/folders/…/Screenshot.png` is a message about a file rather than a
+/// mistyped command. Command names never contain a slash, so the second
+/// separator is what tells the two apart.
+fn command_name(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('/')?;
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// True when `line` should be treated as a command rather than a message.
 pub fn is_command(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with('/') && trimmed.len() > 1
+    command_name(line).is_some()
 }
 
 /// Parses a command line.
@@ -204,6 +224,8 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "effort" | "reasoning" => Ok(Command::Effort(argument)),
         "default" => parse_default(rest),
         "mode" | "plan" => Ok(Command::Mode(argument)),
+        "backup" | "fallback" => Ok(Command::Backup(argument)),
+        "telegram" | "tg" => Ok(Command::Telegram(argument)),
         "usage" => Ok(Command::Usage),
         "status" => Ok(Command::Status),
         "update" | "upgrade" => parse_update(rest),
@@ -213,6 +235,7 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
         "thinking" => parse_thinking(rest),
         "mcp" => parse_mcp(rest),
         "context" => Ok(Command::Context),
+        "compact" => Ok(Command::Compact),
         // One command for both listing and opening: two commands for one intent
         // was needless surface.
         "resume" | "chats" | "sessions" | "conversations" | "open" => Ok(Command::Resume(argument)),
@@ -237,6 +260,7 @@ pub fn parse(line: &str) -> std::result::Result<Command, ParseError> {
                 task: task.trim().to_string(),
             })
         }
+        "queue" | "queued" | "pending" => Ok(Command::Queue),
         "cancel" | "stop" => Ok(Command::Cancel),
         "config" | "settings" => Ok(Command::Config),
         "doctor" => Ok(Command::Doctor),
@@ -351,6 +375,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/effort",
     "/default",
     "/mode",
+    "/backup",
+    "/telegram",
     "/usage",
     "/status",
     "/update",
@@ -360,12 +386,14 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/thinking",
     "/mcp",
     "/context",
+    "/compact",
     "/resume",
     "/new",
     "/clear-history",
     "/children",
     "/parent",
     "/delegate",
+    "/queue",
     "/cancel",
     "/config",
     "/doctor",
@@ -389,6 +417,13 @@ const SUBCOMMAND_COMPLETIONS: &[&str] = &[
     "/mcp reauth",
     "/mcp reconnect",
     "/mcp remove",
+    "/telegram allow",
+    "/telegram connect",
+    "/telegram link",
+    "/telegram remove",
+    "/telegram reset",
+    "/telegram setup",
+    "/telegram status",
     "/thinking hide",
     "/thinking show",
     "/thinking toggle",
@@ -408,6 +443,12 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     // command name and wants its fixed subcommands (for example `/update `).
     let prefix = prefix.trim_start();
     if !prefix.starts_with('/') {
+        return Vec::new();
+    }
+    // A pasted file path opens with a slash too. The list is still useful for a
+    // bare `/`, but it gets out of the way as soon as the text stops looking like
+    // a command name.
+    if prefix.len() > 1 && command_name(prefix).is_none() {
         return Vec::new();
     }
     if prefix.contains(char::is_whitespace) {
@@ -463,6 +504,14 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "switch execution mode (Shift+Tab cycles): full, plan, accept-edits",
         },
         HelpEntry {
+            usage: "/backup [id [model]|none]",
+            detail: "pick the CLI and model to continue on if this one runs out of quota",
+        },
+        HelpEntry {
+            usage: "/telegram [status|setup|connect|link|allow|remove|reset]",
+            detail: "set up, inspect, or remove phone access; reset remains an alias",
+        },
+        HelpEntry {
             usage: "/usage",
             detail: "show exact token counts reported by the last CLI turn",
         },
@@ -488,7 +537,7 @@ pub fn help() -> Vec<HelpEntry> {
         },
         HelpEntry {
             usage: "/thinking [show|hide|toggle]",
-            detail: "show, hide, or toggle agent thinking in the transcript",
+            detail: "show, hide, or toggle agent thinking and tool activity in the transcript",
         },
         HelpEntry {
             usage: "/mcp [list|check [name]]",
@@ -519,6 +568,10 @@ pub fn help() -> Vec<HelpEntry> {
             detail: "show exactly what your next message will send",
         },
         HelpEntry {
+            usage: "/compact",
+            detail: "fold this conversation into a summary to free context; the transcript is kept",
+        },
+        HelpEntry {
             usage: "/resume [n|id]",
             detail: "list earlier sessions, or reopen one",
         },
@@ -541,6 +594,10 @@ pub fn help() -> Vec<HelpEntry> {
         HelpEntry {
             usage: "/delegate <agent> <task>",
             detail: "hand a task to a different CLI as a subagent",
+        },
+        HelpEntry {
+            usage: "/queue",
+            detail: "review messages waiting to send; Del or Ctrl+D drops the highlighted one",
         },
         HelpEntry {
             usage: "/cancel",
@@ -608,6 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dragged_file_path_is_a_message_not_a_command() {
+        // Dropping a screenshot on the composer pastes an absolute path; it used
+        // to come back as "unknown command /var/folders/…" instead of reaching
+        // the agent.
+        let dropped = "/var/folders/yf/T/TemporaryItems/Screenshot\\ 2026-08-05.png";
+        assert!(!is_command(dropped));
+        assert!(complete(dropped).is_empty());
+
+        assert!(!is_command(
+            "/Users/matic/WORK/agentmux/README.md explain this"
+        ));
+        assert!(!is_command("/tmp/a.png /tmp/b.png compare these"));
+
+        // Real commands, and the bare slash that opens the list, are untouched.
+        assert!(is_command("/model opus"));
+        assert!(!complete("/").is_empty());
+        assert!(!complete("/mod").is_empty());
+    }
+
+    #[test]
     fn parses_bare_and_direct_forms() {
         assert_eq!(parse("/agent").expect("parse"), Command::Agent(None));
         assert_eq!(
@@ -641,6 +718,26 @@ mod tests {
             parse("/THINKING SHOW").expect("parse"),
             Command::Thinking(ThinkingCommand::Show)
         );
+    }
+
+    #[test]
+    fn telegram_help_and_completions_match_the_guided_actions() {
+        let completions = complete("/telegram ");
+        for action in [
+            "status", "setup", "connect", "link", "allow", "remove", "reset",
+        ] {
+            let expected = format!("/telegram {action}");
+            assert!(
+                completions.iter().any(|candidate| *candidate == expected),
+                "missing {action}: {completions:?}"
+            );
+        }
+        let entry = help()
+            .into_iter()
+            .find(|entry| entry.usage.starts_with("/telegram"))
+            .expect("Telegram help");
+        assert!(!entry.usage.contains("start"), "{}", entry.usage);
+        assert!(!entry.usage.contains("stop"), "{}", entry.usage);
     }
 
     #[test]
@@ -924,6 +1021,13 @@ mod tests {
                 other => other.to_string(),
             };
             assert!(parse(&line).is_ok(), "{name} must parse");
+        }
+    }
+
+    #[test]
+    fn the_queue_review_command_has_the_obvious_aliases() {
+        for line in ["/queue", "/queued", "/pending"] {
+            assert_eq!(parse(line).expect("parse"), Command::Queue, "{line}");
         }
     }
 

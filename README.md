@@ -57,8 +57,8 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
   and delegated-agent activity without inventing hidden reasoning.
 - Separates user prompts from agent responses with a quiet full-width prompt
   surface and preserves Markdown list hierarchy when narrow terminals wrap it.
-- Lets you show or hide thinking with `/thinking` or `Ctrl+T`, including while a
-  model is running.
+- Lets you show or hide thinking and tool activity together with `/thinking` or
+  `Ctrl+T`, including while a model is running.
 - Recognizes deliberate numbered choices and presents a keyboard picker.
 - Keeps mouse-wheel scrolling and drag-to-select/copy active at the same time.
 - Discovers project and global skills for every compatible agent, while keeping
@@ -68,7 +68,10 @@ Sources and attribution are in <a href="docs/assets/README.md">docs/assets</a>.<
 - Delegates work to another CLI while preserving parent/child lineage.
 - Updates the conversation title to the current request and keeps a short
   description of the conversation's starting point and current focus.
-- Queues messages submitted during a run and starts them in FIFO order.
+- Queues messages submitted during a run in the TUI and starts them in FIFO
+  order after success or cancellation; a failure pauses the queue for review.
+- Shows how long the running turn has taken beside the spinner, and reports the
+  total when it finishes, including when it fails or is cancelled.
 
 ## Installation
 
@@ -144,14 +147,16 @@ a different agent or applies an effort value to an incompatible model.
 | `Ctrl+P` / `Ctrl+N` | Navigate composer history explicitly |
 | `Option+Backspace` / `Ctrl+W` | Delete the previous word |
 | `Cmd+Backspace` / `Ctrl+U` | Delete to the start of the line |
+| `Option+←` / `Option+→` | Move the caret one word at a time (`Ctrl+←`/`Ctrl+→` and `Alt+B`/`Alt+F` also work) |
+| `Cmd+←` / `Cmd+→` | Move the caret to the start or end of the current line |
 | `Ctrl+Y` | Restore the last composer edit |
-| `Ctrl+T` | Show or collapse CLI-emitted thinking, including during a run |
+| `Ctrl+T` | Show or collapse CLI-emitted thinking and tool activity, including during a run |
 | Mouse wheel / `PageUp` / `PageDown` | Scroll rendered transcript rows |
 | Drag with the left mouse button | Select visible text and copy it on release |
 | `Cmd+C` / `Ctrl+Shift+C` | Copy the selection, or the latest response if none is selected |
 | `F2` | Toggle Argo wheel + drag mode and terminal-native selection mode |
 | `Home` / `End` | Move within input; with empty input, jump through the transcript |
-| `Esc` | Close an overlay, cancel a turn, or discard a paused queue |
+| `Esc` | Close an overlay; cancel a turn (then continue queued follow-ups); cancel Telegram linking; or discard a paused queue |
 | `Ctrl+C`, twice within 3 seconds | Exit Argo; the first press only warns |
 | `Ctrl+D` with an empty composer | Exit immediately |
 
@@ -173,14 +178,17 @@ details and queue behavior.
 | `/effort [level]` | Set effort only when the current model supports it |
 | `/default [configure\|current\|clear]` | Manage the startup CLI/model/effort |
 | `/mode [id]` | Set Argo's execution mode directly; Plan works with every CLI and `Shift+Tab` cycles it |
-| `/thinking [show\|hide\|toggle]` | Control CLI-emitted thinking visibility (`Ctrl+T`) |
+| `/backup [id [model]\|none]` | Configure or clear a standby CLI for quota-exhaustion failover |
+| `/telegram [status\|setup\|connect\|link\|allow\|remove\|reset]` | Set up, inspect, or remove Telegram phone access |
+| `/thinking [show\|hide\|toggle]` | Control visibility of CLI-emitted thinking and tool activity (`Ctrl+T`) |
 | `/usage` | Show last-turn tokens and the selected provider's local allowance surface |
-| `/status` | Show conversation, selection, context, run, and queue state |
+| `/status` | Show conversation, selection, context, run state with elapsed time, and queue state |
 | `/update [check\|install\|force]` | Check for updates or exit and update Argo directly |
 | `/agents` | Browse CLIs; Enter switches, Space configures default, Delete clears it |
 | `/skills` | Show skills available to every agent |
 | `/instructions [enable\|disable\|edit]` | Manage opt-in `.argo-instructions.md` project memory |
 | `/context` | Preview exactly what the next CLI receives |
+| `/compact` | Fold the conversation so far into a summary to free context |
 | `/resume [n\|id]` | List or reopen conversations (`/open` is an alias) |
 | `/new [title]` | Start a new conversation |
 | `/clear-history` | Delete stored chats for this workspace and start fresh |
@@ -188,7 +196,8 @@ details and queue behavior.
 | `/parent` or `/back` | Return from an opened child conversation |
 | `/delegate <agent> <task>` | Run a self-contained task in a child conversation |
 | `/mcp ...` | Add, list, check, auth, reconnect, or delete MCP servers |
-| `/cancel` | Stop the active turn without dropping queued follow-ups |
+| `/queue` | Review queued follow-ups; `Del` or `Ctrl+D` removes the highlighted one |
+| `/cancel` | Stop the active turn; the next queued follow-up starts automatically |
 | `/config` | Show preferences and state paths |
 | `/doctor` | Run environment and adapter diagnostics |
 | `/help` | Open the complete in-app command reference |
@@ -197,6 +206,50 @@ details and queue behavior.
 Opening a result from `/children` is non-blocking: `Esc` or `Enter` closes the
 snapshot and returns to the parent while agents continue working. Opening a real
 child chat with `/open <id>` lets you use `/parent` to navigate back.
+
+## Backup failover and Telegram access
+
+`/backup` chooses a standby CLI, its model, and optional effort. If the active
+CLI reports that its plan is exhausted before producing output or side effects,
+Argo visibly continues the same run on the standby. The standby becomes the
+conversation's active CLI, the exhausted CLI moves into the backup slot, and
+subsequent status and usage attribution name the CLI that actually answered.
+Use `/backup none` to disable failover.
+
+Bare `/telegram` shows status when linked and otherwise opens guided setup. The
+wizard validates a BotFather token, shows a bot link, and prints a fresh one-time
+`/link <challenge>` command. The TUI remains responsive while it waits for up to
+90 seconds; `Esc` cancels the wait. Linking starts the bridge immediately, so no
+Argo restart is required. `/telegram allow` adds the current workspace and
+`/telegram remove` stops the bridge and deletes the stored token and Telegram
+configuration (`/telegram reset` remains a compatibility alias).
+
+**Security warning:** Telegram is remote access to coding agents. An authorized
+Telegram user can select full-access mode and run commands or modify files in
+every allowlisted workspace with the permissions of your local account. Use a
+private bot, authorize only trusted user IDs, keep the workspace allowlist
+minimal, and run `/telegram remove` immediately if the bot token or account is
+compromised.
+
+The scriptable equivalents include:
+
+```bash
+argo telegram setup --root /path/to/project
+argo telegram status
+argo telegram link --secs 120 --root /path/to/project
+argo telegram allow <USER_ID> --root /path/to/project
+argo telegram qr
+argo telegram remove
+argo telegram reset       # compatibility alias
+```
+
+Turn timeouts are opt-in. `ARGO_TURN_TIMEOUT_MS` limits daemon-owned agent turns;
+unset, invalid, or `0` means no daemon turn deadline. Scriptable streaming also
+accepts `ARGO_STREAM_IDLE_TIMEOUT_MS`; unset, invalid, or `0` waits indefinitely,
+while a positive value stops that client after that many milliseconds without an
+event but leaves the daemon-owned turn running. Telegram linking uses the TUI's
+90-second window or scriptable `argo telegram link --secs <seconds>`, independent
+of those environment variables.
 
 ## Usage reporting
 
@@ -330,7 +383,7 @@ limitations instead of launching every CLI at startup.
 
 ## Scriptable CLI
 
-The same operations are available outside the TUI:
+Common operations are available outside the TUI:
 
 ```bash
 argo doctor
@@ -344,6 +397,7 @@ argo send --conversation-id <id> --agent codex --model <model> "optimize it"
 argo select <id> --agent claude --model <model> --reasoning high
 argo mode <id> plan
 argo context <id> "the next question"
+argo compact <conversation-id>
 argo delegate <agent> "inspect this failure and report likely causes"
 
 argo skills --root /path/to/project

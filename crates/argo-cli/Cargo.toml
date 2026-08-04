@@ -17,6 +17,7 @@ argo-runtime = { workspace = true }
 argo-resources = { workspace = true }
 argo-tui = { workspace = true }
 argo-store = { workspace = true }
+argo-telegram = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 serde_json = { workspace = true }

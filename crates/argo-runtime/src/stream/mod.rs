@@ -105,6 +105,37 @@ pub fn is_retryable_failure(message: &str) -> bool {
     .iter()
     .any(|needle| lower.contains(needle))
 }
+
+/// True when a failure means this CLI's plan or credit is spent.
+///
+/// Narrower than [`is_retryable_failure`] on purpose, and the two are not
+/// interchangeable: a transient rate limit clears on its own and is already
+/// handled by the engine's one-shot retry, whereas an exhausted plan will not
+/// recover within the conversation. Only the latter justifies handing the turn to
+/// a different CLI, so anything ambiguous is deliberately excluded — a false
+/// positive silently moves a user onto another vendor's quota.
+pub fn is_limit_exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "usage limit",
+        "usage limits",
+        "out of credit",
+        "insufficient credit",
+        "insufficient_quota",
+        "quota exceeded",
+        "exceeded your quota",
+        "exceeded your current quota",
+        "weekly limit",
+        "monthly limit",
+        "upgrade your plan",
+        "plan limit",
+        "credit balance is too low",
+        "no credits remaining",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// Truncates `text` to `max` bytes, respecting char boundaries.
 ///
 /// Tool output and error text from a CLI is unbounded in principle, so every
@@ -151,6 +182,43 @@ mod tests {
         assert!(is_retryable_failure("HTTP status 503 service unavailable"));
         assert!(!is_retryable_failure("invalid API key"));
         assert!(!is_retryable_failure("model does not exist"));
+    }
+
+    #[test]
+    fn exhaustion_is_recognized_from_how_the_clis_actually_word_it() {
+        assert!(is_limit_exhausted(
+            "Claude usage limit reached. Your limit will reset at 3pm."
+        ));
+        assert!(is_limit_exhausted(
+            "You exceeded your current quota, please check your plan and billing details"
+        ));
+        assert!(is_limit_exhausted(
+            "Your credit balance is too low to access the Anthropic API"
+        ));
+        assert!(is_limit_exhausted("You've hit your weekly limit for Opus"));
+    }
+
+    #[test]
+    fn generic_non_billing_limits_are_not_exhaustion() {
+        assert!(!is_limit_exhausted("tool call limit reached for this turn"));
+        assert!(!is_limit_exhausted("recursion limit reached"));
+        assert!(!is_limit_exhausted(
+            "you have reached your limit of 100 files per request"
+        ));
+        assert!(!is_limit_exhausted("maximum token limit reached"));
+    }
+
+    #[test]
+    fn transient_failures_are_never_treated_as_exhaustion() {
+        // These recover on their own and are already covered by the engine's
+        // one-shot retry. Failing over on them would move the user onto another
+        // vendor's quota for what was a blip.
+        assert!(!is_limit_exhausted("connection reset by peer"));
+        assert!(!is_limit_exhausted("HTTP status 429 too many requests"));
+        assert!(!is_limit_exhausted("rate limit exceeded, retry after 20s"));
+        assert!(!is_limit_exhausted("HTTP status 503 service unavailable"));
+        // Neither is an ordinary error the user must act on.
+        assert!(!is_limit_exhausted("invalid API key"));
     }
 
     #[test]

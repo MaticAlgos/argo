@@ -25,14 +25,15 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// How long to wait between streamed events before giving up.
 ///
 /// This is an inactivity budget, not a total budget, so a long agentic turn that
-/// keeps producing output is never cut short. Override with
-/// `ARGO_STREAM_IDLE_TIMEOUT_MS`; `0` waits indefinitely.
+/// keeps producing output is never cut short. Normal turns wait indefinitely by
+/// default; set `ARGO_STREAM_IDLE_TIMEOUT_MS` to a positive value to opt into a
+/// client-side inactivity limit. `0` also waits indefinitely.
 fn stream_idle_timeout() -> Option<std::time::Duration> {
-    let ms = std::env::var("ARGO_STREAM_IDLE_TIMEOUT_MS")
+    std::env::var("ARGO_STREAM_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(120_000);
-    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
 }
 
 /// A connected client session.
@@ -52,6 +53,8 @@ impl Client {
                     // daemon alive. Stop it through its own compatible handshake
                     // before starting this build.
                     argo_daemon::stop_older_daemon(paths, protocol, "argo-cli").await?;
+                } else if !daemon_is_unavailable(&error) {
+                    return Err(error);
                 }
             }
         }
@@ -65,7 +68,8 @@ impl Client {
             tokio::time::sleep(std::time::Duration::from_millis(75)).await;
             match Self::try_connect(paths).await {
                 Ok(client) => return Ok(client),
-                Err(error) => last_error = Some(error),
+                Err(error) if daemon_is_unavailable(&error) => last_error = Some(error),
+                Err(error) => return Err(error),
             }
         }
         Err(last_error
@@ -113,7 +117,10 @@ impl Client {
     }
 
     /// Sends a request with a caller-selected reply budget.
-    async fn request_within(
+    ///
+    /// Needed by anything the daemon answers slowly on purpose, such as waiting
+    /// for a Telegram message to arrive, which outlives the default budget.
+    pub async fn request_within(
         &mut self,
         request: Request,
         budget: Option<std::time::Duration>,
@@ -143,6 +150,14 @@ impl Client {
         serde_json::from_str(&line)
             .map_err(|e| ArgoError::Protocol(format!("malformed reply: {e}")))
     }
+}
+
+/// True only for the initial socket-open failure that means no daemon is listening.
+///
+/// Handshake, protocol, and daemon-reported errors must not be mistaken for an
+/// absent daemon and hidden behind an auto-start retry loop.
+fn daemon_is_unavailable(error: &ArgoError) -> bool {
+    matches!(error, ArgoError::Io(message) if message.starts_with("connect to daemon:"))
 }
 
 /// Starts the daemon as a detached background process.
@@ -176,7 +191,334 @@ fn spawn_daemon(paths: &ArgoPaths) -> Result<()> {
     Ok(())
 }
 
-/// Prints environment and adapter status.
+/// Builds the required two-phase link exchange in protocol order.
+fn telegram_link_sequence(challenge: String, timeout_ms: u64, root: String) -> (Request, Request) {
+    (
+        Request::TelegramPrepareLink {
+            challenge: challenge.clone(),
+        },
+        Request::TelegramLink {
+            challenge,
+            timeout_ms,
+            root,
+        },
+    )
+}
+
+/// Accepts only the acknowledgement returned after a link window is prepared.
+fn telegram_link_prepared(response: Response) -> Result<()> {
+    match response {
+        Response::Ok => Ok(()),
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!(
+            "unexpected Telegram prepare reply: {other:?}"
+        ))),
+    }
+}
+
+/// Drives Telegram setup and reporting from a terminal.
+///
+/// Every step after bot creation is here, including linking, so the bridge can
+/// be set up on a headless host with no TUI.
+pub async fn telegram(paths: &ArgoPaths, action: crate::TelegramAction) -> Result<()> {
+    use crate::TelegramAction;
+
+    if let TelegramAction::Setup { root } = &action {
+        return telegram_setup(paths, resolve_root(root.clone())?).await;
+    }
+
+    let connect_token = match &action {
+        TelegramAction::Connect { token_file } => {
+            Some(read_bot_token(token_file.as_deref()).await?)
+        }
+        _ => None,
+    };
+    let link_challenge = matches!(action, TelegramAction::Link { .. })
+        .then(argo_daemon::protocol::telegram_link_challenge);
+
+    let mut client = Client::connect(paths).await?;
+    let request = match &action {
+        TelegramAction::Status | TelegramAction::Qr => Request::TelegramStatus,
+        TelegramAction::Connect { .. } => Request::TelegramConnect {
+            token: connect_token.clone().unwrap_or_default(),
+        },
+        TelegramAction::Link { secs, root } => {
+            let (prepare, wait) = telegram_link_sequence(
+                link_challenge.clone().unwrap_or_default(),
+                secs.saturating_mul(1000).max(1_000),
+                resolve_root(root.clone())?,
+            );
+            telegram_link_prepared(client.request(prepare).await?)?;
+            wait
+        }
+        TelegramAction::Allow { user_id, root } => Request::TelegramAllowUser {
+            user_id: *user_id,
+            root: resolve_root(root.clone())?,
+        },
+        TelegramAction::Start => Request::TelegramStart,
+        TelegramAction::Remove => Request::TelegramRemove,
+        TelegramAction::Reset => Request::TelegramReset,
+        // Handled above, before a client is opened.
+        TelegramAction::Setup { .. } => unreachable!("setup returns earlier"),
+    };
+
+    // Linking deliberately blocks while the daemon watches for the user's first
+    // message, so it needs a budget larger than the default request timeout.
+    let budget = match &action {
+        TelegramAction::Link { secs, .. } => {
+            let challenge = link_challenge.as_deref().unwrap_or_default();
+            println!("send this exact command to the bot:");
+            println!("  /link {challenge}");
+            println!("waiting up to {secs}s for that command…");
+            std::time::Duration::from_secs(secs.saturating_add(20))
+        }
+        _ => std::time::Duration::from_millis(REQUEST_TIMEOUT_MS),
+    };
+
+    match client.request_within(request, Some(budget)).await? {
+        Response::Telegram {
+            bot_username,
+            linked,
+            running,
+            allowed_user_ids,
+            workspaces,
+            active_workspace,
+        } => {
+            match &action {
+                TelegramAction::Connect { .. } | TelegramAction::Qr => {
+                    match bot_username.as_deref() {
+                        Some(username) => print_bot_invite(username),
+                        None => println!("no bot is connected yet"),
+                    }
+                }
+                TelegramAction::Remove | TelegramAction::Reset => {
+                    println!("telegram setup removed; stored token and settings deleted")
+                }
+                _ => {}
+            }
+
+            println!(
+                "bot        : {}",
+                bot_username
+                    .map(|name| format!("@{name}"))
+                    .unwrap_or_else(|| "not connected".into())
+            );
+            println!(
+                "bridge     : {}",
+                match (linked, running) {
+                    (false, _) => "not linked yet — run: argo telegram setup",
+                    (true, false) => "linked but not polling; run: argo telegram start",
+                    (true, true) => "running",
+                }
+            );
+            println!(
+                "authorized : {}",
+                if allowed_user_ids.is_empty() {
+                    "nobody".to_string()
+                } else {
+                    allowed_user_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            for root in &workspaces {
+                let marker = if Some(root) == active_workspace.as_ref() {
+                    ">"
+                } else {
+                    " "
+                };
+                println!("workspace  : {marker} {root}");
+            }
+            Ok(())
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    }
+}
+
+/// Reads a bot token without accepting it in process arguments.
+async fn read_bot_token(path: Option<&std::path::Path>) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let token = match path {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|error| ArgoError::Io(format!("read {}: {error}", path.display())))?,
+        None => {
+            use std::io::{IsTerminal, Write};
+            let interactive = std::io::stdin().is_terminal();
+            if interactive {
+                print!("Paste the bot token: ");
+                let _ = std::io::stdout().flush();
+            }
+            let echo = interactive.then(EchoGuard::hide).flatten();
+            let token = BufReader::new(tokio::io::stdin())
+                .lines()
+                .next_line()
+                .await
+                .map_err(|error| ArgoError::Io(format!("read token: {error}")))?
+                .unwrap_or_default();
+            drop(echo);
+            if interactive {
+                println!();
+            }
+            token
+        }
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(ArgoError::Invalid("no token entered".into()));
+    }
+    Ok(token)
+}
+
+/// Best-effort terminal echo suppression using the platform's standard `stty`.
+///
+/// Token input still works when `stty` is unavailable; it simply falls back to
+/// the terminal's ordinary echo behavior rather than adding a new dependency.
+struct EchoGuard;
+
+impl EchoGuard {
+    fn hide() -> Option<Self> {
+        std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .filter(std::process::ExitStatus::success)
+            .map(|_| Self)
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Runs the whole setup in one command, prompting as it goes.
+///
+/// Creating the bot is the one step that cannot be automated: Telegram exposes no
+/// API for it, and BotFather only talks to humans. Everything after the token is
+/// handled here, including discovering the user's id, so nobody has to go
+/// looking for it.
+async fn telegram_setup(paths: &ArgoPaths, root: String) -> Result<()> {
+    println!("Connect Telegram");
+    println!();
+    println!("1. Open https://t.me/BotFather and send /newbot");
+    println!("2. Choose a display name, then a username ending in 'bot'");
+    println!("3. Copy the token it replies with");
+    println!();
+    if let Some(rows) = argo_telegram::qr::render("https://t.me/BotFather") {
+        for row in rows {
+            println!("{row}");
+        }
+        println!();
+    }
+
+    let token = read_bot_token(None).await?;
+
+    let mut client = Client::connect(paths).await?;
+    let username = match client
+        .request(Request::TelegramConnect {
+            token: token.clone(),
+        })
+        .await?
+    {
+        Response::Telegram { bot_username, .. } => bot_username,
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => return Err(ArgoError::remote(code, message, retryable)),
+        other => return Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    };
+    let Some(username) = username else {
+        return Err(ArgoError::Protocol(
+            "the bot connected but reported no username".into(),
+        ));
+    };
+
+    println!();
+    println!("Connected to @{username}.");
+    print_bot_invite(&username);
+    let challenge = argo_daemon::protocol::telegram_link_challenge();
+    const TOTAL_SECS: u64 = 180;
+    let (prepare, wait) =
+        telegram_link_sequence(challenge.clone(), TOTAL_SECS * 1000, root.clone());
+    telegram_link_prepared(client.request(prepare).await?)?;
+
+    println!("Scan that (or open the link), then send this exact command:");
+    println!("  /link {challenge}");
+    println!();
+    println!("Waiting for your message (up to {TOTAL_SECS}s). Press Ctrl-C to stop.");
+
+    match client
+        .request_within(wait, Some(std::time::Duration::from_secs(TOTAL_SECS + 20)))
+        .await?
+    {
+        Response::Telegram {
+            allowed_user_ids, ..
+        } => {
+            println!("Linked. Authorized: {allowed_user_ids:?}");
+            println!("Workspace reachable from Telegram: {root}");
+            println!();
+            println!("The bridge is live now — message @{username} to start.");
+            Ok(())
+        }
+        Response::Error { code, .. } if code == "TIMEOUT" => {
+            println!("No matching /link command arrived.");
+            println!("Start a fresh challenge, then send the exact command it prints:");
+            println!("  argo telegram link");
+            println!("or, if you already know your Telegram user id:");
+            println!("  argo telegram allow <USER_ID>");
+            Ok(())
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    }
+}
+
+/// Prints the scannable invite that replaces typing a link into a phone.
+fn print_bot_invite(username: &str) {
+    let link = format!("https://t.me/{username}");
+    println!();
+    match argo_telegram::qr::render(&link) {
+        Some(rows) => {
+            for row in rows {
+                println!("{row}");
+            }
+        }
+        // A terminal too narrow for the symbol still gets a usable instruction.
+        None => println!("(could not render a QR code)"),
+    }
+    println!();
+    println!("scan that, or open {link}");
+    println!("then run `argo telegram link` and send the exact /link challenge it prints");
+    println!();
+}
+
 pub async fn doctor(paths: &ArgoPaths) -> Result<()> {
     println!("argo {}", env!("CARGO_PKG_VERSION"));
     println!("  data dir : {}", paths.root().display());
@@ -888,6 +1230,44 @@ pub async fn context(paths: &ArgoPaths, conversation_id: &str, prompt: &str) -> 
     }
 }
 
+/// Folds a conversation's history into a summary and reports what changed.
+///
+/// The scriptable equivalent of `/compact`. Prints what was folded rather than
+/// the summary itself: the point is to confirm the reduction, and the summary is
+/// visible through `argo context`.
+pub async fn compact(paths: &ArgoPaths, conversation_id: &str) -> Result<()> {
+    let mut client = Client::connect(paths).await?;
+    match client
+        .request(Request::Compact {
+            conversation_id: ConversationId::new(conversation_id),
+        })
+        .await?
+    {
+        Response::Compacted {
+            compacted_upto,
+            messages_compacted,
+            sessions_cleared,
+            ..
+        } => {
+            println!("compacted {messages_compacted} message(s) up to seq {compacted_upto}");
+            println!("stored transcript unchanged; only future turns are reduced");
+            if sessions_cleared > 0 {
+                println!(
+                    "dropped {sessions_cleared} native session(s) so the next turn reseeds from \
+                     the compacted context"
+                );
+            }
+            Ok(())
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => Err(ArgoError::remote(code, message, retryable)),
+        other => Err(ArgoError::Protocol(format!("unexpected reply: {other:?}"))),
+    }
+}
+
 /// Delegates one self-contained task to another CLI and prints its report.
 ///
 /// Agent-launched commands inherit these ids from the active turn. Explicit flags
@@ -1014,7 +1394,7 @@ pub async fn send(
         }
     }
 
-    let (run_id, resumed) = match client
+    let (run_id, resumed, usage_source) = match client
         .request(Request::SendMessage {
             conversation_id,
             prompt: message,
@@ -1040,7 +1420,8 @@ pub async fn send(
                     ", fresh session with context".to_string()
                 }
             );
-            (run_id, resumed)
+            let usage_source = format!("{agent_id}/{model}");
+            (run_id, resumed, usage_source)
         }
         Response::Error {
             code,
@@ -1051,14 +1432,14 @@ pub async fn send(
     };
     let _ = resumed;
 
-    stream_events(paths, run_id).await
+    stream_events(paths, run_id, usage_source).await
 }
 
 /// Follows a run to completion on a second connection.
 ///
 /// A separate connection keeps the streaming read loop from interleaving with
 /// request/response traffic on the first one.
-async fn stream_events(paths: &ArgoPaths, run_id: RunId) -> Result<()> {
+async fn stream_events(paths: &ArgoPaths, run_id: RunId, mut usage_source: String) -> Result<()> {
     let mut client = Client::connect(paths).await?;
     let line = serde_json::to_string(&Request::Subscribe {
         run_id: run_id.clone(),
@@ -1085,6 +1466,20 @@ async fn stream_events(paths: &ArgoPaths, run_id: RunId) -> Result<()> {
                 RunEventKind::SessionReseeded { reason } => {
                     eprintln!("  · {reason}; retrying with full context")
                 }
+                RunEventKind::BackupFailover {
+                    to_agent_id,
+                    to_model,
+                    detail,
+                    ..
+                } => {
+                    usage_source = format!(
+                        "{}/{}",
+                        to_agent_id,
+                        to_model.unwrap_or_else(|| "default".into())
+                    );
+                    eprintln!("\n  ⇄ {detail}");
+                    eprintln!("  · active CLI for this turn: {usage_source}");
+                }
                 RunEventKind::Error { message, .. } => eprintln!("  ! {message}"),
                 RunEventKind::RunFinished {
                     status: final_status,
@@ -1092,7 +1487,11 @@ async fn stream_events(paths: &ArgoPaths, run_id: RunId) -> Result<()> {
                 } => {
                     status = final_status;
                     if let Some(input) = usage.input {
-                        eprintln!("  · tokens in={} out={}", input, usage.output.unwrap_or(0));
+                        eprintln!(
+                            "  · tokens ({usage_source}) in={} out={}",
+                            input,
+                            usage.output.unwrap_or(0)
+                        );
                     }
                 }
                 _ => {}
@@ -1162,11 +1561,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_idle_timeout_is_bounded_by_default_and_disablable() {
+    fn stream_idle_timeout_is_unlimited_by_default_and_can_be_set_explicitly() {
         std::env::remove_var("ARGO_STREAM_IDLE_TIMEOUT_MS");
         assert!(
-            stream_idle_timeout().is_some(),
-            "must not wait forever by default"
+            stream_idle_timeout().is_none(),
+            "normal turns must wait indefinitely by default"
         );
         std::env::set_var("ARGO_STREAM_IDLE_TIMEOUT_MS", "0");
         assert!(stream_idle_timeout().is_none(), "0 means wait indefinitely");
@@ -1174,6 +1573,11 @@ mod tests {
         assert_eq!(
             stream_idle_timeout(),
             Some(std::time::Duration::from_millis(1500))
+        );
+        std::env::set_var("ARGO_STREAM_IDLE_TIMEOUT_MS", "not-a-number");
+        assert!(
+            stream_idle_timeout().is_none(),
+            "malformed values do not add a default limit"
         );
         std::env::remove_var("ARGO_STREAM_IDLE_TIMEOUT_MS");
     }
@@ -1191,6 +1595,21 @@ mod tests {
     fn blank_messages_produce_an_empty_title_rather_than_panicking() {
         assert_eq!(first_line(""), "");
         assert_eq!(first_line("\n\n"), "");
+    }
+
+    #[test]
+    fn telegram_link_sequence_prepares_the_exact_challenge_before_waiting() {
+        let (prepare, wait) =
+            telegram_link_sequence("challenge".into(), 12_000, "/workspace".into());
+        assert!(matches!(
+            prepare,
+            Request::TelegramPrepareLink { challenge } if challenge == "challenge"
+        ));
+        assert!(matches!(
+            wait,
+            Request::TelegramLink { challenge, timeout_ms: 12_000, root }
+                if challenge == "challenge" && root == "/workspace"
+        ));
     }
 
     #[test]

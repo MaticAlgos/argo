@@ -165,6 +165,24 @@ pub enum RunEventKind {
         /// Terminal status.
         status: RunStatus,
     },
+    /// The primary exhausted its allowance before acting and the same run moved
+    /// to its snapshotted standby route.
+    BackupFailover {
+        /// Exhausted primary adapter.
+        from_agent_id: AgentId,
+        /// Primary model used for the failed attempt.
+        from_model: Option<String>,
+        /// Primary reasoning effort used for the failed attempt.
+        from_reasoning: Option<String>,
+        /// Standby adapter now executing the run.
+        to_agent_id: AgentId,
+        /// Standby model selected at turn start.
+        to_model: Option<String>,
+        /// Standby reasoning effort selected at turn start.
+        to_reasoning: Option<String>,
+        /// Human-readable explanation for transcript surfaces.
+        detail: String,
+    },
     /// Non-fatal diagnostic information.
     Diagnostic {
         /// Stable code.

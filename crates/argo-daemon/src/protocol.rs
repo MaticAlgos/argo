@@ -10,6 +10,14 @@
 
 use argo_core::event::{EventSeq, RunEvent};
 use argo_core::ids::{AgentId, ConversationId, RunId};
+
+/// Generates a fresh challenge for one Telegram linking window.
+///
+/// UUID v4 generation is backed by the operating system CSPRNG. Keeping the
+/// full identifier preserves its random bits while remaining easy to copy.
+pub fn telegram_link_challenge() -> String {
+    RunId::generate().to_string()
+}
 use argo_core::message::ContentBlock;
 use argo_core::runtime::{ModelOption, ReasoningOption};
 use argo_core::session::SelectionChange;
@@ -85,6 +93,22 @@ pub enum Request {
         /// Mode identifier, or `None` to return to full access.
         mode: Option<String>,
     },
+    /// Set the standby agent this conversation fails over to.
+    ///
+    /// When the selected agent reports an exhausted plan, the turn is handed to
+    /// this agent with the canonical transcript, rather than failing.
+    SetBackupAgent {
+        /// Conversation to update.
+        conversation_id: ConversationId,
+        /// Adapter to stand by, or `None` to disable failover.
+        agent_id: Option<String>,
+        /// Model for the standby. Its own, never the primary's.
+        #[serde(default)]
+        model: Option<String>,
+        /// Reasoning effort for the standby, when its model offers one.
+        #[serde(default)]
+        reasoning: Option<String>,
+    },
     /// Preview the exact body the next turn would send.
     ///
     /// Backs `/context`, so a user can see what a switched agent will receive
@@ -94,6 +118,15 @@ pub enum Request {
         conversation_id: ConversationId,
         /// Prompt the user is about to send.
         prompt: String,
+    },
+    /// Fold the conversation so far into a summary and start a fresh context.
+    ///
+    /// Backs `/compact`. Nothing is deleted: the canonical messages stay in
+    /// SQLite and remain readable, and only the projection sent to an agent is
+    /// reduced from here on.
+    Compact {
+        /// Conversation to compact.
+        conversation_id: ConversationId,
     },
     /// Submit a turn.
     SendMessage {
@@ -141,6 +174,63 @@ pub enum Request {
         /// How long to wait before giving up on the child.
         timeout_ms: Option<u64>,
     },
+    /// Report whether the Telegram bridge is configured and running.
+    TelegramStatus,
+    /// Validate a bot token and remember it, without linking a user yet.
+    ///
+    /// Returns the bot's identity so the wizard can show the deep link the user
+    /// must open to prove who they are.
+    TelegramConnect {
+        /// Bot token issued by BotFather.
+        token: String,
+    },
+    /// Prepare one Telegram linking window before displaying its challenge.
+    ///
+    /// The daemon stops ordinary polling and records a high-water mark first, so
+    /// a command sent immediately after the client displays the challenge cannot
+    /// be mistaken for stale traffic.
+    TelegramPrepareLink {
+        /// Cryptographically unpredictable one-time challenge generated locally.
+        challenge: String,
+    },
+    /// Wait for the exact challenge-bearing `/link` command and authorize its sender.
+    ///
+    /// [`Request::TelegramPrepareLink`] must complete before the challenge is
+    /// displayed and this wait begins.
+    TelegramLink {
+        /// Challenge prepared for this attempt.
+        challenge: String,
+        /// How long to watch for the matching command.
+        timeout_ms: u64,
+        /// Workspace to allow once linking succeeds.
+        root: String,
+    },
+    /// Cancel a prepared or active linking window and restore ordinary polling.
+    TelegramCancelLink {
+        /// Challenge identifying the window to cancel.
+        challenge: String,
+    },
+    /// Allow a workspace root to be opened from Telegram.
+    TelegramAllowWorkspace {
+        /// Workspace root to add to the allowlist.
+        root: String,
+    },
+    /// Authorize a Telegram user id directly.
+    ///
+    /// The manual alternative to [`Request::TelegramLink`], for when the user
+    /// already knows their id or the linking window expired.
+    TelegramAllowUser {
+        /// Telegram numeric user id.
+        user_id: i64,
+        /// Workspace to allow alongside it.
+        root: String,
+    },
+    /// Start the Telegram poll loop now, without restarting the daemon.
+    TelegramStart,
+    /// Forget the bot token and all Telegram settings (legacy reset spelling).
+    TelegramReset,
+    /// Remove Telegram phone access, deleting its token and all bridge settings.
+    TelegramRemove,
     /// Ask the daemon to shut down.
     Shutdown,
 }
@@ -203,6 +293,17 @@ pub enum Response {
         /// The exact body that would be sent.
         body: String,
     },
+    /// A conversation was compacted, for `/compact`.
+    Compacted {
+        /// Highest message sequence now covered by the summary.
+        compacted_upto: i64,
+        /// Number of messages that will no longer be replayed verbatim.
+        messages_compacted: usize,
+        /// Native session handles dropped so the next turn reseeds.
+        sessions_cleared: usize,
+        /// The summary that now stands in for the compacted prefix.
+        summary: String,
+    },
     /// A turn was accepted.
     RunStarted {
         /// The new run.
@@ -229,6 +330,21 @@ pub enum Response {
     StreamEnd {
         /// Run that finished.
         run_id: RunId,
+    },
+    /// State of the Telegram bridge.
+    Telegram {
+        /// Bot username, once a token has been validated.
+        bot_username: Option<String>,
+        /// Whether a token and at least one authorized user are stored.
+        linked: bool,
+        /// Whether the poll loop is running in this daemon.
+        running: bool,
+        /// Authorized Telegram user ids.
+        allowed_user_ids: Vec<i64>,
+        /// Allowlisted workspace roots.
+        workspaces: Vec<String>,
+        /// Workspace currently in focus.
+        active_workspace: Option<String>,
     },
     /// Child conversations.
     Children {
@@ -277,6 +393,15 @@ pub struct ConversationSummary {
     pub selected_reasoning: Option<String>,
     /// Execution mode selected for the next turn.
     pub selected_mode: Option<String>,
+    /// Standby agent used when the selected agent exhausts its plan.
+    #[serde(default)]
+    pub selected_backup_agent_id: Option<String>,
+    /// Model the standby runs.
+    #[serde(default)]
+    pub selected_backup_model: Option<String>,
+    /// Reasoning effort for the standby.
+    #[serde(default)]
+    pub selected_backup_reasoning: Option<String>,
     /// Number of messages.
     pub message_count: usize,
     /// Agents that hold a live upstream session here.
@@ -363,6 +488,14 @@ mod tests {
     use argo_core::event::{RunEventKind, RunStatus, TokenUsage};
 
     #[test]
+    fn telegram_remove_request_round_trips() {
+        let request = Request::TelegramRemove;
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"op\":\"telegram_remove\""));
+        assert_eq!(Request::decode(&json).expect("decode"), request);
+    }
+
+    #[test]
     fn requests_round_trip_with_a_tagged_op() {
         let request = Request::SendMessage {
             conversation_id: ConversationId::new("c1"),
@@ -391,6 +524,9 @@ mod tests {
             selected_model: Some("gpt-5".into()),
             selected_reasoning: None,
             selected_mode: None,
+            selected_backup_agent_id: Some("claude".into()),
+            selected_backup_model: Some("sonnet".into()),
+            selected_backup_reasoning: None,
             message_count: 2,
             agents_with_sessions: vec![],
             parent_conversation_id: None,

@@ -149,6 +149,64 @@ impl Store {
         Ok(())
     }
 
+    /// Rebinds a running run and its assistant placeholder to a different
+    /// adapter.
+    ///
+    /// Failover keeps one run row so clients following this turn see a single
+    /// continuous stream. Agent attribution and resume provenance describe the
+    /// standby's attempt, not the exhausted primary's. Both rows are changed in
+    /// one transaction so a crash cannot leave the run and transcript disagreeing.
+    pub fn rebind_run_agent(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentId,
+        model: Option<&str>,
+        resumed: bool,
+        invalidation_reason: Option<InvalidationReason>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| ArgoError::Store(format!("begin run rebind: {e}")))?;
+        let run_changed = tx
+            .execute(
+                "UPDATE runs
+                    SET agent_id = ?2,
+                        model = ?3,
+                        resumed = ?4,
+                        invalidation_reason = ?5
+                  WHERE id = ?1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    agent_id.as_str(),
+                    model,
+                    resumed as i64,
+                    invalidation_reason.map(reason_to_str),
+                ],
+            )
+            .map_err(|e| ArgoError::Store(format!("rebind run agent: {e}")))?;
+        if run_changed == 0 {
+            return Err(ArgoError::not_found("run", run_id.as_str()));
+        }
+
+        let message_changed = tx
+            .execute(
+                "UPDATE messages
+                    SET agent_id = ?2, model = ?3
+                  WHERE id = (SELECT assistant_message_id FROM runs WHERE id = ?1)",
+                rusqlite::params![run_id.as_str(), agent_id.as_str(), model],
+            )
+            .map_err(|e| ArgoError::Store(format!("rebind run message: {e}")))?;
+        if message_changed == 0 {
+            return Err(ArgoError::Store(format!(
+                "run {run_id} has no attached assistant message"
+            )));
+        }
+
+        tx.commit()
+            .map_err(|e| ArgoError::Store(format!("commit run rebind: {e}")))
+    }
+
     /// Records a terminal status.
     pub fn finish_run(
         &self,
@@ -393,6 +451,63 @@ mod tests {
             .finish_run(&id, RunStatus::Running, None)
             .expect_err("must reject");
         assert_eq!(err.code(), "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn rebind_updates_attribution_and_resume_provenance_together() {
+        let (s, conv, ws) = setup();
+        let id = s.create_run(new_run(&conv, &ws, "claude")).expect("create");
+        let message_id = MessageId::generate();
+        s.append_message_with_id(
+            &conv,
+            message_id.clone(),
+            crate::messages::NewMessage::assistant(
+                vec![argo_core::message::ContentBlock::text("answer")],
+                AgentId::new("claude"),
+                Some("m1".into()),
+                id.clone(),
+            ),
+        )
+        .expect("message");
+        s.attach_run_message(&id, &message_id).expect("attach");
+
+        s.rebind_run_agent(&id, &AgentId::new("codex"), Some("m2"), true, None)
+            .expect("rebind");
+
+        let rebound = s.get_run(&id).expect("run");
+        assert_eq!(rebound.agent_id, AgentId::new("codex"));
+        assert_eq!(rebound.model.as_deref(), Some("m2"));
+        assert!(rebound.resumed);
+        assert!(rebound.invalidation_reason.is_none());
+        let assistant = s
+            .list_messages(&conv)
+            .expect("messages")
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .expect("assistant");
+        assert_eq!(assistant.agent_id, Some(AgentId::new("codex")));
+        assert_eq!(assistant.model.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn rebind_rolls_back_when_the_assistant_placeholder_is_missing() {
+        let (s, conv, ws) = setup();
+        let id = s.create_run(new_run(&conv, &ws, "claude")).expect("create");
+
+        s.rebind_run_agent(
+            &id,
+            &AgentId::new("codex"),
+            Some("m2"),
+            true,
+            Some(InvalidationReason::ConversationAdvanced),
+        )
+        .expect_err("missing message must abort the transaction");
+
+        let unchanged = s.get_run(&id).expect("run");
+        assert_eq!(unchanged.agent_id, AgentId::new("claude"));
+        assert_eq!(unchanged.model.as_deref(), Some("m1"));
+        assert!(!unchanged.resumed);
+        assert!(unchanged.invalidation_reason.is_none());
     }
 
     #[test]

@@ -11,6 +11,12 @@ use argo_core::message::{ContentBlock, ToolStatus};
 use argo_daemon::protocol::{ConversationSummary, MessageView};
 use argo_runtime::AgentInfo;
 
+/// Title of the queued-message list, shared by the opener and the refresh.
+const QUEUE_PICKER_TITLE: &str = "queued messages";
+
+/// How much of a queued message a list row shows before eliding.
+const QUEUE_PREVIEW_CHARS: usize = 96;
+
 /// Returns only the detected version number for a CLI picker row.
 ///
 /// Version commands often repeat the product name (`codex-cli 0.146.0`) or add
@@ -152,6 +158,8 @@ pub enum InputAction {
     McpHeaderEnv,
     McpLocalEnvName,
     McpLocalEnvSource,
+    /// Bot token pasted during `/telegram` setup.
+    TelegramToken,
 }
 
 /// In-progress MCP server created by the guided TUI flow.
@@ -194,6 +202,12 @@ pub enum PickerAction {
     ChildConversation,
     /// Set the execution mode.
     Mode,
+    /// Choose the standby CLI used when the active one runs out of quota.
+    Backup,
+    /// Choose the standby's model.
+    BackupModel,
+    /// Choose the standby's reasoning effort.
+    BackupEffort,
     /// Submit an option offered by the latest assistant response.
     ResponseOption,
     /// Choose local, remote, or imported MCP setup.
@@ -206,6 +220,8 @@ pub enum PickerAction {
     McpImport,
     /// Enable, disable, or edit project instructions.
     Instructions,
+    /// Review the messages waiting to be sent; Del or Ctrl+D drops one.
+    QueuedMessage,
 }
 
 /// One terminal cell used by Argo-owned drag selection.
@@ -264,6 +280,12 @@ pub struct App {
     pub cursor: usize,
     /// Run currently streaming, if any.
     pub active_run: Option<RunId>,
+    /// When the active turn started, for the elapsed clock beside the spinner.
+    ///
+    /// A wall clock rather than a tick count: ticks only advance while the timer
+    /// fires, so a stalled or redraw-starved turn would under-report exactly when
+    /// the user is most interested in how long it has been.
+    run_started: Option<std::time::Instant>,
     /// Overlay pane.
     pub overlay: Overlay,
     /// Status line message.
@@ -287,6 +309,10 @@ pub struct App {
     pub startup_save_default: bool,
     /// State carried between fields in `/mcp add`.
     pub mcp_draft: Option<McpDraft>,
+    /// Abort handle for the background Telegram link wait, when active.
+    telegram_link_abort: Option<tokio::task::AbortHandle>,
+    /// Challenge identifying the daemon-owned link window.
+    telegram_link_challenge: Option<String>,
     /// Width-aware maximum rendered-row scroll, refreshed by the renderer.
     scroll_limit: std::cell::Cell<usize>,
     /// Recent inputs, newest last.
@@ -425,6 +451,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             active_run: None,
+            run_started: None,
             overlay: Overlay::None,
             status: "Type a message, or /help for commands".to_string(),
             should_quit: false,
@@ -435,6 +462,8 @@ impl App {
             selected_screen_text: None,
             startup_save_default: false,
             mcp_draft: None,
+            telegram_link_abort: None,
+            telegram_link_challenge: None,
             scroll_limit: std::cell::Cell::new(0),
             history: Vec::new(),
             history_cursor: None,
@@ -494,6 +523,7 @@ impl App {
     /// Returns the queue depth so the caller can tell the user where it landed.
     pub fn enqueue(&mut self, message: String) -> usize {
         self.queued.push_back(message);
+        self.refresh_queue_overlay();
         self.queued.len()
     }
 
@@ -508,12 +538,16 @@ impl App {
 
     /// Commits delivery of the oldest queued message.
     pub fn commit_queued(&mut self) -> Option<String> {
-        self.queued.pop_front()
+        let sent = self.queued.pop_front();
+        self.refresh_queue_overlay();
+        sent
     }
 
     /// Takes the next queued message, if any.
     pub fn dequeue(&mut self) -> Option<String> {
-        self.queued.pop_front()
+        let taken = self.queued.pop_front();
+        self.refresh_queue_overlay();
+        taken
     }
 
     /// Number of messages waiting.
@@ -523,7 +557,124 @@ impl App {
 
     /// Discards every queued message, returning how many were dropped.
     pub fn clear_queue(&mut self) -> usize {
-        std::mem::take(&mut self.queued).len()
+        let dropped = std::mem::take(&mut self.queued).len();
+        self.refresh_queue_overlay();
+        dropped
+    }
+
+    /// Drops the first queued message whose text is `message`.
+    ///
+    /// Identified by content rather than by position because the queue drains on
+    /// its own: the running turn can succeed between opening the list and
+    /// pressing the removal key, and a position captured beforehand would by then
+    /// name a different message. Returns false when it has already been sent.
+    pub fn remove_queued(&mut self, message: &str) -> bool {
+        let Some(index) = self.queued.iter().position(|queued| queued == message) else {
+            return false;
+        };
+        self.queued.remove(index);
+        self.refresh_queue_overlay();
+        true
+    }
+
+    /// Opens the list of messages waiting to be sent.
+    ///
+    /// False when the queue is empty, so the caller can say so rather than open
+    /// an empty pane over the transcript.
+    pub fn open_queue_picker(&mut self) -> bool {
+        if self.queued.is_empty() {
+            return false;
+        }
+        let (items, values) = self.queue_entries();
+        self.open_picker(
+            QUEUE_PICKER_TITLE,
+            items,
+            values,
+            PickerAction::QueuedMessage,
+        );
+        true
+    }
+
+    /// Keeps an open queue list in step with the queue behind it.
+    ///
+    /// Without this the list would keep offering to remove a message that is
+    /// already on its way to the agent, which is the one thing removal cannot do.
+    fn refresh_queue_overlay(&mut self) {
+        let previous = match &self.overlay {
+            Overlay::Picker {
+                action: PickerAction::QueuedMessage,
+                selected,
+                ..
+            } => *selected,
+            _ => return,
+        };
+        // An emptied queue leaves nothing to review; holding the pane open would
+        // just be a wall the user has to dismiss.
+        if self.queued.is_empty() {
+            self.close_overlay();
+            return;
+        }
+        let filter = match &self.overlay {
+            Overlay::Picker { filter, .. } => filter.clone(),
+            _ => String::new(),
+        };
+        let (items, values) = self.queue_entries();
+        self.overlay = Overlay::Picker {
+            title: QUEUE_PICKER_TITLE.into(),
+            items,
+            values,
+            selected: previous,
+            filter,
+            action: PickerAction::QueuedMessage,
+        };
+        // The list just got shorter; the old highlight may sit past its end.
+        let matched = self.picker_matches().len();
+        if let Overlay::Picker { selected, .. } = &mut self.overlay {
+            *selected = (*selected).min(matched.saturating_sub(1));
+        }
+    }
+
+    /// One scannable row per queued message, paired with its full text.
+    fn queue_entries(&self) -> (Vec<String>, Vec<String>) {
+        let items = self
+            .queued
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                // Flattened and clipped: a pasted multi-line prompt would
+                // otherwise take the whole pane, and the row only needs to be
+                // enough to recognise the message by.
+                let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+                let preview = if flat.chars().count() > QUEUE_PREVIEW_CHARS {
+                    let kept = flat
+                        .chars()
+                        .take(QUEUE_PREVIEW_CHARS - 1)
+                        .collect::<String>();
+                    format!("{kept}…")
+                } else {
+                    flat
+                };
+                format!("{}. {preview}", index + 1)
+            })
+            .collect();
+        (items, self.queued.iter().cloned().collect())
+    }
+
+    /// Renders a turn duration compactly enough to sit in the status line.
+    ///
+    /// Seconds below a minute, `m:ss` above it, `h:mm:ss` past an hour: a long
+    /// agentic turn should still read at a glance without a units suffix pushing
+    /// the queue count off a narrow terminal.
+    fn format_elapsed(elapsed: std::time::Duration) -> String {
+        let total = elapsed.as_secs();
+        let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+        if hours > 0 {
+            format!("{hours}:{minutes:02}:{seconds:02}")
+        } else if minutes > 0 {
+            format!("{minutes}:{seconds:02}")
+        } else {
+            format!("{seconds}s")
+        }
     }
 
     /// Advances the animation. Called on a timer while a turn is running.
@@ -555,12 +706,20 @@ impl App {
                 Activity::Responding => "streaming response",
                 Activity::Working => "tool running",
             });
-        let base = format!("{} {} · {detail}", self.spinner(), self.activity.label());
+        let mut base = format!("{} {} · {detail}", self.spinner(), self.activity.label());
+        if let Some(elapsed) = self.run_elapsed() {
+            base.push_str(&format!(" · {}", Self::format_elapsed(elapsed)));
+        }
         match self.queue_depth() {
             0 => Some(base),
             1 => Some(format!("{base} · 1 queued")),
             n => Some(format!("{base} · {n} queued")),
         }
+    }
+
+    /// How long the active turn has been running, or `None` when idle.
+    pub fn run_elapsed(&self) -> Option<std::time::Duration> {
+        self.run_started.map(|started| started.elapsed())
     }
 
     /// Rotating shortcut hint shown only while a turn is active.
@@ -593,6 +752,32 @@ impl App {
     /// True while a turn is streaming.
     pub fn is_busy(&self) -> bool {
         self.active_run.is_some()
+    }
+
+    /// Records a background Telegram link wait so Escape can cancel it.
+    pub fn begin_telegram_link(&mut self, challenge: String, abort: tokio::task::AbortHandle) {
+        if let Some(previous) = self.telegram_link_abort.replace(abort) {
+            previous.abort();
+        }
+        self.telegram_link_challenge = Some(challenge);
+    }
+
+    /// Clears a completed Telegram link wait.
+    pub fn finish_telegram_link(&mut self) {
+        self.telegram_link_abort = None;
+        self.telegram_link_challenge = None;
+    }
+
+    /// Cancels the local wait and returns the daemon challenge to cancel.
+    pub fn cancel_telegram_link(&mut self) -> Option<String> {
+        let abort = self.telegram_link_abort.take()?;
+        abort.abort();
+        self.telegram_link_challenge.take()
+    }
+
+    /// Whether Telegram setup is waiting for the phone-side challenge.
+    pub fn telegram_link_pending(&self) -> bool {
+        self.telegram_link_abort.is_some()
     }
 
     /// Appends a transcript line.
@@ -877,6 +1062,62 @@ impl App {
         self.cursor = (self.cursor + 1).min(self.input.chars().count());
     }
 
+    /// Moves the caret to the start of the previous word (Option/Ctrl+Left).
+    ///
+    /// Words are whitespace-delimited, the same rule [`Self::backspace_word`]
+    /// uses, so moving over a word and deleting it agree on where it began.
+    /// Unlike deletion, this crosses newlines: a caret at the start of a line has
+    /// nowhere else to go, and stopping there would strand it.
+    pub fn move_word_left(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut cursor = self.cursor.min(chars.len());
+        while cursor > 0 && chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        while cursor > 0 && !chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        self.cursor = cursor;
+    }
+
+    /// Moves the caret to the end of the next word (Option/Ctrl+Right).
+    pub fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut cursor = self.cursor.min(chars.len());
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        while cursor < chars.len() && !chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        self.cursor = cursor;
+    }
+
+    /// Moves the caret to the start of its logical line (Cmd+Left).
+    ///
+    /// Logical rather than visual: it pairs with [`Self::backspace_to_line_start`],
+    /// which deletes exactly the span this traverses.
+    pub fn move_line_start(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        self.cursor = chars[..cursor]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+    }
+
+    /// Moves the caret to the end of its logical line (Cmd+Right).
+    pub fn move_line_end(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        self.cursor = chars[cursor..]
+            .iter()
+            .position(|ch| *ch == '\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(chars.len());
+    }
+
     /// Moves the caret to the start.
     pub fn move_home(&mut self) {
         self.cursor = 0;
@@ -966,6 +1207,7 @@ impl App {
         context_transfer_reason: Option<&str>,
     ) {
         self.active_run = Some(run_id);
+        self.run_started = Some(std::time::Instant::now());
         self.streaming.clear();
         self.thinking_streaming.clear();
         self.active_tools.clear();
@@ -1128,6 +1370,30 @@ impl App {
                 self.streaming.clear();
                 self.thinking_streaming.clear();
             }
+            RunEventKind::BackupFailover {
+                to_agent_id,
+                to_model,
+                detail,
+                ..
+            } => {
+                // This event means only that the current run moved to its
+                // snapshotted standby. The daemon promotes that route for future
+                // turns only after the standby succeeds, and a newer user
+                // selection can veto promotion. Keep the cached conversation
+                // untouched here; terminal bookkeeping refreshes its authoritative
+                // summary from the daemon.
+                let model = to_model.unwrap_or_else(|| "default".into());
+                let agent = to_agent_id.to_string();
+                self.active_usage_source = Some(format!("{agent}/{model}"));
+                self.push(LineKind::Notice, format!("⇄ {detail}"));
+                self.push(
+                    LineKind::AgentHeader,
+                    format!("{agent} · {model} · quota failover"),
+                );
+                self.set_status(format!("continued on {agent}/{model}"));
+                self.streaming.clear();
+                self.thinking_streaming.clear();
+            }
             RunEventKind::Diagnostic { code, detail } => {
                 // Most diagnostics are noise for a chat view; surface only the ones
                 // that explain something the user can act on.
@@ -1161,6 +1427,8 @@ impl App {
                 }
                 self.active_error_retryable = false;
                 self.active_run = None;
+                // Read before clearing: the final line reports the whole turn.
+                let elapsed = self.run_started.take().map(|started| started.elapsed());
                 self.activity = Activity::Idle;
                 self.activity_detail = None;
                 self.streaming.clear();
@@ -1182,6 +1450,12 @@ impl App {
                     }
                     _ => "the turn did not complete".to_string(),
                 };
+                // Kept next to the outcome rather than only in the transcript: a
+                // cancelled or failed turn is exactly when the elapsed cost is
+                // worth seeing.
+                if let Some(elapsed) = elapsed {
+                    note.push_str(&format!(" · took {}", Self::format_elapsed(elapsed)));
+                }
                 if let (Some(input), Some(output)) = (usage.input, usage.output) {
                     note.push_str(&format!(" · {input} in / {output} out"));
                 }
@@ -1578,6 +1852,20 @@ impl App {
     }
 
     /// Returns the chosen value and action, closing the picker.
+    /// The highlighted picker value, without choosing it or closing the pane.
+    pub fn picker_selected_value(&self) -> Option<String> {
+        let matches = self.picker_matches();
+        match &self.overlay {
+            Overlay::Picker {
+                values, selected, ..
+            } => matches
+                .get(*selected)
+                .and_then(|index| values.get(*index))
+                .cloned(),
+            _ => None,
+        }
+    }
+
     pub fn overlay_choose(&mut self) -> Option<(PickerAction, String)> {
         let matches = self.picker_matches();
         let chosen = match &self.overlay {
@@ -1711,6 +1999,23 @@ impl App {
             .and_then(|c| c.selected_reasoning.clone())
     }
 
+    /// Standby routing for the status bar, as `agent/model · effort`.
+    ///
+    /// Shows the model because a standby with the wrong one is indistinguishable
+    /// from a correct one until the moment it is needed.
+    pub fn backup_label(&self) -> Option<String> {
+        let conversation = self.conversation.as_ref()?;
+        let agent = conversation.selected_backup_agent_id.clone()?;
+        let mut label = match &conversation.selected_backup_model {
+            Some(model) => format!("{agent}/{model}"),
+            None => agent,
+        };
+        if let Some(effort) = &conversation.selected_backup_reasoning {
+            label.push_str(&format!(" · {effort}"));
+        }
+        Some(label)
+    }
+
     /// Selection summary for the status bar.
     pub fn selection_label(&self) -> String {
         let Some(conversation) = &self.conversation else {
@@ -1764,7 +2069,8 @@ impl App {
         self.selected_screen_text.as_deref()
     }
 
-    /// Changes whether reasoning lines are drawn without deleting canonical data.
+    /// Changes whether reasoning and tool-activity lines are drawn without
+    /// deleting canonical data.
     pub fn set_thinking_visible(&mut self, visible: bool) {
         self.thinking_visible = visible;
         // Filtering reasoning changes the rendered row count. Following the live
@@ -1773,9 +2079,9 @@ impl App {
         self.scroll_back = 0;
         self.clear_mouse_selection();
         self.set_status(if visible {
-            "thinking is visible · Ctrl+T or /thinking hide to collapse it"
+            "thinking and tools are visible · Ctrl+T or /thinking hide to collapse"
         } else {
-            "thinking is hidden · Ctrl+T or /thinking show to reveal it"
+            "thinking and tools are hidden · Ctrl+T or /thinking show to reveal"
         });
     }
 
@@ -1851,7 +2157,13 @@ impl App {
         } else {
             "idle"
         };
-        lines.push(format!("Run state: {state}"));
+        match self.run_elapsed() {
+            Some(elapsed) => lines.push(format!(
+                "Run state: {state} · running for {}",
+                Self::format_elapsed(elapsed)
+            )),
+            None => lines.push(format!("Run state: {state}")),
+        }
         lines.push(format!("Queued follow-ups: {}", self.queue_depth()));
         if let Some(source) = &self.last_usage_source {
             lines.push(format!(
@@ -2422,6 +2734,131 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_turns_read_at_a_glance_at_every_scale() {
+        use std::time::Duration;
+        let f = |secs| App::format_elapsed(Duration::from_secs(secs));
+        assert_eq!(f(0), "0s");
+        assert_eq!(f(7), "7s");
+        assert_eq!(f(59), "59s");
+        assert_eq!(f(60), "1:00");
+        assert_eq!(f(95), "1:35");
+        assert_eq!(f(3599), "59:59");
+        assert_eq!(f(3600), "1:00:00");
+        assert_eq!(f(7385), "2:03:05");
+    }
+
+    #[test]
+    fn the_elapsed_clock_runs_only_while_a_turn_does() {
+        let mut app = new_app();
+        assert!(app.run_elapsed().is_none(), "idle has no clock");
+
+        app.begin_run_with_reason(RunId::new("r1"), "claude", None, true, None);
+        assert!(app.run_elapsed().is_some(), "a started turn is timed");
+        assert!(
+            app.activity_indicator().expect("running").contains(" · 0s"),
+            "the spinner line carries the elapsed time"
+        );
+
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: Default::default(),
+        });
+        assert!(app.run_elapsed().is_none(), "the clock stops with the turn");
+        assert!(
+            app.status.contains("took 0s"),
+            "the final status reports the duration, got {:?}",
+            app.status
+        );
+    }
+
+    fn composer_with(text: &str) -> App {
+        let mut app = new_app();
+        for ch in text.chars() {
+            app.insert(ch);
+        }
+        app
+    }
+
+    #[test]
+    fn option_arrows_step_over_whole_words() {
+        let mut app = composer_with("git commit --amend");
+        assert_eq!(app.cursor, 18);
+
+        app.move_word_left();
+        assert_eq!(app.cursor, 11, "back to the start of --amend");
+        app.move_word_left();
+        assert_eq!(app.cursor, 4, "back to the start of commit");
+        app.move_word_left();
+        assert_eq!(app.cursor, 0);
+        // Already at the start: clamped rather than wrapped or panicking.
+        app.move_word_left();
+        assert_eq!(app.cursor, 0);
+
+        app.move_word_right();
+        assert_eq!(app.cursor, 3, "end of git");
+        app.move_word_right();
+        assert_eq!(app.cursor, 10, "end of commit");
+        app.move_word_right();
+        assert_eq!(app.cursor, 18);
+        app.move_word_right();
+        assert_eq!(app.cursor, 18);
+    }
+
+    #[test]
+    fn word_movement_counts_characters_not_bytes() {
+        // A byte-indexed implementation would land mid-scalar and panic on the
+        // next edit, so prove the caret still splices where it claims to be.
+        let mut app = composer_with("héllo wörld");
+        app.move_word_left();
+        assert_eq!(app.cursor, 6);
+        app.backspace();
+        assert_eq!(app.input, "héllowörld");
+    }
+
+    #[test]
+    fn word_movement_crosses_newlines_and_runs_of_spaces() {
+        let mut app = composer_with("first\n\nsecond   third");
+        app.move_word_left();
+        assert_eq!(app.cursor, 16, "start of third");
+        app.move_word_left();
+        assert_eq!(app.cursor, 7, "start of second, over the blank line");
+        app.move_word_left();
+        assert_eq!(
+            app.cursor, 0,
+            "start of first, not stranded at the line start"
+        );
+    }
+
+    #[test]
+    fn word_movement_agrees_with_word_deletion() {
+        // Option+Left then a word delete must not leave a stray fragment: both
+        // have to treat the same span as one word.
+        let mut app = composer_with("cargo test --workspace");
+        app.move_word_left();
+        let start = app.cursor;
+        app.move_word_right();
+        app.backspace_word();
+        assert_eq!(app.input, "cargo test ");
+        assert_eq!(app.cursor, start);
+    }
+
+    #[test]
+    fn command_arrows_stay_within_the_current_line() {
+        let mut app = composer_with("first line\nsecond line");
+        app.move_line_start();
+        assert_eq!(app.cursor, 11);
+        app.move_line_end();
+        assert_eq!(app.cursor, 22);
+
+        // From inside the first line, both ends belong to that line alone.
+        app.cursor = 4;
+        app.move_line_end();
+        assert_eq!(app.cursor, 10);
+        app.move_line_start();
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
     fn caret_movement_is_clamped() {
         let mut app = new_app();
         app.insert('a');
@@ -2751,6 +3188,75 @@ mod tests {
         assert_eq!(app.clear_queue(), 0);
     }
 
+    /// Rows currently shown by the `/queue` list.
+    fn queue_rows(app: &App) -> Vec<String> {
+        match &app.overlay {
+            Overlay::Picker {
+                action: PickerAction::QueuedMessage,
+                items,
+                ..
+            } => items.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_queue_list_shows_what_is_waiting_and_drops_one() {
+        let mut app = new_app();
+        assert!(
+            !app.open_queue_picker(),
+            "an empty queue has nothing to show"
+        );
+
+        app.enqueue("first".into());
+        app.enqueue("second".into());
+        app.enqueue("third".into());
+        assert!(app.open_queue_picker());
+        assert_eq!(
+            queue_rows(&app),
+            vec!["1. first", "2. second", "3. third"],
+            "numbered in send order"
+        );
+
+        assert!(app.remove_queued("second"));
+        assert_eq!(app.queue_depth(), 2);
+        // Renumbered, because the position shown has to be the position it sends in.
+        assert_eq!(queue_rows(&app), vec!["1. first", "2. third"]);
+
+        // The list closes itself once there is nothing left to review.
+        assert!(app.remove_queued("first"));
+        assert!(app.remove_queued("third"));
+        assert!(!app.has_overlay());
+    }
+
+    #[test]
+    fn a_message_that_was_sent_leaves_the_open_queue_list() {
+        let mut app = new_app();
+        app.enqueue("first".into());
+        app.enqueue("second".into());
+        assert!(app.open_queue_picker());
+
+        // The turn succeeded while the list was open.
+        assert_eq!(app.commit_queued().as_deref(), Some("first"));
+        assert_eq!(queue_rows(&app), vec!["1. second"]);
+
+        // Removing it now is refused rather than taking whatever moved up.
+        assert!(!app.remove_queued("first"));
+        assert_eq!(app.queue_depth(), 1);
+        assert_eq!(app.queued_front(), Some("second"));
+    }
+
+    #[test]
+    fn a_queued_message_is_previewed_on_one_line() {
+        let mut app = new_app();
+        app.enqueue(format!("look at\nthis {}", "long ".repeat(60)));
+        assert!(app.open_queue_picker());
+        let row = queue_rows(&app).remove(0);
+        assert!(row.starts_with("1. look at this long"), "{row}");
+        assert!(!row.contains('\n'), "{row}");
+        assert!(row.ends_with('…'), "{row}");
+    }
+
     #[test]
     fn the_indicator_reports_how_many_messages_are_waiting() {
         let mut app = new_app();
@@ -2809,6 +3315,141 @@ mod tests {
         let line = app.lines.last().expect("line");
         assert_eq!(line.kind, LineKind::Notice);
         assert!(line.text.contains("retrying with full context"));
+    }
+
+    #[test]
+    fn failover_updates_the_active_turn_without_speculatively_promoting_selection() {
+        let mut app = new_app();
+        app.conversation = Some(ConversationSummary {
+            id: ConversationId::new("conversation"),
+            title: Some("Failover".into()),
+            description: None,
+            selected_agent_id: Some("claude".into()),
+            selected_model: Some("sonnet".into()),
+            selected_reasoning: Some("high".into()),
+            selected_mode: None,
+            selected_backup_agent_id: Some("codex".into()),
+            selected_backup_model: Some("gpt-5.6-codex".into()),
+            selected_backup_reasoning: Some("medium".into()),
+            message_count: 0,
+            agents_with_sessions: vec![],
+            parent_conversation_id: None,
+            workspace: Some("/repo".into()),
+            updated_at: 0,
+        });
+        app.begin_run(RunId::new("run"), "claude", Some("sonnet"), false);
+        app.apply_event(RunEventKind::BackupFailover {
+            from_agent_id: argo_core::ids::AgentId::new("claude"),
+            from_model: Some("sonnet".into()),
+            from_reasoning: Some("high".into()),
+            to_agent_id: argo_core::ids::AgentId::new("codex"),
+            to_model: Some("gpt-5.6-codex".into()),
+            to_reasoning: Some("medium".into()),
+            detail: "claude reported its plan is exhausted — continuing this turn on codex".into(),
+        });
+
+        // BackupFailover describes the adapter executing this run, not a durable
+        // routing promotion. The async run layer refreshes authoritative
+        // conversation state after RunFinished.
+        assert_eq!(app.selection_label(), "claude/sonnet");
+        assert_eq!(
+            app.backup_label().as_deref(),
+            Some("codex/gpt-5.6-codex · medium")
+        );
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::Notice && line.text.contains("continuing this turn on codex")
+        }));
+        assert!(app.lines.iter().any(|line| {
+            line.kind == LineKind::AgentHeader && line.text.contains("codex · gpt-5.6-codex")
+        }));
+
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage {
+                input: Some(12),
+                output: Some(4),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            app.last_usage_source.as_deref(),
+            Some("codex/gpt-5.6-codex")
+        );
+        assert!(app.usage_report()[0].contains("codex/gpt-5.6-codex"));
+        assert_eq!(app.selection_label(), "claude/sonnet");
+        assert_eq!(
+            app.backup_label().as_deref(),
+            Some("codex/gpt-5.6-codex · medium")
+        );
+    }
+
+    #[test]
+    fn failover_usage_keeps_the_turn_snapshot_when_backup_changed_mid_run() {
+        let mut app = new_app();
+        app.conversation = Some(ConversationSummary {
+            id: ConversationId::new("conversation"),
+            title: Some("Race".into()),
+            description: None,
+            selected_agent_id: Some("claude".into()),
+            selected_model: Some("sonnet".into()),
+            selected_reasoning: Some("high".into()),
+            selected_mode: None,
+            // The user changed the standby after this turn snapshotted codex.
+            selected_backup_agent_id: Some("kiro".into()),
+            selected_backup_model: Some("claude-sonnet-4.5".into()),
+            selected_backup_reasoning: Some("max".into()),
+            message_count: 0,
+            agents_with_sessions: vec![],
+            parent_conversation_id: None,
+            workspace: Some("/repo".into()),
+            updated_at: 0,
+        });
+        app.begin_run(RunId::new("run"), "claude", Some("sonnet"), false);
+        app.apply_event(RunEventKind::BackupFailover {
+            from_agent_id: argo_core::ids::AgentId::new("claude"),
+            from_model: Some("sonnet".into()),
+            from_reasoning: Some("high".into()),
+            to_agent_id: argo_core::ids::AgentId::new("codex"),
+            to_model: Some("gpt-5.6-codex".into()),
+            to_reasoning: Some("medium".into()),
+            detail: "continuing this turn on codex".into(),
+        });
+
+        assert_eq!(
+            app.active_usage_source.as_deref(),
+            Some("codex/gpt-5.6-codex")
+        );
+        assert_eq!(app.selection_label(), "claude/sonnet");
+        assert_eq!(
+            app.backup_label().as_deref(),
+            Some("kiro/claude-sonnet-4.5 · max")
+        );
+        app.apply_event(RunEventKind::RunFinished {
+            status: RunStatus::Succeeded,
+            usage: TokenUsage {
+                input: Some(2),
+                output: Some(1),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            app.last_usage_source.as_deref(),
+            Some("codex/gpt-5.6-codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_link_wait_can_be_cancelled() {
+        let mut app = new_app();
+        let task = tokio::spawn(std::future::pending::<()>());
+        app.begin_telegram_link("challenge-12345678901234567890".into(), task.abort_handle());
+        assert!(app.telegram_link_pending());
+        assert_eq!(
+            app.cancel_telegram_link().as_deref(),
+            Some("challenge-12345678901234567890")
+        );
+        assert!(!app.telegram_link_pending());
+        assert!(app.cancel_telegram_link().is_none());
     }
 
     #[test]
@@ -3319,6 +3960,9 @@ mod tests {
             selected_model: model.map(str::to_string),
             selected_reasoning: None,
             selected_mode: None,
+            selected_backup_agent_id: None,
+            selected_backup_model: None,
+            selected_backup_reasoning: None,
             message_count: messages,
             agents_with_sessions: agents.iter().map(|a| a.to_string()).collect(),
             parent_conversation_id: None,

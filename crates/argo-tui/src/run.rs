@@ -54,6 +54,12 @@ enum McpAuthEvent {
     Failed { name: String, message: String },
 }
 
+#[derive(Debug)]
+enum TelegramLinkEvent {
+    Reply(Box<Response>),
+    Failed(String),
+}
+
 impl ScreenSnapshot {
     fn capture(buffer: &ratatui::buffer::Buffer) -> Self {
         let area = buffer.area;
@@ -337,6 +343,7 @@ async fn event_loop(
     let mut keys = EventStream::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RunEvent>();
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<McpAuthEvent>();
+    let (telegram_tx, mut telegram_rx) = mpsc::unbounded_channel::<TelegramLinkEvent>();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let _ = update_tx.send(argo_runtime::update::check().await);
@@ -389,6 +396,47 @@ async fn event_loop(
                     apply_stream_event(connection, app, paths, &event_tx, event).await?;
                 }
             }
+            Some(link) = telegram_rx.recv() => {
+                app.finish_telegram_link();
+                match link {
+                    TelegramLinkEvent::Reply(response) => match *response {
+                        Response::Telegram { allowed_user_ids, .. } => {
+                            app.push(
+                                LineKind::Notice,
+                                format!(
+                                    "· Telegram connected — authorized {}",
+                                    allowed_user_ids
+                                        .iter()
+                                        .map(|id| id.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            );
+                            app.push(
+                                LineKind::Notice,
+                                "· the bridge is live now — message the bot to start".to_string(),
+                            );
+                            app.set_status("Telegram connected");
+                        }
+                        Response::Error { code, message, .. } if code == "TIMEOUT" => {
+                            app.report_error(format!(
+                                "{message} — run /telegram setup for a fresh challenge"
+                            ));
+                        }
+                        Response::Error { code, .. } if code == "CANCELLED" => {
+                            // Esc already reports cancellation after the daemon
+                            // confirms that the link poll has stopped.
+                        }
+                        Response::Error { message, .. } => app.report_error(message),
+                        other => {
+                            app.report_error(format!("unexpected Telegram reply: {other:?}"));
+                        }
+                    },
+                    TelegramLinkEvent::Failed(message) => app.report_error(format!(
+                        "Telegram linking failed: {message} — run /telegram setup to retry"
+                    )),
+                }
+            }
             Some(auth) = auth_rx.recv() => {
                 match auth {
                     McpAuthEvent::Progress { name, message } => {
@@ -423,7 +471,16 @@ async fn event_loop(
                             set_mouse_scroll_mode(&mut std::io::stdout(), app, enabled)
                                 .map_err(|e| ArgoError::Io(format!("toggle mouse wheel: {e}")))?;
                         } else {
-                            handle_key(key, connection, app, paths, &event_tx, &auth_tx).await?;
+                            handle_key(
+                                key,
+                                connection,
+                                app,
+                                paths,
+                                &event_tx,
+                                &auth_tx,
+                                &telegram_tx,
+                            )
+                            .await?;
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
@@ -706,6 +763,7 @@ async fn handle_key(
     paths: &ArgoPaths,
     event_tx: &mpsc::UnboundedSender<RunEvent>,
     auth_tx: &mpsc::UnboundedSender<McpAuthEvent>,
+    telegram_tx: &mpsc::UnboundedSender<TelegramLinkEvent>,
 ) -> Result<()> {
     let plain_ctrl_c = key.code == KeyCode::Char('c')
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -721,14 +779,30 @@ async fn handle_key(
     if matches!(app.overlay, crate::app::Overlay::Input { .. }) {
         match key.code {
             KeyCode::Esc => {
+                let telegram = matches!(
+                    app.overlay,
+                    crate::app::Overlay::Input {
+                        action: InputAction::TelegramToken,
+                        ..
+                    }
+                );
                 app.close_overlay();
                 app.mcp_draft = None;
-                app.set_status("MCP setup cancelled");
+                app.set_status(if telegram {
+                    "Telegram setup cancelled"
+                } else {
+                    "MCP setup cancelled"
+                });
             }
             KeyCode::Backspace => app.overlay_input_pop(),
             KeyCode::Enter => {
                 if let Some((action, value)) = app.overlay_submit_input() {
-                    apply_mcp_input(app, paths, auth_tx, action, value)?;
+                    match action {
+                        InputAction::TelegramToken => {
+                            telegram_connect(connection, app, paths, telegram_tx, value).await?
+                        }
+                        _ => apply_mcp_input(app, paths, auth_tx, action, value)?,
+                    }
                 }
             }
             KeyCode::Char(ch)
@@ -795,6 +869,14 @@ async fn handle_key(
                     app.picker_filter_push(' ');
                 }
             }
+            // Two bindings because the key labelled Delete on a Mac keyboard
+            // sends Backspace, which the filter already owns.
+            KeyCode::Delete if is_queue_picker(app) => drop_highlighted_queue_item(app),
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && is_queue_picker(app) =>
+            {
+                drop_highlighted_queue_item(app)
+            }
             KeyCode::Delete
                 if matches!(
                     &app.overlay,
@@ -854,6 +936,11 @@ async fn handle_key(
             if app.has_completions() {
                 // Dismiss the list without abandoning what was typed.
                 app.completions.clear();
+            } else if let Some(challenge) = app.cancel_telegram_link() {
+                let response = connection
+                    .request(Request::TelegramCancelLink { challenge })
+                    .await?;
+                apply_telegram_cancel_response(app, response);
             } else if app.is_busy() {
                 // Cancellation retains queued follow-ups; the terminal cancelled
                 // event advances immediately to the next FIFO item.
@@ -913,6 +1000,29 @@ async fn handle_key(
         }
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
+        // Word-wise movement. Option+Arrow is the macOS binding and Ctrl+Arrow
+        // the one elsewhere; Alt+B/F covers terminals that send Option as Meta
+        // (Apple Terminal's "Use Option as Meta key") and so deliver a letter
+        // rather than an arrow.
+        KeyCode::Left
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            app.move_word_left()
+        }
+        KeyCode::Right
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            app.move_word_right()
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_left(),
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_right(),
+        // Cmd+Arrow is the macOS line-wise pair, matching Cmd+Backspace above.
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => app.move_line_start(),
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => app.move_line_end(),
         KeyCode::Left => app.move_left(),
         KeyCode::Right => app.move_right(),
         KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) || app.input.is_empty() => {
@@ -1252,6 +1362,36 @@ const fn should_drain_queue(status: argo_core::event::RunStatus) -> bool {
     )
 }
 
+/// True while the `/queue` list is the open overlay.
+fn is_queue_picker(app: &App) -> bool {
+    matches!(
+        &app.overlay,
+        crate::app::Overlay::Picker {
+            action: PickerAction::QueuedMessage,
+            ..
+        }
+    )
+}
+
+/// Drops the highlighted message from the queue.
+///
+/// The queue drains while the list is open, so the highlighted message may have
+/// been sent a moment ago. Saying so is better than silently doing nothing, and
+/// far better than removing whatever slid into its place.
+fn drop_highlighted_queue_item(app: &mut App) {
+    let Some(message) = app.picker_selected_value() else {
+        return;
+    };
+    if app.remove_queued(&message) {
+        app.set_status(format!(
+            "removed from queue · {} waiting",
+            app.queue_depth()
+        ));
+    } else {
+        app.set_status("already sent — it left the queue before you removed it");
+    }
+}
+
 /// Executes a slash command.
 /// Executes a command, optionally returning a message to submit afterwards.
 ///
@@ -1423,6 +1563,69 @@ async fn run_command(
             set_mode(connection, app, Some(requested)).await?;
         }
 
+        Command::Backup(None) => {
+            let current = app
+                .conversation
+                .as_ref()
+                .and_then(|c| c.selected_agent_id.clone());
+            // The active agent is excluded: standing by for itself would leave the
+            // conversation with nowhere to go when its plan runs out.
+            let candidates: Vec<_> = app
+                .agents
+                .iter()
+                .filter(|info| Some(&info.id) != current.as_ref())
+                .collect();
+            let mut items = vec!["  none          disable failover".to_string()];
+            let mut values = vec![BACKUP_NONE.to_string()];
+            for info in candidates {
+                let mark = if info.available { "✓" } else { "·" };
+                let version = info.version.clone().unwrap_or_else(|| {
+                    if info.available {
+                        "installed"
+                    } else {
+                        "not installed"
+                    }
+                    .into()
+                });
+                items.push(format!("{mark} {:<10} {version}", info.id));
+                values.push(info.id.clone());
+            }
+            app.open_picker("backup agent", items, values, PickerAction::Backup);
+        }
+        Command::Backup(Some(requested)) => {
+            let requested = requested.trim().to_ascii_lowercase();
+            if matches!(requested.as_str(), "none" | "off" | "clear") {
+                set_backup(connection, app, None, None, None, true).await?;
+            } else {
+                // `/backup <agent>` opens the model picker; `/backup <agent>
+                // <model>` sets both outright.
+                let mut parts = requested.split_whitespace();
+                let agent = parts.next().unwrap_or_default().to_string();
+                let model = parts.next().map(str::to_string);
+                match commands::resolve_agent(&agent) {
+                    Ok(agent) => match model {
+                        Some(model) => {
+                            set_backup(
+                                connection,
+                                app,
+                                Some(agent.to_string()),
+                                Some(model),
+                                None,
+                                true,
+                            )
+                            .await?;
+                        }
+                        None => start_backup_flow(connection, app, agent.to_string()).await?,
+                    },
+                    Err(message) => app.report_error(message),
+                }
+            }
+        }
+
+        Command::Telegram(argument) => {
+            telegram_command(connection, app, argument.as_deref().unwrap_or("")).await?;
+        }
+
         Command::Usage => {
             let mut lines = app.usage_report();
             lines.push(String::new());
@@ -1584,6 +1787,47 @@ async fn run_command(
                     lines.push(String::new());
                     lines.extend(body.lines().map(|l| l.to_string()));
                     app.open_text("next turn", lines);
+                }
+                Response::Error { message, .. } => app.report_error(message),
+                other => app.report_error(format!("unexpected reply: {other:?}")),
+            }
+        }
+
+        Command::Compact => {
+            let Some(conversation) = app.conversation.as_ref().map(|c| c.id.clone()) else {
+                app.report_error("no conversation is open");
+                return Ok(None);
+            };
+            match connection
+                .request(Request::Compact {
+                    conversation_id: conversation,
+                })
+                .await?
+            {
+                Response::Compacted {
+                    messages_compacted,
+                    sessions_cleared,
+                    ..
+                } => {
+                    // Said plainly, because the transcript above does not change:
+                    // only what the next turn receives does.
+                    app.push(
+                        LineKind::Notice,
+                        format!(
+                            "· compacted {messages_compacted} message(s) into a summary; \
+                             the transcript above is unchanged"
+                        ),
+                    );
+                    if sessions_cleared > 0 {
+                        app.push(
+                            LineKind::Notice,
+                            format!(
+                                "· dropped {sessions_cleared} native session(s) so the next turn \
+                                 starts from the compacted context"
+                            ),
+                        );
+                    }
+                    app.set_status("context compacted");
                 }
                 Response::Error { message, .. } => app.report_error(message),
                 other => app.report_error(format!("unexpected reply: {other:?}")),
@@ -1783,6 +2027,15 @@ async fn run_command(
             Err(message) => app.report_error(message),
         },
 
+        Command::Queue => {
+            if !app.open_queue_picker() {
+                app.push(
+                    LineKind::Notice,
+                    "· nothing queued — messages typed during a turn wait here".to_string(),
+                );
+            }
+        }
+
         Command::Cancel => cancel_active(connection, app).await?,
 
         Command::Config => {
@@ -1823,7 +2076,8 @@ async fn run_command(
                     format!("protocol      v{IPC_PROTOCOL_VERSION}"),
                     String::new(),
                     "ARGO_DATA_DIR              relocate all state".to_string(),
-                    "ARGO_TURN_TIMEOUT_MS       per-turn ceiling, 0 disables".to_string(),
+                    "ARGO_TURN_TIMEOUT_MS       optional per-turn ceiling; unset/0 disables"
+                        .to_string(),
                     "ARGO_LOG=debug             daemon log level".to_string(),
                 ],
             );
@@ -1927,6 +2181,447 @@ async fn set_mode(connection: &mut Connection, app: &mut App, mode: Option<Strin
     Ok(())
 }
 
+/// How long `/telegram` waits for the user to send `/link` from their phone.
+const TELEGRAM_LINK_TIMEOUT_MS: u64 = 90_000;
+
+/// Applies the daemon's race-aware Telegram link cancellation result.
+///
+/// `Ok` means cancellation owned and closed the prepared window. A Telegram
+/// status means the wait had already finished, so its linked state must be shown
+/// rather than falsely claiming remote access was cancelled.
+fn apply_telegram_cancel_response(app: &mut App, response: Response) {
+    match response {
+        Response::Ok => {
+            app.push(LineKind::Notice, "· Telegram linking cancelled".to_string());
+            app.set_status("Telegram linking cancelled");
+        }
+        Response::Telegram { linked: true, .. } => {
+            app.push(
+                LineKind::Notice,
+                "· Telegram linked before cancellation completed".to_string(),
+            );
+            app.set_status("Telegram remains linked · /telegram remove disconnects it");
+        }
+        Response::Telegram { linked: false, .. } => {
+            app.set_status("no Telegram link wait is active");
+        }
+        Response::Error { message, .. } => app.report_error(message),
+        other => app.report_error(format!("unexpected Telegram cancellation reply: {other:?}")),
+    }
+}
+
+/// Routes `/telegram` and its subcommands.
+async fn telegram_command(
+    connection: &mut Connection,
+    app: &mut App,
+    argument: &str,
+) -> Result<()> {
+    match argument.trim().to_ascii_lowercase().as_str() {
+        "" | "status" => {
+            let status = telegram_status(connection, app).await?;
+            match status {
+                Some(status) if status.linked => {
+                    app.open_text("Telegram", telegram_report(&status))
+                }
+                // Nothing set up yet: go straight into the wizard rather than
+                // reporting an absence and making the user guess the next step.
+                Some(_) => telegram_begin_setup(app),
+                None => {}
+            }
+        }
+        "allow" => {
+            let root = app.workspace.clone();
+            match connection
+                .request(Request::TelegramAllowWorkspace { root: root.clone() })
+                .await?
+            {
+                Response::Telegram { .. } => {
+                    app.push(LineKind::Notice, format!("· Telegram may now open {root}"));
+                    app.set_status("workspace allowed for Telegram");
+                }
+                Response::Error { message, .. } => app.report_error(message),
+                other => app.report_error(format!("unexpected reply: {other:?}")),
+            }
+        }
+        "remove" | "delete" | "disconnect" | "reset" => {
+            match connection.request(Request::TelegramRemove).await? {
+                Response::Telegram { .. } => {
+                    app.push(
+                        LineKind::Notice,
+                        "· Telegram setup removed — stored token and settings deleted".to_string(),
+                    );
+                    app.set_status("Telegram setup removed");
+                }
+                Response::Error { message, .. } => app.report_error(message),
+                other => app.report_error(format!("unexpected reply: {other:?}")),
+            }
+        }
+        "setup" | "connect" | "link" => telegram_begin_setup(app),
+        other => app.report_error(format!(
+            "unknown /telegram argument '{other}'; expected status, setup, connect, link, allow, remove, or reset"
+        )),
+    }
+    Ok(())
+}
+
+/// The state the daemon reports for the bridge.
+struct TelegramStatus {
+    bot_username: Option<String>,
+    linked: bool,
+    running: bool,
+    allowed_user_ids: Vec<i64>,
+    workspaces: Vec<String>,
+    active_workspace: Option<String>,
+}
+
+async fn telegram_status(
+    connection: &mut Connection,
+    app: &mut App,
+) -> Result<Option<TelegramStatus>> {
+    match connection.request(Request::TelegramStatus).await? {
+        Response::Telegram {
+            bot_username,
+            linked,
+            running,
+            allowed_user_ids,
+            workspaces,
+            active_workspace,
+        } => Ok(Some(TelegramStatus {
+            bot_username,
+            linked,
+            running,
+            allowed_user_ids,
+            workspaces,
+            active_workspace,
+        })),
+        Response::Error { message, .. } => {
+            app.report_error(message);
+            Ok(None)
+        }
+        other => {
+            app.report_error(format!("unexpected reply: {other:?}"));
+            Ok(None)
+        }
+    }
+}
+
+fn telegram_report(status: &TelegramStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Bot:        @{}",
+        status.bot_username.as_deref().unwrap_or("not connected")
+    ));
+    lines.push(format!(
+        "Bridge:     {}",
+        if status.running {
+            "running"
+        } else if status.linked {
+            "linked, but the poller is not currently running"
+        } else {
+            "not linked"
+        }
+    ));
+    lines.push(format!(
+        "Authorized: {}",
+        if status.allowed_user_ids.is_empty() {
+            "nobody".to_string()
+        } else {
+            status
+                .allowed_user_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    lines.push(String::new());
+    lines.push("Workspaces reachable from Telegram:".into());
+    if status.workspaces.is_empty() {
+        lines.push("  (none)".into());
+    }
+    for root in &status.workspaces {
+        let marker = if Some(root) == status.active_workspace.as_ref() {
+            "▸"
+        } else {
+            " "
+        };
+        lines.push(format!("  {marker} {root}"));
+    }
+    lines.push(String::new());
+    lines.push("/telegram allow   — let Telegram open this workspace".into());
+    lines.push("/telegram remove  — disconnect and delete the token and settings".into());
+    lines.push("/telegram reset   — legacy alias for remove".into());
+    lines.push(String::new());
+    // Stated every time the panel is opened: this is a full-access agent
+    // reachable from a phone, and that should never be a surprise.
+    lines.push(
+        "Anyone on the authorized list can run commands in these workspaces with full access."
+            .into(),
+    );
+    lines
+}
+
+/// Opens the guided setup: BotFather instructions, then the token field.
+///
+/// The instructions go into the transcript rather than an overlay so they stay
+/// readable — and the link stays clickable — while the token field is open.
+fn telegram_begin_setup(app: &mut App) {
+    for line in [
+        "· Connect Telegram — create a bot, then paste its token",
+        "·   1. open https://t.me/BotFather",
+        "·   2. send /newbot",
+        "·   3. choose a display name, then a username ending in 'bot'",
+        "·   4. copy the token it replies with",
+        "· the token is stored in a 0600 file and never shown again",
+        "· whoever you authorize can run commands in the workspaces you allow",
+    ] {
+        app.push(LineKind::Notice, line.to_string());
+    }
+    app.open_input(
+        "Connect Telegram · 1 of 2",
+        "paste the bot token from BotFather",
+        true,
+        InputAction::TelegramToken,
+    );
+}
+
+/// Validates a pasted token, then waits for the user to identify themselves.
+async fn telegram_connect(
+    connection: &mut Connection,
+    app: &mut App,
+    paths: &ArgoPaths,
+    telegram_tx: &mpsc::UnboundedSender<TelegramLinkEvent>,
+    token: String,
+) -> Result<()> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        app.report_error("paste the token BotFather sent you, or press Esc to cancel");
+        return Ok(());
+    }
+
+    let username = match connection
+        .request(Request::TelegramConnect { token })
+        .await?
+    {
+        Response::Telegram { bot_username, .. } => bot_username,
+        Response::Error { message, .. } => {
+            app.report_error(message);
+            return Ok(());
+        }
+        other => {
+            app.report_error(format!("unexpected reply: {other:?}"));
+            return Ok(());
+        }
+    };
+    let Some(username) = username else {
+        app.report_error("the bot connected but reported no username");
+        return Ok(());
+    };
+
+    app.push(
+        LineKind::Notice,
+        format!("· connected to @{username} — now prove it's you"),
+    );
+    let challenge = argo_daemon::protocol::telegram_link_challenge();
+    match connection
+        .request(Request::TelegramPrepareLink {
+            challenge: challenge.clone(),
+        })
+        .await?
+    {
+        Response::Ok => {}
+        Response::Error { message, .. } => {
+            app.report_error(message);
+            return Ok(());
+        }
+        other => {
+            app.report_error(format!("unexpected reply: {other:?}"));
+            return Ok(());
+        }
+    }
+
+    app.push(
+        LineKind::Notice,
+        format!("· open https://t.me/{username} and send this exact command within 90 seconds"),
+    );
+    app.push(LineKind::Notice, format!("  /link {challenge}"));
+    app.set_status("waiting for the Telegram /link challenge · Esc cancels");
+
+    // Wait on a separate daemon connection so the terminal event loop remains
+    // responsive. Escape aborts this local task, then explicitly cancels and
+    // joins the daemon-owned link window before reporting success.
+    let root = app.workspace.clone();
+    let paths = paths.clone();
+    let sender = telegram_tx.clone();
+    let task_challenge = challenge.clone();
+    let task = tokio::spawn(async move {
+        let outcome: Result<Response> = async {
+            let mut connection = Connection::connect(&paths).await?;
+            connection
+                .request(Request::TelegramLink {
+                    challenge: task_challenge,
+                    timeout_ms: TELEGRAM_LINK_TIMEOUT_MS,
+                    root,
+                })
+                .await
+        }
+        .await;
+        let event = match outcome {
+            Ok(response) => TelegramLinkEvent::Reply(Box::new(response)),
+            Err(error) => TelegramLinkEvent::Failed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+    app.begin_telegram_link(challenge, task.abort_handle());
+    Ok(())
+}
+
+/// Picker value meaning "turn failover off".
+///
+/// A sentinel rather than an empty string so an accidental blank entry cannot be
+/// mistaken for a deliberate choice to disable failover.
+const BACKUP_NONE: &str = "\u{0}none";
+
+/// Sets or clears the conversation's standby agent and its routing.
+///
+/// `announce` is false for the intermediate steps of the guided flow, so
+/// choosing an agent then a model reports once rather than three times.
+async fn set_backup(
+    connection: &mut Connection,
+    app: &mut App,
+    agent_id: Option<String>,
+    model: Option<String>,
+    reasoning: Option<String>,
+    announce: bool,
+) -> Result<bool> {
+    let Some(conversation) = app.conversation.as_ref().map(|c| c.id.clone()) else {
+        app.report_error("no conversation is open");
+        return Ok(false);
+    };
+    match connection
+        .request(Request::SetBackupAgent {
+            conversation_id: conversation,
+            agent_id: agent_id.clone(),
+            model,
+            reasoning,
+        })
+        .await?
+    {
+        Response::Conversation { summary, .. } => {
+            app.set_conversation_summary(summary);
+            if announce {
+                match agent_id {
+                    Some(_) => {
+                        let label = app.backup_label().unwrap_or_else(|| "none".into());
+                        app.push(
+                            LineKind::Notice,
+                            format!(
+                                "· backup: {label} — the turn continues there if the current CLI runs out of quota"
+                            ),
+                        );
+                        app.set_status(format!("backup: {label}"));
+                    }
+                    None => {
+                        app.push(
+                            LineKind::Notice,
+                            "· backup cleared — failover is off".to_string(),
+                        );
+                        app.set_status("backup: none");
+                    }
+                }
+            }
+            Ok(true)
+        }
+        Response::Error {
+            code,
+            message,
+            retryable,
+        } => {
+            let _ = (code, retryable);
+            app.report_error(message);
+            Ok(false)
+        }
+        other => {
+            app.report_error(format!("unexpected reply: {other:?}"));
+            Ok(false)
+        }
+    }
+}
+
+/// Records the standby agent, then offers its models.
+///
+/// The standby needs its own model: ids are not portable between CLIs, so
+/// inheriting the primary's would either be rejected or silently ignored.
+async fn start_backup_flow(
+    connection: &mut Connection,
+    app: &mut App,
+    agent: String,
+) -> Result<()> {
+    if !set_backup(connection, app, Some(agent.clone()), None, None, false).await? {
+        return Ok(());
+    }
+    let Some(info) = probe_agent(connection, app, &agent, false).await? else {
+        return Ok(());
+    };
+    let concrete: Vec<_> = info
+        .models
+        .iter()
+        .filter(|model| model.id != argo_runtime::DEFAULT_MODEL_ID)
+        .collect();
+    let models: Vec<_> = if concrete.is_empty() {
+        info.models.iter().collect()
+    } else {
+        concrete
+    };
+    if models.is_empty() {
+        // Nothing to choose from: the adapter's default is the only option.
+        app.push(
+            LineKind::Notice,
+            format!("· backup: {agent} (default model)"),
+        );
+        app.set_status(format!("backup: {agent}"));
+        return Ok(());
+    }
+    let items = models.iter().map(|model| model.label.clone()).collect();
+    let values = models.iter().map(|model| model.id.clone()).collect();
+    app.open_picker(
+        format!("backup model for {}", info.id),
+        items,
+        values,
+        PickerAction::BackupModel,
+    );
+    Ok(())
+}
+
+/// Offers the standby's reasoning levels, if its model has any.
+async fn open_backup_effort_picker(connection: &mut Connection, app: &mut App) -> Result<bool> {
+    let Some(summary) = app.conversation.clone() else {
+        return Ok(false);
+    };
+    let (Some(agent_id), Some(model)) = (
+        summary.selected_backup_agent_id,
+        summary.selected_backup_model,
+    ) else {
+        return Ok(false);
+    };
+    let Some(info) = probe_agent(connection, app, &agent_id, false).await? else {
+        return Ok(false);
+    };
+    let levels = info.reasoning_for(Some(&model));
+    if levels.is_empty() {
+        return Ok(false);
+    }
+    let items = levels.iter().map(|level| level.label.clone()).collect();
+    let values = levels.iter().map(|level| level.id.clone()).collect();
+    app.open_picker(
+        format!("backup effort for {agent_id}/{model}"),
+        items,
+        values,
+        PickerAction::BackupEffort,
+    );
+    Ok(true)
+}
+
 /// Applies a picker choice.
 async fn apply_choice(
     connection: &mut Connection,
@@ -1938,6 +2633,9 @@ async fn apply_choice(
     value: String,
 ) -> Result<()> {
     match action {
+        // Review only. Removal is a deliberate keypress, so Enter closing the
+        // list cannot cost the user a message they meant to keep.
+        PickerAction::QueuedMessage => Ok(()),
         PickerAction::StartupAgent => match commands::resolve_agent(&value) {
             Ok(agent) => {
                 start_agent_flow(connection, app, agent, PickerAction::StartupModel, false).await
@@ -2037,6 +2735,49 @@ async fn apply_choice(
             Ok(())
         }
         PickerAction::Mode => set_mode(connection, app, Some(value)).await,
+        PickerAction::Backup => {
+            if value == BACKUP_NONE {
+                set_backup(connection, app, None, None, None, true).await?;
+                return Ok(());
+            }
+            start_backup_flow(connection, app, value).await
+        }
+        PickerAction::BackupModel => {
+            let agent = app
+                .conversation
+                .as_ref()
+                .and_then(|c| c.selected_backup_agent_id.clone());
+            let Some(agent) = agent else {
+                app.report_error("no backup agent is selected");
+                return Ok(());
+            };
+            if !set_backup(connection, app, Some(agent), Some(value), None, false).await? {
+                return Ok(());
+            }
+            // Announce only once the effort step is known not to apply.
+            if !open_backup_effort_picker(connection, app).await? {
+                let label = app.backup_label().unwrap_or_else(|| "none".into());
+                app.push(LineKind::Notice, format!("· backup: {label}"));
+                app.set_status(format!("backup: {label}"));
+            }
+            Ok(())
+        }
+        PickerAction::BackupEffort => {
+            let summary = app.conversation.clone();
+            let (Some(agent), Some(model)) = (
+                summary
+                    .as_ref()
+                    .and_then(|c| c.selected_backup_agent_id.clone()),
+                summary
+                    .as_ref()
+                    .and_then(|c| c.selected_backup_model.clone()),
+            ) else {
+                app.report_error("no backup model is selected");
+                return Ok(());
+            };
+            set_backup(connection, app, Some(agent), Some(model), Some(value), true).await?;
+            Ok(())
+        }
         PickerAction::Conversation => {
             let id = ConversationId::new(value);
             load_conversation(connection, app, &id).await
@@ -3100,6 +3841,8 @@ fn apply_mcp_input(
         return Ok(());
     }
     match action {
+        // Routed to the async Telegram path before reaching here.
+        InputAction::TelegramToken => {}
         InputAction::McpAddName => {
             if !value
                 .chars()
@@ -3827,6 +4570,8 @@ impl Connection {
             Err(error) => {
                 if let Some(protocol) = argo_daemon::mismatched_daemon_protocol(&error) {
                     argo_daemon::stop_older_daemon(paths, protocol, "argo-tui").await?;
+                } else if !daemon_is_unavailable(&error) {
+                    return Err(error);
                 }
             }
         }
@@ -3836,8 +4581,10 @@ impl Connection {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(connection) = Self::connect_to(&paths.socket()).await {
-                return Ok(connection);
+            match Self::connect_to(&paths.socket()).await {
+                Ok(connection) => return Ok(connection),
+                Err(error) if daemon_is_unavailable(&error) => {}
+                Err(error) => return Err(error),
             }
         }
         Err(ArgoError::Process(
@@ -3897,6 +4644,11 @@ impl Connection {
     }
 }
 
+/// True only when opening the daemon socket itself failed.
+fn daemon_is_unavailable(error: &ArgoError) -> bool {
+    matches!(error, ArgoError::Io(message) if message.starts_with("connect:"))
+}
+
 /// Starts a detached daemon.
 fn spawn_daemon(paths: &ArgoPaths) -> Result<()> {
     let exe =
@@ -3938,6 +4690,26 @@ mod tests {
         assert!(should_drain_queue(RunStatus::Cancelled));
         assert!(!should_drain_queue(RunStatus::Running));
         assert!(!should_drain_queue(RunStatus::Pending));
+    }
+
+    #[test]
+    fn the_removal_key_drops_the_highlighted_queue_item() {
+        let mut app = App::new("/repo");
+        app.enqueue("first".into());
+        app.enqueue("second".into());
+        assert!(!is_queue_picker(&app), "the list is not open yet");
+
+        assert!(app.open_queue_picker());
+        assert!(is_queue_picker(&app));
+        app.overlay_move(1);
+        drop_highlighted_queue_item(&mut app);
+        assert_eq!(app.queue_depth(), 1);
+        assert_eq!(app.queued_front(), Some("first"));
+
+        // The last one closes the list rather than leaving an empty pane open.
+        drop_highlighted_queue_item(&mut app);
+        assert_eq!(app.queue_depth(), 0);
+        assert!(!is_queue_picker(&app));
     }
 
     #[test]
@@ -4444,5 +5216,37 @@ mod tests {
         assert!(!argo_resources::instructions::is_enabled(&root));
         assert!(file.is_file());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn telegram_status_response(linked: bool) -> Response {
+        Response::Telegram {
+            bot_username: linked.then(|| "argo_test_bot".into()),
+            linked,
+            running: linked,
+            allowed_user_ids: linked.then_some(42).into_iter().collect(),
+            workspaces: Vec::new(),
+            active_workspace: None,
+        }
+    }
+
+    #[test]
+    fn telegram_cancellation_never_claims_a_completed_link_was_cancelled() {
+        let mut cancelled = App::new("/repo");
+        apply_telegram_cancel_response(&mut cancelled, Response::Ok);
+        assert_eq!(cancelled.status, "Telegram linking cancelled");
+
+        let mut linked = App::new("/repo");
+        apply_telegram_cancel_response(&mut linked, telegram_status_response(true));
+        assert!(
+            linked.status.contains("remains linked"),
+            "{}",
+            linked.status
+        );
+        assert!(
+            linked.status.contains("/telegram remove"),
+            "{}",
+            linked.status
+        );
+        assert!(!linked.status.contains("cancelled"), "{}", linked.status);
     }
 }

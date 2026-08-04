@@ -95,6 +95,12 @@ enum Command {
     McpServer,
     /// Report environment, database, and adapter status.
     Doctor,
+    /// Set up, inspect, or disconnect the Telegram bridge.
+    Telegram {
+        /// What to do.
+        #[command(subcommand)]
+        action: Option<TelegramAction>,
+    },
     /// List detected coding-agent CLIs.
     Agents {
         /// Re-probe instead of using the cached inventory.
@@ -205,6 +211,14 @@ enum Command {
         /// Prompt to preview.
         prompt: String,
     },
+    /// Fold a conversation's history into a summary to free context.
+    ///
+    /// Nothing is deleted: the stored transcript is untouched and only what
+    /// future turns receive is reduced.
+    Compact {
+        /// Conversation id.
+        conversation_id: String,
+    },
     /// Stop the running daemon.
     Stop,
     /// Check for a newer Argo build and install it from GitHub.
@@ -216,6 +230,58 @@ enum Command {
         #[arg(long, conflicts_with = "check")]
         force: bool,
     },
+}
+
+/// Steps of Telegram setup.
+///
+/// Creating the bot itself is not here because Telegram has no API for it:
+/// BotFather is a chat, and only a human can drive it. Everything after that
+/// point is automated.
+#[derive(Subcommand, Debug, Clone)]
+enum TelegramAction {
+    /// Show the current bridge state (the default).
+    Status,
+    /// Guided end-to-end setup: token, QR, then linking.
+    ///
+    /// The same flow as `/telegram` in the TUI, for terminals and headless hosts.
+    Setup {
+        /// Workspace root to allow. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Validate a BotFather token and store it.
+    ///
+    /// Prints a QR code that opens the bot, so the next step is a scan.
+    Connect {
+        /// Read the token from this file instead of standard input.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
+    },
+    /// Wait for the first message sent to the bot and authorize its sender.
+    Link {
+        /// How long to watch, in seconds.
+        #[arg(long, default_value_t = 120)]
+        secs: u64,
+        /// Workspace root to allow. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Authorize a Telegram user id directly, skipping the linking wait.
+    Allow {
+        /// Numeric Telegram user id (what `/link` would have discovered).
+        user_id: i64,
+        /// Workspace root to allow. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Print the QR code and deep link for the connected bot.
+    Qr,
+    /// Start polling now, for a bridge linked after the daemon came up.
+    Start,
+    /// Remove Telegram phone access and delete every stored bridge setting.
+    Remove,
+    /// Legacy spelling for `remove`.
+    Reset,
 }
 
 fn main() {
@@ -292,6 +358,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Daemon => run_daemon(paths).await,
         Command::McpServer => argo_daemon::mcp::serve_stdio(&paths).await,
         Command::Doctor => client::doctor(&paths).await,
+        Command::Telegram { action } => {
+            client::telegram(&paths, action.unwrap_or(TelegramAction::Status)).await
+        }
         Command::Agents { refresh } => client::agents(&paths, refresh).await,
         Command::Chats { root } => client::chats(&paths, root).await,
         Command::ClearHistory { all, root } => client::clear_history(&paths, all, root).await,
@@ -350,6 +419,7 @@ async fn run(cli: Cli) -> Result<()> {
             conversation_id,
             prompt,
         } => client::context(&paths, &conversation_id, &prompt).await,
+        Command::Compact { conversation_id } => client::compact(&paths, &conversation_id).await,
         Command::Stop => client::stop(&paths).await,
         Command::Update { check, force } => client::update(check, force).await,
     }
@@ -541,6 +611,22 @@ mod tests {
         assert_eq!(exit_code(&ArgoError::Cancelled), 130);
         assert_eq!(exit_code(&ArgoError::Timeout(1)), 124);
         assert_eq!(exit_code(&ArgoError::Invalid("x".into())), 1);
+    }
+
+    #[test]
+    fn telegram_remove_is_explicit_and_reset_stays_compatible() {
+        for (name, expected_remove) in [("remove", true), ("reset", false)] {
+            let cli = Cli::try_parse_from(["argo", "telegram", name]).expect("parse");
+            match cli.command.expect("command") {
+                Command::Telegram {
+                    action: Some(TelegramAction::Remove),
+                } => assert!(expected_remove),
+                Command::Telegram {
+                    action: Some(TelegramAction::Reset),
+                } => assert!(!expected_remove),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
     }
 
     #[test]

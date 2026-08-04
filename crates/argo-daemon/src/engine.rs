@@ -68,7 +68,7 @@ Only describe reasoning, tools, or child activity that Argo or the underlying CL
 const DELEGATION_DIRECTIVE: &str = "## Delegation policy (current; supersedes earlier Argo delegation instructions)\nUse the active CLI's native subagent mechanism for ordinary delegation so work stays in the current running session. Do not initiate Argo cross-CLI delegation merely for parallelism, exploratory work, a second opinion, or because another CLI might be better. Use `argo_delegate` or \"$ARGO_BIN\" delegate only when the user explicitly asks for Argo-managed or cross-CLI delegation.";
 
 /// How many recent messages are considered before budgeting trims further.
-const MAX_RECENT_MESSAGES: usize = 200;
+pub(crate) const MAX_RECENT_MESSAGES: usize = 200;
 
 /// Everything the engine needs to run one turn.
 pub struct TurnRequest {
@@ -108,6 +108,46 @@ pub struct TurnRequest {
     pub timeout_ms: Option<u64>,
     /// Execution mode for this turn.
     pub mode: argo_core::mode::AgentMode,
+    /// Whether to append `prompt` to canonical history before running.
+    ///
+    /// False when re-running a prompt that is already in history — the backup
+    /// failover hands the same user turn to a second agent, and appending it
+    /// again would show the user's message twice and skew the transcript the
+    /// receiving CLI is seeded with.
+    pub append_user: bool,
+    /// Standby to hand this turn to if the selected agent's plan is exhausted.
+    pub failover: Option<FailoverPlan>,
+}
+
+/// A pre-resolved standby agent, used only if the primary runs out of quota.
+///
+/// Resolved before the turn starts rather than at the moment of failure: probing
+/// an adapter and staging its resources can fail, and discovering that the
+/// standby was never installed is far less useful once the primary has already
+/// given up.
+pub struct FailoverPlan {
+    /// Adapter to hand the turn to.
+    pub agent_id: AgentId,
+    /// Model for the standby, when it offers one.
+    pub model: Option<String>,
+    /// Reasoning effort for the standby, when supported.
+    pub reasoning: Option<String>,
+    /// Executable resolved by detection.
+    pub bin: String,
+    /// Help flags observed on the standby's binary.
+    pub help_flags: Vec<String>,
+    /// Skills staged for the standby.
+    pub active_skills: Vec<String>,
+    /// MCP servers exposed to the standby.
+    pub active_mcp_servers: Vec<String>,
+    /// MCP descriptors for protocol adapters.
+    pub mcp_descriptors: Vec<serde_json::Value>,
+    /// Generated MCP config path, for adapters that take a file.
+    pub mcp_config: Option<String>,
+    /// Adapter-native MCP configuration overrides.
+    pub mcp_overrides: Vec<String>,
+    /// Environment required by the standby's MCP configuration.
+    pub mcp_environment: Vec<(String, String)>,
 }
 
 /// What the engine decided and produced.
@@ -245,7 +285,10 @@ pub async fn run_turn(
     cancel: &CancelToken,
     listener: Option<&(dyn Fn(argo_core::event::RunEvent) + Send + Sync)>,
 ) -> Result<TurnOutcome> {
-    let def = argo_runtime::require(request.agent_id.as_str())?;
+    // Mutable because failover rebinds the turn to the standby adapter in place,
+    // keeping one run and one event stream for whichever CLI answers.
+    let mut request = request;
+    let mut def = argo_runtime::require(request.agent_id.as_str())?;
     let (conversation, cwd) = {
         let store = lock(store)?;
         let conversation = store.get_conversation(&request.conversation_id)?;
@@ -256,8 +299,11 @@ pub async fn run_turn(
     // 1. The user's message becomes canonical history immediately, so it survives
     //    even if the agent never responds. Refresh the title from the latest focus
     //    on every turn; the summary description separately preserves where the
-    //    conversation began.
-    append_user_and_refresh_title(store, &request.conversation_id, &request.prompt)?;
+    //    conversation began. A failover turn skips this: its prompt was already
+    //    recorded by the attempt that ran out of quota.
+    if request.append_user {
+        append_user_and_refresh_title(store, &request.conversation_id, &request.prompt)?;
+    }
 
     // 2. Pin the assistant placeholder before spawning.
     let assistant_id = MessageId::generate();
@@ -265,26 +311,7 @@ pub async fn run_turn(
     // 3. Decide resume vs fresh. The guard is confined to this block: holding it
     //    across the child process's lifetime would serialize the whole daemon
     //    behind one turn.
-    let (stored_session, cursor) = {
-        let store = lock(store)?;
-        let stored_session =
-            store.get_agent_session(&request.conversation_id, &request.agent_id)?;
-        let cursor = store.latest_completed_assistant_message_id(
-            &request.conversation_id,
-            Some(&assistant_id),
-            stored_session
-                .as_ref()
-                .and_then(|s| s.last_message_id.as_ref()),
-        )?;
-        (stored_session, cursor)
-    };
-    let plan = evaluate_resume(ResumeInputs {
-        stored: stored_session.as_ref(),
-        supports_resume: def.capabilities.native_resume,
-        current_model: request.model.as_deref(),
-        current_cwd: Some(&cwd),
-        latest_completed_assistant: cursor.as_ref(),
-    });
+    let plan = plan_for(store, &request, def, &cwd, &assistant_id)?;
 
     // 4. Create the run and attach the placeholder.
     let run_id = lock(store)?.create_run(NewRun {
@@ -337,6 +364,11 @@ pub async fn run_turn(
     let mut attempt_plan = plan.clone();
     let mut reseeded = false;
     let mut transient_retried = false;
+    // The agent that ran out of quota, and the routing it was using, once
+    // failover has taken over.
+    let mut exhausted_agent: Option<AgentId> = None;
+    let mut spent_model: Option<String> = None;
+    let mut spent_reasoning: Option<String> = None;
     // Retained so a successful fresh turn can store the id it was told to use.
     let mut minted_session;
     let outcome = loop {
@@ -445,6 +477,56 @@ pub async fn run_turn(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
+
+                // The primary's plan is spent. Hand the same turn to the standby
+                // rather than failing, reusing this run so every client following
+                // the turn sees one continuous stream. Guarded by `has_output` for
+                // the same reason as the transient retry: re-running after the CLI
+                // acted could duplicate side effects.
+                if should_fail_over(&exec.outcome, request.failover.as_ref(), has_output) {
+                    let plan = request.failover.take().expect("guarded above");
+                    let from_agent_id = request.agent_id.clone();
+                    let from_model = request.model.clone();
+                    let from_reasoning = request.reasoning.clone();
+                    let to_agent_id = plan.agent_id.clone();
+                    let to_model = plan.model.clone();
+                    let to_reasoning = plan.reasoning.clone();
+                    let detail = format!(
+                        "{} reported its plan is exhausted — continuing this turn on {}",
+                        from_agent_id, to_agent_id
+                    );
+                    exhausted_agent = Some(from_agent_id.clone());
+                    spent_model.clone_from(&from_model);
+                    spent_reasoning.clone_from(&from_reasoning);
+                    def = argo_runtime::require(plan.agent_id.as_str())?;
+                    apply_failover(&mut request, plan);
+                    // The standby may hold its own session here from an earlier
+                    // turn, so this goes through the ordinary resume guard rather
+                    // than assuming a fresh seed. Persist that plan as part of the
+                    // same transaction that reattributes the assistant message.
+                    attempt_plan = plan_for(store, &request, def, &cwd, &assistant_id)?;
+                    lock(store)?.rebind_run_agent(
+                        &run_id,
+                        &request.agent_id,
+                        request.model.as_deref(),
+                        attempt_plan.skip_transcript(),
+                        attempt_plan.invalidation,
+                    )?;
+                    reseeded = false;
+                    transient_retried = false;
+                    sink.session_id = None;
+                    sink.emit(RunEventKind::BackupFailover {
+                        from_agent_id: from_agent_id.clone(),
+                        from_model,
+                        from_reasoning,
+                        to_agent_id,
+                        to_model,
+                        to_reasoning,
+                        detail,
+                    });
+                    tracing::info!(from = %from_agent_id, to = %request.agent_id, "failed over to backup agent");
+                    continue;
+                }
                 break exec;
             }
             Err(error) => {
@@ -472,7 +554,7 @@ pub async fn run_turn(
                 });
                 return Ok(TurnOutcome {
                     run_id,
-                    resumed: false,
+                    resumed: attempt_plan.skip_transcript(),
                     invalidation: attempt_plan.invalidation,
                     status,
                     reseeded,
@@ -501,6 +583,37 @@ pub async fn run_turn(
             .as_deref()
             .map(|message| ("AGENT_ERROR", message)),
     )?;
+
+    // 6b. Make a successful handoff stick. An exhausted plan does not refill
+    //     before the next message, so leaving the spent agent selected would fail
+    //     every following turn. A failed/cancelled standby is never promoted.
+    //
+    //     The turn-start routing snapshot is the compare-and-swap guard: selection
+    //     commands issued while this run was active are newer user intent and must
+    //     not be overwritten at completion.
+    if outcome.outcome.status == RunStatus::Succeeded {
+        if let Some(spent) = &exhausted_agent {
+            let promoted = lock(store)?.promote_failover_if_unchanged(
+                &conversation,
+                argo_store::store::FailoverRoute {
+                    agent_id: &request.agent_id,
+                    model: request.model.as_deref(),
+                    reasoning: request.reasoning.as_deref(),
+                },
+                argo_store::store::FailoverRoute {
+                    agent_id: spent,
+                    model: spent_model.as_deref(),
+                    reasoning: spent_reasoning.as_deref(),
+                },
+            )?;
+            if !promoted {
+                tracing::info!(
+                    conversation_id = %request.conversation_id,
+                    "kept newer conversation selection instead of promoting failover agent"
+                );
+            }
+        }
+    }
 
     // 7. Persist the upstream handle, but only for a turn that actually completed.
     //    Storing a handle from a failed turn would resume into a broken state.
@@ -580,6 +693,72 @@ fn thinking_stream_unavailable(
         && !help_flags
             .iter()
             .any(|flag| flag == "--include-partial-messages")
+}
+
+/// Applies the resume-identity guard for whichever agent `request` names.
+///
+/// Called again after failover, because the standby may already hold its own
+/// session in this conversation from an earlier turn.
+fn plan_for(
+    store: &SharedStore,
+    request: &TurnRequest,
+    def: &argo_runtime::RuntimeDef,
+    cwd: &str,
+    assistant_id: &MessageId,
+) -> Result<ResumePlan> {
+    let (stored_session, cursor) = {
+        let store = lock(store)?;
+        let stored_session =
+            store.get_agent_session(&request.conversation_id, &request.agent_id)?;
+        let cursor = store.latest_completed_assistant_message_id(
+            &request.conversation_id,
+            Some(assistant_id),
+            stored_session
+                .as_ref()
+                .and_then(|s| s.last_message_id.as_ref()),
+        )?;
+        (stored_session, cursor)
+    };
+    Ok(evaluate_resume(ResumeInputs {
+        stored: stored_session.as_ref(),
+        supports_resume: def.capabilities.native_resume,
+        current_model: request.model.as_deref(),
+        current_cwd: Some(cwd),
+        latest_completed_assistant: cursor.as_ref(),
+    }))
+}
+
+/// True when the turn should be handed to the configured standby.
+///
+/// Exhaustion only — a transient rate limit is handled by the retry above and
+/// must not burn the standby's quota.
+fn should_fail_over(
+    outcome: &TerminalOutcome,
+    failover: Option<&FailoverPlan>,
+    has_output: bool,
+) -> bool {
+    failover.is_some()
+        && outcome.status == RunStatus::Failed
+        && !has_output
+        && outcome
+            .message
+            .as_deref()
+            .is_some_and(argo_runtime::stream::is_limit_exhausted)
+}
+
+/// Rebinds a turn to its standby agent.
+fn apply_failover(request: &mut TurnRequest, plan: FailoverPlan) {
+    request.agent_id = plan.agent_id;
+    request.model = plan.model;
+    request.reasoning = plan.reasoning;
+    request.bin = plan.bin;
+    request.help_flags = plan.help_flags;
+    request.active_skills = plan.active_skills;
+    request.active_mcp_servers = plan.active_mcp_servers;
+    request.mcp_descriptors = plan.mcp_descriptors;
+    request.mcp_config = plan.mcp_config;
+    request.mcp_overrides = plan.mcp_overrides;
+    request.mcp_environment = plan.mcp_environment;
 }
 
 fn should_retry_transient(
@@ -683,6 +862,20 @@ pub fn build_context_package(
         .collect();
     let history = drop_last_user_prompt(history, &request.prompt);
 
+    // An explicit `/compact` fixes a floor under the transcript: messages at or
+    // below the epoch boundary are represented by its summary and are never
+    // replayed, however much budget the target model has. Applied before
+    // budgeting so a large window cannot quietly undo a compaction the user asked
+    // for.
+    let epoch = lock(store)?.latest_context_epoch(&request.conversation_id)?;
+    let history: Vec<Message> = match &epoch {
+        Some(epoch) => history
+            .into_iter()
+            .filter(|m| m.seq > epoch.compacted_upto)
+            .collect(),
+        None => history,
+    };
+
     let files_touched: Vec<String> = history
         .iter()
         .flat_map(|m| m.blocks.iter())
@@ -702,10 +895,21 @@ pub fn build_context_package(
     let budget = ContextBudget::conservative();
     let plan = plan_budget(&history, budget);
     let (older, recent) = history.split_at(plan.verbatim_from.min(history.len()));
-    let compacted_summary = plan
+
+    // Two summaries can apply at once: the epoch's, covering everything the user
+    // compacted away, and a budget-driven one for whatever still does not fit.
+    // Concatenated oldest-first so the reader sees the conversation in order.
+    let budget_summary = plan
         .needs_compaction
         .then(|| fallback_summary(older))
         .filter(|s| !s.is_empty());
+    let compacted_summary = match (epoch.and_then(|e| e.summary), budget_summary) {
+        (Some(epoch_summary), Some(budget_summary)) => {
+            Some(format!("{epoch_summary}\n\n{budget_summary}"))
+        }
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    };
 
     Ok(ContextPackage {
         stable_instructions: STABLE_INSTRUCTIONS.to_string(),
@@ -814,6 +1018,8 @@ mod tests {
             project_instructions: None,
             timeout_ms: Some(5_000),
             mode: argo_core::mode::AgentMode::Full,
+            append_user: true,
+            failover: None,
         }
     }
 
@@ -1151,6 +1357,91 @@ mod tests {
             })
         ));
         assert!(terminal_failure_event(&TerminalOutcome::succeeded()).is_none());
+    }
+
+    fn failover_plan(agent: &str) -> FailoverPlan {
+        FailoverPlan {
+            agent_id: AgentId::new(agent),
+            model: Some("backup-model".into()),
+            reasoning: Some("high".into()),
+            bin: "/usr/bin/backup".into(),
+            help_flags: vec!["--resume".into()],
+            active_skills: vec!["skill-b".into()],
+            active_mcp_servers: vec!["server-b".into()],
+            mcp_descriptors: vec![serde_json::json!({"name": "b"})],
+            mcp_config: Some("/tmp/b.json".into()),
+            mcp_overrides: vec!["--mcp-b".into()],
+            mcp_environment: vec![("B".into(), "1".into())],
+        }
+    }
+
+    #[test]
+    fn failover_fires_only_on_exhaustion_and_only_before_the_cli_acted() {
+        let exhausted =
+            TerminalOutcome::failed("Claude usage limit reached. Your limit will reset at 10pm.");
+        let plan = failover_plan("codex");
+        assert!(should_fail_over(&exhausted, Some(&plan), false));
+
+        // No standby configured is the common case and must stay the old behavior.
+        assert!(!should_fail_over(&exhausted, None, false));
+        // Output already produced: re-running on another CLI could repeat side
+        // effects the first one already committed.
+        assert!(!should_fail_over(&exhausted, Some(&plan), true));
+        // A transient failure is the retry path's job; spending the standby's
+        // quota on a blip would be worse than waiting.
+        let transient = TerminalOutcome::failed("HTTP status 429 too many requests");
+        assert!(!should_fail_over(&transient, Some(&plan), false));
+        assert!(should_retry_transient(&transient, false, false));
+        // And a clean turn never hands off.
+        assert!(!should_fail_over(
+            &TerminalOutcome::succeeded(),
+            Some(&plan),
+            false
+        ));
+    }
+
+    #[test]
+    fn failover_rebinds_every_agent_specific_field() {
+        // A half-applied swap would run the standby's binary with the exhausted
+        // agent's MCP config, which fails in a way that looks unrelated.
+        let conv = ConversationId::new("c1");
+        let mut request = request(&conv, "claude", "hello");
+        apply_failover(&mut request, failover_plan("codex"));
+
+        assert_eq!(request.agent_id, AgentId::new("codex"));
+        assert_eq!(request.model.as_deref(), Some("backup-model"));
+        assert_eq!(request.reasoning.as_deref(), Some("high"));
+        assert_eq!(request.bin, "/usr/bin/backup");
+        assert_eq!(request.help_flags, vec!["--resume".to_string()]);
+        assert_eq!(request.active_skills, vec!["skill-b".to_string()]);
+        assert_eq!(request.active_mcp_servers, vec!["server-b".to_string()]);
+        assert_eq!(request.mcp_config.as_deref(), Some("/tmp/b.json"));
+        assert_eq!(request.mcp_overrides, vec!["--mcp-b".to_string()]);
+        assert_eq!(request.mcp_environment, vec![("B".into(), "1".into())]);
+        assert_eq!(request.mcp_descriptors.len(), 1);
+        // The user's turn is untouched: it is the same question, asked of someone
+        // else.
+        assert_eq!(request.prompt, "hello");
+        assert_eq!(request.conversation_id, conv);
+    }
+
+    #[test]
+    fn a_failover_turn_does_not_re_record_the_users_message() {
+        let (store, _paths, conv, _ws, _dir) = setup();
+        append(&store, &conv, NewMessage::user("only once"));
+
+        // What run_turn does when append_user is false: nothing is written, so the
+        // standby answers the prompt already sitting in history.
+        let before = lock(&store).unwrap().list_messages(&conv).unwrap().len();
+        let mut request = request(&conv, "claude", "only once");
+        request.append_user = false;
+        assert!(!request.append_user);
+        let after = lock(&store).unwrap().list_messages(&conv).unwrap().len();
+        assert_eq!(
+            before, after,
+            "no message may be appended by the swap itself"
+        );
+        assert_eq!(after, 1);
     }
 
     #[tokio::test]

@@ -45,12 +45,19 @@ Argo removes the stale preference and returns to the startup picker.
 | `Alt+Enter` or `Ctrl+J` | Insert a newline when a terminal cannot encode Shift+Enter |
 | `Option+Backspace` or `Ctrl+W` | Delete the previous word |
 | `Cmd+Backspace` or `Ctrl+U` | Delete to the start of the current line |
+| `Option+←` / `Option+→` | Move the caret one word left or right |
+| `Cmd+←` / `Cmd+→` | Move the caret to the start or end of the current line |
 | `Backspace` / `Delete` | Delete around the cursor |
 | `Ctrl+Y` | Restore the most recent composer edit |
-| `Ctrl+T` | Show or collapse CLI-emitted thinking immediately |
+| `Ctrl+T` | Show or collapse CLI-emitted thinking and tool/file activity immediately |
 | `Ctrl+P` / `Ctrl+N` | Previous/next submitted user prompt |
 | `↑` / `↓` | Navigate a visible picker/completion, otherwise composer history |
 | `Tab` | Accept the highlighted slash-command completion |
+
+Word movement accepts `Ctrl+←`/`Ctrl+→` as well, which is what most non-macOS
+terminals send. Terminals configured to send Option as Meta deliver `Esc b`/`Esc f`
+rather than an arrow, so `Alt+B`/`Alt+F` move by word too. A word is
+whitespace-delimited — the same span `Option+Backspace` deletes.
 
 Pastes arrive through bracketed paste and may contain multiple lines. Use the
 terminal's paste shortcut—normally `Cmd+V` on macOS or `Ctrl+Shift+V` on Linux.
@@ -81,7 +88,7 @@ Apple Terminal does not forward the Command modifier to the application.
 | Shortcut | Result |
 |---|---|
 | `Shift+Tab` | Cycle supported modes; from `full`, enter `plan` first when available |
-| `Esc` | Close an overlay; cancel an active turn; or discard a paused queue |
+| `Esc` | Close an overlay; cancel an active turn and continue its queued follow-ups; cancel Telegram linking; or discard a paused queue |
 | `Ctrl+C` twice within 3 seconds | Exit the TUI; the first press warns |
 | `Ctrl+D` with empty input | Exit immediately |
 
@@ -99,8 +106,10 @@ prints a copyable `argo --resume <conversation-id>` command when applicable.
 | `/effort [level]` | Set supported reasoning effort |
 | `/default [configure\|current\|clear]` | Manage launch selection |
 | `/mode [full\|plan\|accept-edits\|read-only]` | Set a supported mode directly; use `/mode plan` to plan without cycling |
-| `/thinking [show\|hide\|toggle]` | Control rendered CLI-emitted thinking |
-| `/status` | Show selection, context, active run, and queue |
+| `/backup [id [model]\|none]` | Configure or clear quota-exhaustion failover |
+| `/telegram [status\|setup\|connect\|link\|allow\|remove\|reset]` | Set up, inspect, or remove phone access |
+| `/thinking [show\|hide\|toggle]` | Control rendered CLI-emitted thinking and tool activity |
+| `/status` | Show selection, context, active run and how long it has run, and queue |
 | `/update [check\|install\|force]` | Check for updates, or exit and update directly |
 | `/agents` | Browse/switch CLIs and set or clear the startup default |
 
@@ -111,10 +120,12 @@ prints a copyable `argo --resume <conversation-id>` command when applicable.
 | `/new [title]` | Create a conversation |
 | `/resume [n\|id]` | List conversations or reopen one; `/open` is an alias |
 | `/context` | Preview the next context projection and resume decision |
+| `/compact` | Fold history into a summary now, freeing context without deleting the transcript |
 | `/children` | Inspect delegated children in a read-only snapshot |
 | `/parent` or `/back` | Return from a directly opened child to its parent |
 | `/delegate <agent> <task>` | Start a delegated child task |
-| `/cancel` | Stop the current run; queued messages remain |
+| `/queue` | Review messages waiting to send; `Del` or `Ctrl+D` drops the highlighted one |
+| `/cancel` | Stop the current run; the next queued message starts automatically |
 | `/clear-history` | Delete chats for this workspace and create a fresh one |
 
 `/clear-history` is immediate and unavailable while any agent run is active. Use
@@ -147,11 +158,16 @@ restores the normal terminal, exits the running TUI, and then invokes the public
 installer. The scriptable equivalents are `argo update --check`, `argo update`,
 and `argo update --force`.
 
-## Thinking and model choices
+## Thinking and tool activity
 
-Argo shows only reasoning text a CLI actually emits. `/thinking hide` suppresses
-those transcript blocks without changing the model's reasoning configuration;
-`/thinking show` renders them again.
+Argo shows only reasoning text a CLI actually emits. `/thinking hide` (or
+`Ctrl+T`) suppresses both those transcript blocks **and** tool/file activity
+lines, replacing the run of hidden rows with a single marker. They are hidden and
+revealed together because they are the same class of intermediate detail: leaving
+a wall of tool calls on screen defeats the purpose of collapsing reasoning.
+Nothing is deleted — `/thinking show` renders it all again, and the canonical
+rows are untouched throughout. Visibility never changes the model's reasoning
+configuration.
 
 Effort is separate from visibility. The effort picker appears only if Argo has a
 verified adjustable-effort mapping for the selected model. Choosing another
@@ -170,6 +186,81 @@ sessions.
 When a response deliberately asks the user to select among numbered alternatives,
 Argo opens a simple choice picker. Ordinary numbered prose and procedural lists
 remain in the transcript.
+
+## How long a turn has been running
+
+While a turn streams, the spinner line carries its elapsed time — `7s`, then
+`1:35`, then `2:03:05` — beside the activity label and any queued count. It is
+measured from a wall clock rather than the redraw timer, so a stalled turn keeps
+counting honestly instead of appearing to freeze. When the turn ends, the status
+line reports the total (`done · took 1:12 · 4210 in / 980 out`), including for a
+cancelled or failed turn. `/status` shows the same figure for the active run.
+
+## Backup failover
+
+`/backup` opens a guided CLI → model → optional effort selection for a standby.
+`/backup <agent>` starts the same model/effort flow, `/backup <agent> <model>`
+sets a concrete route, and `/backup none` disables it. The standby must differ
+from the active CLI.
+
+Failover is deliberately narrow: it happens only when the active CLI reports
+that its plan or quota is exhausted before it emits output or performs side
+effects. Argo prints the failover diagnostic in the existing run, changes the
+header/status selection to the CLI now answering, and attributes completed token
+usage to that CLI. The successful standby becomes the active selection and the
+exhausted route moves into the backup slot. Ordinary agent errors do not consume
+the backup.
+
+## Telegram phone access
+
+Bare `/telegram` reports a linked bridge and otherwise opens guided setup. The
+wizard sends the bot token through a masked field, validates it, displays the bot
+link, and generates a fresh one-time command of the form `/link <challenge>`.
+Only that exact command can authorize its sender. The 90-second TUI wait runs in
+the background, so the interface remains usable; press `Esc` to cancel it.
+Linking starts the bridge immediately—there is no restart step.
+
+TUI actions are:
+
+```text
+/telegram status       # bare /telegram is equivalent when already linked
+/telegram setup        # connect and link a bot
+/telegram connect      # alias that reopens guided setup
+/telegram link         # alias that reopens guided setup with a fresh challenge
+/telegram allow        # allow the current workspace
+/telegram remove       # stop the bridge and delete token/settings
+/telegram reset        # compatibility alias for remove
+```
+
+For scripts and headless hosts:
+
+```bash
+argo telegram setup --root /path/to/project
+argo telegram status
+argo telegram connect                 # token from masked terminal input or stdin
+argo telegram connect --token-file /secure/path/token
+argo telegram link --secs 120 --root /path/to/project
+argo telegram allow <USER_ID> --root /path/to/project
+argo telegram qr
+argo telegram start                   # recovery only; linking normally starts it
+argo telegram remove
+argo telegram reset                   # compatibility alias
+```
+
+**Security warning:** this is remote access to coding agents, not a notification
+channel. An authorized Telegram user can select full-access mode and execute
+commands or modify files in every allowlisted workspace with your local account's
+permissions. Use a private bot, authorize only trusted IDs, minimize allowlisted
+workspaces, protect the BotFather token, and run `/telegram remove` immediately if
+the bot token or authorized account is compromised.
+
+Telegram linking has its own explicit window: 90 seconds in the TUI and `--secs`
+for `argo telegram link`. Agent turn deadlines are separate and opt-in:
+`ARGO_TURN_TIMEOUT_MS=<milliseconds>` limits daemon-owned turns, while unset,
+invalid, or `0` means unlimited. Scriptable `argo send`/delegation streaming can
+also set `ARGO_STREAM_IDLE_TIMEOUT_MS=<milliseconds>`; unset, invalid, or `0`
+waits indefinitely, while a positive value stops the client after that much event
+inactivity without cancelling the daemon-owned turn.
 
 ## Usage and allowance
 
@@ -235,10 +326,37 @@ compact representation of older turns when required. This means switching CLIs
 does not transfer an unlimited raw transcript, and it does not discard canonical
 history either. `/context` shows the planned package before the next message.
 
-Messages typed while a run is active enter a durable-in-memory FIFO queue. A
+That budget-driven trimming happens automatically on every turn, walking back
+from the newest message and folding whatever no longer fits into a mechanical
+outline. It is not triggered by a "window almost full" threshold, and it is
+recomputed each turn rather than persisted.
+
+`/compact` is the explicit version, for when you want the context reduced now
+rather than when the budget forces it. It records a compaction point, summarizes
+everything up to it, and drops every stored native session for the conversation
+so the next turn actually reseeds from the reduced projection — a vendor CLI still
+holding the full history in its own session would otherwise keep answering from
+the uncompacted version. Canonical messages are never deleted: the transcript
+above stays readable and only what future turns receive changes. The summary
+states what was folded away without inventing detail; it is not model-written.
+Compacting twice carries the earlier outline forward, and Argo refuses when there
+is nothing new to fold or while a turn is still running. Outside the TUI, run
+`argo compact <conversation-id>` for the same operation.
+
+Messages typed while a run is active enter a TUI-local in-memory FIFO queue. A
 queued item is removed only after the daemon confirms its run started. Success or
-cancellation advances the queue; failure pauses it. Press empty `Enter` to retry
-or `Esc` while idle to discard the paused items.
+cancellation—including `/cancel` or `Esc` during a run—starts the next item;
+failure pauses the queue. Press empty `Enter` to retry or `Esc` while idle to
+discard the paused items. Leaving the TUI discards items that have not started.
+
+`/queue` opens that queue for review, in send order. `Del` or `Ctrl+D` drops the
+highlighted message — two bindings because the key labelled Delete on a Mac
+keyboard sends Backspace, which narrows the list instead. `Enter` and `Esc` both
+just close it, so review cannot cost you a message by accident. The list tracks
+the queue while it is open: a message whose run starts leaves the list, and the
+pane closes once nothing is left. Removal is matched by message content, so if
+the highlighted item is sent in the moment before the key lands, Argo says it has
+already gone rather than dropping whatever moved up into its place.
 
 ## Delegated conversations
 

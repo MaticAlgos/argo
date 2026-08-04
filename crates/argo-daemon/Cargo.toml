@@ -12,6 +12,7 @@ argo-store = { workspace = true }
 argo-context = { workspace = true }
 argo-runtime = { workspace = true }
 argo-resources = { workspace = true }
+argo-telegram = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

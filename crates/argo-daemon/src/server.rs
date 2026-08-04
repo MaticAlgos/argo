@@ -29,14 +29,6 @@ use tokio::sync::{broadcast, Mutex};
 /// which the store can always satisfy.
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
-/// Default ceiling on one turn.
-///
-/// Without a deadline a stalled CLI — an ACP agent that never answers its
-/// handshake, say — hangs the turn forever with no way out but Ctrl-C. Generous
-/// enough for long agentic work, bounded enough to fail observably.
-/// Override with `ARGO_TURN_TIMEOUT_MS`.
-const DEFAULT_TURN_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
-
 /// Path of the canonical MCP registry.
 fn mcp_registry_path(paths: &ArgoPaths) -> std::path::PathBuf {
     paths.root().join("mcp.json")
@@ -207,16 +199,59 @@ fn resolve_instructions(workspace_root: &str) -> Option<String> {
     }
 }
 
-/// Resolves the per-turn deadline.
+/// Resolves the optional per-turn deadline.
 fn turn_timeout_ms() -> Option<u64> {
-    match std::env::var("ARGO_TURN_TIMEOUT_MS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            // An explicit 0 disables the deadline for users who want to wait.
-            Ok(0) => None,
-            Ok(value) => Some(value),
-            Err(_) => Some(DEFAULT_TURN_TIMEOUT_MS),
-        },
-        Err(_) => Some(DEFAULT_TURN_TIMEOUT_MS),
+    std::env::var("ARGO_TURN_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+}
+
+/// One accepted turn, reserved by conversation before execution starts.
+struct ActiveRun {
+    cancel: CancelToken,
+    run_id: StdMutex<Option<RunId>>,
+}
+
+impl ActiveRun {
+    fn new(cancel: CancelToken) -> Self {
+        Self {
+            cancel,
+            run_id: StdMutex::new(None),
+        }
+    }
+
+    fn announce(&self, run_id: &RunId) {
+        if let Ok(mut current) = self.run_id.lock() {
+            *current = Some(run_id.clone());
+        }
+    }
+
+    fn matches(&self, run_id: &RunId) -> bool {
+        self.run_id
+            .lock()
+            .map(|current| current.as_ref() == Some(run_id))
+            .unwrap_or(false)
+    }
+}
+
+/// Removes an active-turn reservation on every exit path, including errors.
+struct ActiveRunRegistration {
+    daemon: Arc<Daemon>,
+    conversation_id: ConversationId,
+    active: Arc<ActiveRun>,
+}
+
+impl ActiveRunRegistration {
+    fn active(&self) -> Arc<ActiveRun> {
+        Arc::clone(&self.active)
+    }
+}
+
+impl Drop for ActiveRunRegistration {
+    fn drop(&mut self) {
+        self.daemon
+            .unregister_active(&self.conversation_id, &self.active);
     }
 }
 
@@ -227,9 +262,11 @@ pub struct Daemon {
     agents: Mutex<Option<Vec<AgentInfo>>>,
     /// Serializes deep probes so concurrent requests cannot launch duplicates.
     probe_lock: Mutex<()>,
-    running: Mutex<HashMap<RunId, CancelToken>>,
+    running: StdMutex<HashMap<ConversationId, Arc<ActiveRun>>>,
     events: broadcast::Sender<argo_core::event::RunEvent>,
     shutdown: broadcast::Sender<()>,
+    /// Prepared Telegram authorization window, shared by its wait and cancel requests.
+    pub(crate) telegram_link: Mutex<Option<crate::telegram::LinkAttempt>>,
 }
 
 impl Daemon {
@@ -244,9 +281,10 @@ impl Daemon {
             paths,
             agents: Mutex::new(Some(agents)),
             probe_lock: Mutex::new(()),
-            running: Mutex::new(HashMap::new()),
+            running: StdMutex::new(HashMap::new()),
             events,
             shutdown,
+            telegram_link: Mutex::new(None),
         }
     }
 
@@ -293,11 +331,96 @@ impl Daemon {
         Ok(Self::new(store, paths))
     }
 
+    /// Reserves a conversation before any turn preparation or execution.
+    fn register_active(
+        self: &Arc<Self>,
+        conversation_id: &ConversationId,
+    ) -> Result<ActiveRunRegistration> {
+        let mut running = self
+            .running
+            .lock()
+            .map_err(|_| ArgoError::Store("active-run lock poisoned by a previous panic".into()))?;
+        if running.contains_key(conversation_id) {
+            return Err(ArgoError::Invalid(
+                "a turn is already running for this conversation; cancel it or wait for it to finish"
+                    .into(),
+            ));
+        }
+
+        let active = Arc::new(ActiveRun::new(CancelToken::new()));
+        running.insert(conversation_id.clone(), Arc::clone(&active));
+        Ok(ActiveRunRegistration {
+            daemon: Arc::clone(self),
+            conversation_id: conversation_id.clone(),
+            active,
+        })
+    }
+
+    /// Releases a reservation if it still names this exact accepted turn.
+    fn unregister_active(&self, conversation_id: &ConversationId, active: &Arc<ActiveRun>) {
+        match self.running.lock() {
+            Ok(mut running)
+                if running
+                    .get(conversation_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, active)) =>
+            {
+                running.remove(conversation_id);
+            }
+            Ok(_) => {}
+            Err(_) => tracing::error!(
+                conversation = %conversation_id,
+                "active-run lock poisoned while cleaning up"
+            ),
+        }
+    }
+
+    /// Locks active-turn state for one brief operation.
+    fn active_runs(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<ConversationId, Arc<ActiveRun>>>> {
+        self.running
+            .lock()
+            .map_err(|_| ArgoError::Store("active-run lock poisoned by a previous panic".into()))
+    }
+
+    /// Cancels the active turn with this run id without re-entering dispatch.
+    pub(crate) fn cancel_active_run(&self, run_id: &RunId) -> Result<bool> {
+        let active = self
+            .active_runs()?
+            .values()
+            .find(|active| active.matches(run_id))
+            .cloned();
+        if let Some(active) = active {
+            active.cancel.cancel();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Locks the store for one brief operation.
     fn store(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         self.store
             .lock()
             .map_err(|_| ArgoError::Store("store lock poisoned by a previous panic".into()))
+    }
+
+    /// Follows every run event the daemon publishes.
+    ///
+    /// In-process subscribers get the same stream socket clients do, which is
+    /// what lets the Telegram bridge mirror a turn the TUI is also watching.
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<argo_core::event::RunEvent> {
+        self.events.subscribe()
+    }
+
+    /// Notified when the daemon is shutting down.
+    pub(crate) fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
+        self.shutdown.subscribe()
+    }
+
+    /// Resolved data-directory layout.
+    pub(crate) fn paths(&self) -> &ArgoPaths {
+        &self.paths
     }
 
     /// Detected adapters. Refresh re-runs lightweight PATH-only discovery (never
@@ -449,6 +572,9 @@ impl Daemon {
             selected_model: conversation.selected_model.clone(),
             selected_reasoning: conversation.selected_reasoning.clone(),
             selected_mode: conversation.selected_mode.clone(),
+            selected_backup_agent_id: conversation.selected_backup_agent_id.clone(),
+            selected_backup_model: conversation.selected_backup_model.clone(),
+            selected_backup_reasoning: conversation.selected_backup_reasoning.clone(),
             message_count: messages.len(),
             agents_with_sessions: sessions.iter().map(|s| s.agent_id.to_string()).collect(),
             parent_conversation_id: conversation.parent_conversation_id.clone(),
@@ -684,6 +810,10 @@ pub async fn serve(daemon: Arc<Daemon>, lock: InstanceLock) -> Result<()> {
 
     tracing::info!(socket = %socket_path.display(), "argo daemon listening");
 
+    // Started here rather than in bootstrap so it belongs to a real daemon
+    // process; a no-op when Telegram was never set up.
+    crate::telegram::spawn(Arc::clone(&daemon));
+
     let mut shutdown_rx = daemon.shutdown.subscribe();
     loop {
         tokio::select! {
@@ -907,7 +1037,7 @@ async fn stream_run(
 }
 
 /// Dispatches one request.
-async fn dispatch(daemon: &Arc<Daemon>, request: Request) -> Response {
+pub(crate) async fn dispatch(daemon: &Arc<Daemon>, request: Request) -> Response {
     match handle(daemon, request).await {
         Ok(response) => response,
         Err(error) => Response::from_error(&error),
@@ -967,7 +1097,7 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
         }
 
         Request::ClearConversations { root } => {
-            if !daemon.running.lock().await.is_empty() {
+            if !daemon.active_runs()?.is_empty() {
                 return Err(ArgoError::Invalid(
                     "cannot clear history while an agent turn is running; cancel it first".into(),
                 ));
@@ -1080,6 +1210,56 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             })
         }
 
+        Request::TelegramStatus
+        | Request::TelegramConnect { .. }
+        | Request::TelegramPrepareLink { .. }
+        | Request::TelegramLink { .. }
+        | Request::TelegramCancelLink { .. }
+        | Request::TelegramAllowWorkspace { .. }
+        | Request::TelegramAllowUser { .. }
+        | Request::TelegramStart
+        | Request::TelegramReset
+        | Request::TelegramRemove => crate::telegram::handle(daemon, request).await,
+
+        Request::SetBackupAgent {
+            conversation_id,
+            agent_id,
+            model,
+            reasoning,
+        } => {
+            // Validated here rather than at failover time: discovering the standby
+            // was never installed at the moment the primary runs dry is the worst
+            // possible time to find out.
+            if let Some(requested) = &agent_id {
+                let conversation = daemon.store()?.get_conversation(&conversation_id)?;
+                if conversation.selected_agent_id.as_deref() == Some(requested.as_str()) {
+                    return Err(ArgoError::Invalid(format!(
+                        "{requested} is already this conversation's agent; a backup must be a different CLI"
+                    )));
+                }
+                validate_agent_route(daemon, requested, model.as_deref(), reasoning.as_deref())
+                    .await?;
+            } else if model.is_some() || reasoning.is_some() {
+                return Err(ArgoError::Invalid(
+                    "a backup model or reasoning level requires a backup agent".into(),
+                ));
+            }
+            let conversation = {
+                let store = daemon.store()?;
+                store.set_backup_agent(
+                    &conversation_id,
+                    agent_id.as_deref(),
+                    model.as_deref(),
+                    reasoning.as_deref(),
+                )?;
+                store.get_conversation(&conversation_id)?
+            };
+            Ok(Response::Conversation {
+                summary: daemon.summarize(&conversation).await?,
+                messages: vec![],
+            })
+        }
+
         Request::PreviewContext {
             conversation_id,
             prompt,
@@ -1091,13 +1271,10 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
         } => send_message(daemon, conversation_id, prompt).await,
 
         Request::Cancel { run_id } => {
-            let running = daemon.running.lock().await;
-            match running.get(&run_id) {
-                Some(token) => {
-                    token.cancel();
-                    Ok(Response::Ok)
-                }
-                None => Err(ArgoError::not_found("active run", run_id.as_str())),
+            if daemon.cancel_active_run(&run_id)? {
+                Ok(Response::Ok)
+            } else {
+                Err(ArgoError::not_found("active run", run_id.as_str()))
             }
         }
 
@@ -1148,10 +1325,12 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
             .await
         }
 
+        Request::Compact { conversation_id } => compact(daemon, conversation_id).await,
+
         Request::Shutdown => {
             // Stop in-flight turns so children are signalled rather than orphaned.
-            for token in daemon.running.lock().await.values() {
-                token.cancel();
+            for active in daemon.active_runs()?.values() {
+                active.cancel.cancel();
             }
             let _ = daemon.shutdown.send(());
             Ok(Response::Ok)
@@ -1167,27 +1346,17 @@ async fn handle(daemon: &Arc<Daemon>, request: Request) -> Result<Response> {
 ///
 /// Catching an invalid value here produces a clear message naming the valid
 /// options, instead of an opaque CLI failure at spawn time.
-async fn validate_selection(
+async fn validate_agent_route(
     daemon: &Arc<Daemon>,
-    conversation: &Conversation,
-    change: &SelectionChange,
+    agent_id: &str,
+    model: Option<&str>,
+    reasoning: Option<&str>,
 ) -> Result<()> {
-    // The agent this change resolves to: the new one, or the one already selected.
-    let agent_id = change
-        .agent_id
-        .as_ref()
-        .map(|a| a.to_string())
-        .or_else(|| conversation.selected_agent_id.clone());
-
-    let Some(agent_id) = agent_id else {
-        // Nothing selected yet and none named: the turn will pick a default.
-        return Ok(());
-    };
-    let def = argo_runtime::require(&agent_id)?;
+    let def = argo_runtime::require(agent_id)?;
 
     // Explicit selection is consent to deep-probe this one adapter. Errors and
     // unavailable state remain actionable instead of becoming an empty model list.
-    let info = daemon.probe_agent(&agent_id, false).await?;
+    let info = daemon.probe_agent(agent_id, false).await?;
     if !info.available {
         return Err(ArgoError::AgentUnavailable {
             agent: def.id.to_string(),
@@ -1199,8 +1368,8 @@ async fn validate_selection(
         });
     }
 
-    if let Some(model) = &change.model {
-        if !info.models.iter().any(|candidate| &candidate.id == model) {
+    if let Some(model) = model {
+        if !info.models.iter().any(|candidate| candidate.id == model) {
             let available: Vec<&str> = info
                 .models
                 .iter()
@@ -1215,30 +1384,52 @@ async fn validate_selection(
         }
     }
 
-    if let Some(reasoning) = &change.reasoning {
-        // Levels are per model, so validate against the model in effect after this
-        // change rather than the adapter-wide list.
-        let model = change
-            .model
-            .clone()
-            .or_else(|| conversation.selected_model.clone());
-        let levels = info.reasoning_for(model.as_deref());
+    if let Some(reasoning) = reasoning {
+        let levels = info.reasoning_for(model);
         if levels.is_empty() {
             return Err(ArgoError::Invalid(format!(
                 "{} does not expose reasoning levels",
                 def.name
             )));
         }
-        if !levels.iter().any(|l| &l.id == reasoning) {
-            let available: Vec<&str> = levels.iter().map(|l| l.id.as_str()).collect();
+        if !levels.iter().any(|level| level.id == reasoning) {
+            let available: Vec<&str> = levels.iter().map(|level| level.id.as_str()).collect();
             return Err(ArgoError::Invalid(format!(
                 "'{reasoning}' is not a reasoning level for {}. Available: {}",
-                model.unwrap_or_else(|| def.name.to_string()),
+                model.unwrap_or(def.name),
                 available.join(", ")
             )));
         }
     }
     Ok(())
+}
+
+async fn validate_selection(
+    daemon: &Arc<Daemon>,
+    conversation: &Conversation,
+    change: &SelectionChange,
+) -> Result<()> {
+    // The agent this change resolves to: the new one, or the one already selected.
+    let agent_id = change
+        .agent_id
+        .as_ref()
+        .map(|agent| agent.to_string())
+        .or_else(|| conversation.selected_agent_id.clone());
+
+    let Some(agent_id) = agent_id else {
+        // Nothing selected yet and none named: the turn will pick a default.
+        return Ok(());
+    };
+    let agent_changed = change
+        .agent_id
+        .as_ref()
+        .is_some_and(|agent| Some(agent.as_str()) != conversation.selected_agent_id.as_deref());
+    let model = change.model.as_deref().or_else(|| {
+        (!agent_changed)
+            .then_some(conversation.selected_model.as_deref())
+            .flatten()
+    });
+    validate_agent_route(daemon, &agent_id, model, change.reasoning.as_deref()).await
 }
 
 /// Composes the body the next turn would send, without running anything.
@@ -1303,6 +1494,9 @@ async fn preview_context(
             .as_deref()
             .and_then(argo_core::mode::AgentMode::parse)
             .unwrap_or_default(),
+        append_user: true,
+        // A preview never runs, so it needs no standby.
+        failover: None,
     };
 
     let body = if plan.skip_transcript() {
@@ -1317,6 +1511,87 @@ async fn preview_context(
         resuming: plan.skip_transcript(),
         reason: plan.invalidation.map(|r| r.detail().to_string()),
         body,
+    })
+}
+
+/// Folds a conversation's history into a summary and forces a fresh context.
+///
+/// Three things happen together, and all three are required for `/compact` to
+/// mean anything:
+///
+/// 1. An epoch records the boundary and the summary standing in for it, so future
+///    projections replay the summary instead of the messages.
+/// 2. Every native session handle is dropped, because a vendor CLI holding its
+///    own copy of the history would keep answering from the uncompacted version
+///    and the reduced projection would never be sent.
+/// 3. The canonical rows are left untouched, so the transcript stays readable and
+///    a later build can always reconstruct what was folded away.
+///
+/// The summary is mechanical rather than model-written: it states what was
+/// omitted without inventing detail, which is the same guarantee automatic
+/// budget compaction already gives.
+async fn compact(daemon: &Arc<Daemon>, conversation_id: ConversationId) -> Result<Response> {
+    // Hold the same gate used to reserve sends until the epoch is durable. A
+    // send can therefore happen wholly before or wholly after compaction, never
+    // against a partially compacted context.
+    let running = daemon.active_runs()?;
+    if running.contains_key(&conversation_id) {
+        return Err(ArgoError::Invalid(
+            "a turn is still running; cancel it or let it finish before compacting".into(),
+        ));
+    }
+
+    let mut store = daemon.store()?;
+    // Confirms the conversation exists before anything is written.
+    store.get_conversation(&conversation_id)?;
+
+    let previous = store.latest_context_epoch(&conversation_id)?;
+    let already_compacted = previous.as_ref().map(|e| e.compacted_upto).unwrap_or(0);
+
+    let Some(upto) = store.max_message_seq(&conversation_id)? else {
+        return Err(ArgoError::Invalid(
+            "this conversation has no messages to compact".into(),
+        ));
+    };
+    if upto <= already_compacted {
+        return Err(ArgoError::Invalid(
+            "nothing new to compact since the last compaction".into(),
+        ));
+    }
+
+    let folded: Vec<argo_core::message::Message> = store
+        .list_messages(&conversation_id)?
+        .into_iter()
+        .filter(|m| m.seq > already_compacted && m.seq <= upto)
+        .collect();
+
+    // Carried forward rather than replaced: compacting twice must not discard the
+    // outline of what the first compaction folded away.
+    let summary = match previous.and_then(|e| e.summary) {
+        Some(earlier) => format!(
+            "{earlier}\n\n{}",
+            argo_context::budget::fallback_summary(&folded)
+        ),
+        None => argo_context::budget::fallback_summary(&folded),
+    };
+
+    let (_, sessions_cleared) =
+        store.compact_context(&conversation_id, Some(&summary), upto, "manual")?;
+    drop(store);
+    drop(running);
+
+    tracing::info!(
+        conversation = %conversation_id,
+        compacted_upto = upto,
+        messages = folded.len(),
+        "conversation compacted on request"
+    );
+
+    Ok(Response::Compacted {
+        compacted_upto: upto,
+        messages_compacted: folded.len(),
+        sessions_cleared,
+        summary,
     })
 }
 
@@ -1425,6 +1700,8 @@ async fn delegate(
             Some(&title),
         )?
     };
+    let registration = daemon.register_active(&child_conversation)?;
+    let active_run = registration.active();
     daemon.store()?.update_selection(
         &child_conversation,
         &SelectionChange {
@@ -1479,14 +1756,21 @@ async fn delegate(
         timeout_ms: timeout_ms.or_else(turn_timeout_ms),
         // A subagent inherits full authority: it was asked to do work, not plan.
         mode: argo_core::mode::AgentMode::Full,
+        append_user: true,
+        // Delegation names its agent explicitly; silently answering as a different
+        // CLI would contradict what the delegating agent asked for.
+        failover: None,
     };
 
-    let cancel = CancelToken::new();
+    let cancel = active_run.cancel.clone();
     let events = daemon.events.clone();
     let store = Arc::clone(&daemon.store);
     let lifecycle_parent = parent_run_id.clone();
     let lifecycle_agent = agent_id.clone();
     let lifecycle_task = task.clone();
+    let daemon_for_listener = Arc::clone(daemon);
+    let active_conversation = child_conversation.clone();
+    let active_for_cleanup = Arc::clone(&active_run);
     let spawned = std::sync::atomic::AtomicBool::new(false);
     let listener = move |event: argo_core::event::RunEvent| {
         // The first persisted child event discloses its real generated run id.
@@ -1510,11 +1794,17 @@ async fn delegate(
             }
         }
 
+        active_run.announce(&event.run_id);
         let terminal = match &event.kind {
             RunEventKind::RunFinished { status, .. } => Some(*status),
             _ => None,
         };
         let child_run_id = event.run_id.clone();
+        if terminal.is_some() {
+            // RunFinished is the queue commit barrier. Release before publishing
+            // it so an immediate queued send is accepted.
+            daemon_for_listener.unregister_active(&active_conversation, &active_for_cleanup);
+        }
         let _ = events.send(event);
 
         // Child RunFinished is its own commit barrier. Publish completion to the
@@ -1535,7 +1825,9 @@ async fn delegate(
         }
     };
 
-    let outcome = run_turn(&daemon.store, &daemon.paths, turn, &cancel, Some(&listener)).await?;
+    let outcome = run_turn(&daemon.store, &daemon.paths, turn, &cancel, Some(&listener)).await;
+    drop(registration);
+    let outcome = outcome?;
 
     // The child's reply is what the parent agent receives as its tool result.
     let output = {
@@ -1575,6 +1867,70 @@ fn first_line(text: &str) -> String {
     line.chars().take(45).collect::<String>() + "..."
 }
 
+/// Resolves the conversation's standby agent into a ready-to-run plan.
+///
+/// Returns `None` when no backup is configured, when it names the agent already
+/// running the turn, or when it cannot be resolved — a failed lookup must
+/// degrade to today's behaviour rather than break an otherwise valid turn.
+async fn resolve_failover(
+    daemon: &Arc<Daemon>,
+    conversation: &Conversation,
+    workspace_root: &str,
+) -> Option<crate::engine::FailoverPlan> {
+    let backup = conversation.selected_backup_agent_id.as_deref()?;
+    if conversation.selected_agent_id.as_deref() == Some(backup) {
+        return None;
+    }
+
+    // Resolved through a conversation whose primary selection *is* the backup,
+    // carrying the standby's own recorded model and effort. Reusing
+    // `resolve_selection` keeps one code path for validating a routing target.
+    let probe = Conversation {
+        selected_agent_id: Some(backup.to_string()),
+        selected_model: conversation.selected_backup_model.clone(),
+        selected_reasoning: conversation.selected_backup_reasoning.clone(),
+        ..conversation.clone()
+    };
+    let (info, model, reasoning) = match daemon.resolve_selection(&probe).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(%error, backup, "backup agent is unavailable; failover disabled for this turn");
+            return None;
+        }
+    };
+    let def = match argo_runtime::require(&info.id) {
+        Ok(def) => def,
+        Err(error) => {
+            tracing::warn!(%error, backup, "backup agent is not in the registry");
+            return None;
+        }
+    };
+
+    let (skills, mcp_plan, descriptors) = resolve_resources(
+        &daemon.paths,
+        workspace_root,
+        def.capabilities.mcp_injection,
+        conversation.id.as_str(),
+    );
+
+    Some(crate::engine::FailoverPlan {
+        agent_id: AgentId::new(&info.id),
+        model,
+        reasoning,
+        bin: info.path.clone().unwrap_or_else(|| def.bin.to_string()),
+        help_flags: info.help_flags.clone(),
+        active_skills: skills,
+        active_mcp_servers: mcp_plan.names.clone(),
+        mcp_descriptors: descriptors,
+        mcp_config: mcp_plan
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        mcp_overrides: mcp_plan.config_overrides.clone(),
+        mcp_environment: mcp_plan.environment.clone(),
+    })
+}
+
 /// Accepts a turn and runs it in the background, streaming events.
 async fn send_message(
     daemon: &Arc<Daemon>,
@@ -1585,6 +1941,10 @@ async fn send_message(
         return Err(ArgoError::Invalid("message is empty".into()));
     }
 
+    // Reserve first: all preparation observes one coherent context boundary, and
+    // every `?` below releases the reservation through `Drop`.
+    let registration = daemon.register_active(&conversation_id)?;
+    let active_run = registration.active();
     let conversation = daemon.store()?.get_conversation(&conversation_id)?;
     let (agent, model, reasoning) = daemon.resolve_selection(&conversation).await?;
     let def = argo_runtime::require(&agent.id)?;
@@ -1632,6 +1992,11 @@ async fn send_message(
         conversation_id.as_str(),
     );
 
+    // Resolved before the turn starts so a missing or broken standby surfaces as a
+    // log line now rather than as a second failure at the worst moment. Costs
+    // nothing for conversations that never configured one.
+    let failover = resolve_failover(daemon, &conversation, &workspace_root).await;
+
     let conversation_id_for_summary = conversation_id.clone();
     let turn = TurnRequest {
         conversation_id,
@@ -1659,27 +2024,40 @@ async fn send_message(
             .as_deref()
             .and_then(argo_core::mode::AgentMode::parse)
             .unwrap_or_default(),
+        append_user: true,
+        failover,
     };
 
     // The run row must exist before this call returns so the client can subscribe
     // without racing the spawn.
-    let cancel = CancelToken::new();
     let daemon_for_turn = Arc::clone(daemon);
-    let cancel_for_turn = cancel.clone();
+    let active_conversation_for_turn = conversation_id_for_summary.clone();
+    let cancel_for_turn = active_run.cancel.clone();
     let agent_id = agent.id.clone();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<RunId>();
 
     tokio::spawn(async move {
+        // Ownership moves to the task so every terminal or error path unregisters.
+        let _registration = registration;
         let events = daemon_for_turn.events.clone();
+        let daemon_for_listener = Arc::clone(&daemon_for_turn);
+        let active_for_cleanup = Arc::clone(&active_run);
         // The first event carries the run id, which both announces the run to the
         // waiting caller and fans out to any subscriber.
         let announce = std::sync::Mutex::new(Some(tx));
         let listener = move |event: argo_core::event::RunEvent| {
+            active_run.announce(&event.run_id);
             if let Ok(mut guard) = announce.lock() {
                 if let Some(sender) = guard.take() {
                     let _ = sender.send(event.run_id.clone());
                 }
+            }
+            if event.is_terminal() {
+                // RunFinished is the queue commit barrier. Release before it is
+                // visible so the next FIFO send cannot be spuriously rejected.
+                daemon_for_listener
+                    .unregister_active(&active_conversation_for_turn, &active_for_cleanup);
             }
             // A send failure only means no client is currently subscribed.
             let _ = events.send(event);
@@ -1695,18 +2073,14 @@ async fn send_message(
         )
         .await;
 
-        match &result {
-            Ok(outcome) => {
-                daemon_for_turn.running.lock().await.remove(&outcome.run_id);
-            }
-            Err(error) => tracing::warn!(%error, agent = %agent_id, "turn failed"),
+        if let Err(error) = &result {
+            tracing::warn!(%error, agent = %agent_id, "turn failed");
         }
     });
 
     let run_id = rx
         .await
         .map_err(|_| ArgoError::Process("turn did not start".into()))?;
-    daemon.running.lock().await.insert(run_id.clone(), cancel);
 
     // The engine persists the title and both message rows before announcing the
     // run, so this summary is authoritative and can update every client view
@@ -1760,17 +2134,17 @@ mod tests {
     }
 
     #[test]
-    fn turn_timeout_defaults_and_can_be_overridden() {
-        // A missing or malformed value must still produce a bounded deadline; only
-        // an explicit 0 means "wait indefinitely".
+    fn turn_timeout_is_unlimited_by_default_and_can_be_set_explicitly() {
+        // Missing or malformed values must not impose a default deadline. Only a
+        // positive value opts into a bound; 0 remains an explicit no-deadline value.
         std::env::remove_var("ARGO_TURN_TIMEOUT_MS");
-        assert_eq!(turn_timeout_ms(), Some(DEFAULT_TURN_TIMEOUT_MS));
+        assert_eq!(turn_timeout_ms(), None);
         std::env::set_var("ARGO_TURN_TIMEOUT_MS", "5000");
         assert_eq!(turn_timeout_ms(), Some(5_000));
         std::env::set_var("ARGO_TURN_TIMEOUT_MS", "0");
         assert_eq!(turn_timeout_ms(), None);
         std::env::set_var("ARGO_TURN_TIMEOUT_MS", "not-a-number");
-        assert_eq!(turn_timeout_ms(), Some(DEFAULT_TURN_TIMEOUT_MS));
+        assert_eq!(turn_timeout_ms(), None);
         std::env::remove_var("ARGO_TURN_TIMEOUT_MS");
     }
 
@@ -2066,6 +2440,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_backup_agent_round_trips_and_is_validated_up_front() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+        handle(
+            &daemon,
+            Request::Select {
+                conversation_id: conversation.clone(),
+                change: SelectionChange {
+                    agent_id: Some(AgentId::new("claude")),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .expect("select claude");
+
+        let response = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("codex".into()),
+                model: None,
+                reasoning: None,
+            },
+        )
+        .await
+        .expect("set backup");
+        match response {
+            Response::Conversation { summary, .. } => {
+                assert_eq!(summary.selected_agent_id.as_deref(), Some("claude"));
+                assert_eq!(summary.selected_backup_agent_id.as_deref(), Some("codex"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // An unknown standby is refused now rather than at the moment the primary
+        // runs dry, when it would be far more expensive to discover.
+        let error = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("not-a-cli".into()),
+                model: None,
+                reasoning: None,
+            },
+        )
+        .await
+        .expect_err("must reject unknown");
+        assert_eq!(error.code(), "INVALID_REQUEST");
+
+        // Standing by for yourself is not failover.
+        let error = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("claude".into()),
+                model: None,
+                reasoning: None,
+            },
+        )
+        .await
+        .expect_err("must reject self");
+        assert!(error.to_string().contains("different CLI"));
+
+        let error = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("codex".into()),
+                model: Some("not-a-codex-model".into()),
+                reasoning: None,
+            },
+        )
+        .await
+        .expect_err("must reject unknown backup model");
+        assert!(error.to_string().contains("does not offer model"));
+
+        let codex_model = daemon
+            .probe_agent("codex", false)
+            .await
+            .expect("probe fixture")
+            .models
+            .first()
+            .expect("fallback model")
+            .id
+            .clone();
+        let error = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("codex".into()),
+                model: Some(codex_model),
+                reasoning: Some("not-a-level".into()),
+            },
+        )
+        .await
+        .expect_err("must reject invalid backup reasoning");
+        assert!(error.to_string().contains("reasoning"));
+
+        {
+            let mut agents = daemon.agents.lock().await;
+            let codex = agents
+                .as_mut()
+                .and_then(|agents| agents.iter_mut().find(|agent| agent.id == "codex"))
+                .expect("codex fixture");
+            codex.available = false;
+            codex.diagnostics = vec!["not installed for test".into()];
+        }
+        let error = handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: Some("codex".into()),
+                model: None,
+                reasoning: None,
+            },
+        )
+        .await
+        .expect_err("must reject unavailable backup");
+        assert_eq!(error.code(), "AGENT_UNAVAILABLE");
+
+        handle(
+            &daemon,
+            Request::SetBackupAgent {
+                conversation_id: conversation.clone(),
+                agent_id: None,
+                model: None,
+                reasoning: None,
+            },
+        )
+        .await
+        .expect("clear backup");
+        let conversation = daemon
+            .store()
+            .expect("store")
+            .get_conversation(&conversation)
+            .expect("load");
+        assert!(conversation.selected_backup_agent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn failover_resolution_skips_unusable_or_redundant_standbys() {
+        let (daemon, dir) = daemon().await;
+        let conversation_id = new_conversation(&daemon, dir.path()).await;
+        let root = dir.path().to_string_lossy().to_string();
+        let load = |daemon: &Arc<Daemon>| {
+            daemon
+                .store()
+                .expect("store")
+                .get_conversation(&conversation_id)
+                .expect("load")
+        };
+
+        // No standby configured: the overwhelming common case must cost nothing
+        // and change nothing.
+        assert!(resolve_failover(&daemon, &load(&daemon), &root)
+            .await
+            .is_none());
+
+        daemon
+            .store()
+            .expect("store")
+            .set_backup_agent(&conversation_id, Some("codex"), None, None)
+            .expect("set backup");
+        let plan = resolve_failover(&daemon, &load(&daemon), &root)
+            .await
+            .expect("standby resolves");
+        assert_eq!(plan.agent_id, AgentId::new("codex"));
+        // The primary's model must not follow the turn across: model ids are not
+        // portable between CLIs.
+        assert!(plan.model.is_none() || plan.model.as_deref() != Some("sonnet"));
+
+        // A standby configured with its own model must actually run on it,
+        // otherwise the choice is recorded and silently ignored.
+        daemon
+            .store()
+            .expect("store")
+            .set_backup_agent(&conversation_id, Some("codex"), Some("gpt-5.6-sol"), None)
+            .expect("set backup routing");
+        let routed = resolve_failover(&daemon, &load(&daemon), &root)
+            .await
+            .expect("standby resolves");
+        assert_eq!(routed.model.as_deref(), Some("gpt-5.6-sol"));
+
+        // Once the conversation is already on the standby there is nothing to fail
+        // over to, so resolution must decline rather than hand a CLI to itself.
+        handle(
+            &daemon,
+            Request::Select {
+                conversation_id: conversation_id.clone(),
+                change: SelectionChange {
+                    agent_id: Some(AgentId::new("codex")),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .expect("select codex");
+        assert!(resolve_failover(&daemon, &load(&daemon), &root)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn an_empty_delegated_task_is_rejected() {
         let (daemon, dir) = daemon().await;
         let conversation = new_conversation(&daemon, dir.path()).await;
@@ -2347,6 +2925,19 @@ mod tests {
         .await
         .expect_err("must reject");
         assert_eq!(error.code(), "INVALID_REQUEST");
+
+        // A failure after reservation but before run_turn starts must clean up.
+        let missing = handle(
+            &daemon,
+            Request::SendMessage {
+                conversation_id: ConversationId::new("missing"),
+                prompt: "valid prompt".into(),
+            },
+        )
+        .await
+        .expect_err("missing conversation");
+        assert_eq!(missing.code(), "NOT_FOUND");
+        assert!(daemon.active_runs().expect("running").is_empty());
     }
 
     #[tokio::test]
@@ -2361,6 +2952,68 @@ mod tests {
         .await
         .expect_err("must fail");
         assert_eq!(error.code(), "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn one_active_turn_per_conversation_blocks_sends_and_compaction() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+        daemon
+            .store()
+            .expect("store")
+            .append_message(
+                &conversation,
+                argo_store::NewMessage::user("existing history"),
+            )
+            .expect("append");
+
+        let registration = daemon.register_active(&conversation).expect("reserve");
+        assert_eq!(daemon.active_runs().expect("running").len(), 1);
+
+        let duplicate = handle(
+            &daemon,
+            Request::SendMessage {
+                conversation_id: conversation.clone(),
+                prompt: "second client".into(),
+            },
+        )
+        .await
+        .expect_err("second send must be rejected");
+        assert!(duplicate.to_string().contains("already running"));
+
+        let compacting = handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await
+        .expect_err("compaction must wait for the send");
+        assert!(compacting.to_string().contains("still running"));
+
+        // Registration is RAII-owned, so an early error path cannot leave the
+        // conversation permanently busy.
+        drop(registration);
+        assert!(daemon.active_runs().expect("running").is_empty());
+
+        // Terminal publication removes the reservation before the guard itself
+        // drops, matching the point at which FIFO clients send their next turn.
+        let registration = daemon
+            .register_active(&conversation)
+            .expect("reserve again");
+        let active = registration.active();
+        daemon.unregister_active(&conversation, &active);
+        assert!(daemon.active_runs().expect("running").is_empty());
+        drop(registration);
+
+        handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation,
+            },
+        )
+        .await
+        .expect("compaction after cleanup");
     }
 
     #[tokio::test]
@@ -2433,6 +3086,188 @@ mod tests {
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.error_code.as_deref(), Some("RUN_INTERRUPTED"));
         assert!(store.list_unfinished_runs().expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_folds_history_drops_sessions_and_keeps_the_transcript() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+
+        // A conversation with real history and a live native handle, which is the
+        // only situation where compaction has anything to do.
+        {
+            let store = daemon.store().expect("store");
+            for i in 0..6 {
+                store
+                    .append_message(
+                        &conversation,
+                        argo_store::NewMessage::user(format!("request {i}")),
+                    )
+                    .expect("append");
+            }
+            store
+                .upsert_agent_session(
+                    &conversation,
+                    &argo_core::session::AgentSessionRecord {
+                        agent_id: AgentId::new("claude"),
+                        session_id: argo_core::ids::SessionId::new("sess-1"),
+                        model: None,
+                        cwd: None,
+                        stable_hash: None,
+                        last_message_id: None,
+                        updated_at: 0,
+                    },
+                )
+                .expect("session");
+        }
+
+        let response = handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await
+        .expect("compact");
+
+        let Response::Compacted {
+            compacted_upto,
+            messages_compacted,
+            sessions_cleared,
+            summary,
+        } = response
+        else {
+            panic!("unexpected: {response:?}");
+        };
+        assert_eq!(compacted_upto, 6);
+        assert_eq!(messages_compacted, 6);
+        // The vendor session must go, or the reduced projection is never sent.
+        assert_eq!(sessions_cleared, 1);
+        assert!(summary.contains("6 earlier message(s) omitted"));
+
+        // Canonical history is untouched: /compact changes the projection only.
+        {
+            let store = daemon.store().expect("store");
+            assert_eq!(store.list_messages(&conversation).expect("list").len(), 6);
+            assert!(store
+                .list_agent_sessions(&conversation)
+                .expect("s")
+                .is_empty());
+        }
+
+        // The next turn's projection replays the summary instead of the messages.
+        let preview = handle(
+            &daemon,
+            Request::PreviewContext {
+                conversation_id: conversation.clone(),
+                prompt: "what next".into(),
+            },
+        )
+        .await
+        .expect("preview");
+        let Response::ContextPreview { body, resuming, .. } = preview else {
+            panic!("unexpected: {preview:?}");
+        };
+        assert!(!resuming, "a compacted conversation must reseed");
+        assert!(body.contains("6 earlier message(s) omitted"));
+        // None of the folded turns are replayed verbatim any more.
+        for i in 0..6 {
+            assert!(
+                !body.contains(&format!("request {i}")),
+                "request {i} should have been folded away:\n{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_folds_the_full_prefix_beyond_two_hundred_messages() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+        const MESSAGE_COUNT: usize = 250;
+
+        {
+            let store = daemon.store().expect("store");
+            for i in 0..MESSAGE_COUNT {
+                store
+                    .append_message(
+                        &conversation,
+                        argo_store::NewMessage::user(format!("request {i}")),
+                    )
+                    .expect("append");
+            }
+        }
+
+        let response = handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await
+        .expect("compact");
+        let Response::Compacted {
+            compacted_upto,
+            messages_compacted,
+            summary,
+            ..
+        } = response
+        else {
+            panic!("unexpected: {response:?}");
+        };
+        assert_eq!(compacted_upto, MESSAGE_COUNT as i64);
+        assert_eq!(messages_compacted, MESSAGE_COUNT);
+        assert!(summary.contains("250 earlier message(s) omitted"));
+        assert_eq!(
+            daemon
+                .store()
+                .expect("store")
+                .list_messages(&conversation)
+                .expect("messages")
+                .len(),
+            MESSAGE_COUNT,
+            "manual compaction must preserve canonical messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_when_there_is_nothing_new_to_fold() {
+        let (daemon, dir) = daemon().await;
+        let conversation = new_conversation(&daemon, dir.path()).await;
+
+        // Empty conversation: nothing to summarize.
+        let empty = handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await;
+        assert!(empty.is_err(), "expected a refusal, got {empty:?}");
+
+        daemon
+            .store()
+            .expect("store")
+            .append_message(&conversation, argo_store::NewMessage::user("only turn"))
+            .expect("append");
+        handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await
+        .expect("first compaction");
+
+        // Second attempt with no new messages is a refusal rather than an epoch
+        // that summarizes nothing and needlessly drops sessions again.
+        let repeat = handle(
+            &daemon,
+            Request::Compact {
+                conversation_id: conversation.clone(),
+            },
+        )
+        .await;
+        assert!(repeat.is_err(), "expected a refusal, got {repeat:?}");
     }
 
     async fn new_conversation(daemon: &Arc<Daemon>, root: &std::path::Path) -> ConversationId {

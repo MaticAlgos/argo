@@ -1,7 +1,7 @@
 //! Store handle, workspaces, and conversations.
 
 use argo_core::error::{ArgoError, Result};
-use argo_core::ids::{ConversationId, RunId, WorkspaceId};
+use argo_core::ids::{AgentId, ConversationId, RunId, WorkspaceId};
 use argo_core::now_millis;
 use argo_core::session::SelectionChange;
 use rusqlite::{Connection, OptionalExtension};
@@ -29,10 +29,29 @@ pub struct Conversation {
     pub selected_reasoning: Option<String>,
     /// Execution mode selected for the next turn.
     pub selected_mode: Option<String>,
+    /// Standby agent this conversation fails over to when the selected agent
+    /// exhausts its plan.
+    pub selected_backup_agent_id: Option<String>,
+    /// Model the standby runs, which is never the primary's: model ids are not
+    /// portable between CLIs.
+    pub selected_backup_model: Option<String>,
+    /// Reasoning effort for the standby, when its model offers one.
+    pub selected_backup_reasoning: Option<String>,
     /// Creation time in epoch millis.
     pub created_at: i64,
     /// Last update time in epoch millis.
     pub updated_at: i64,
+}
+
+/// Complete agent routing used when atomically swapping failover roles.
+#[derive(Debug, Clone, Copy)]
+pub struct FailoverRoute<'a> {
+    /// Adapter receiving this route.
+    pub agent_id: &'a AgentId,
+    /// Adapter-specific model, when selected.
+    pub model: Option<&'a str>,
+    /// Model-specific reasoning effort, when selected.
+    pub reasoning: Option<&'a str>,
 }
 
 /// Canonical Argo store.
@@ -178,7 +197,9 @@ impl Store {
             .query_row(
                 "SELECT id, workspace_id, title, parent_conversation_id, parent_run_id,
                         selected_agent_id, selected_model, selected_reasoning,
-                        selected_mode, created_at, updated_at
+                        selected_mode, selected_backup_agent_id,
+                        selected_backup_model, selected_backup_reasoning,
+                        created_at, updated_at
                    FROM conversations WHERE id = ?1",
                 [id.as_str()],
                 map_conversation,
@@ -195,7 +216,9 @@ impl Store {
             .prepare(
                 "SELECT id, workspace_id, title, parent_conversation_id, parent_run_id,
                         selected_agent_id, selected_model, selected_reasoning,
-                        selected_mode, created_at, updated_at
+                        selected_mode, selected_backup_agent_id,
+                        selected_backup_model, selected_backup_reasoning,
+                        created_at, updated_at
                    FROM conversations
                   WHERE workspace_id = ?1
                   ORDER BY updated_at DESC, rowid DESC",
@@ -247,7 +270,9 @@ impl Store {
             .prepare(
                 "SELECT id, workspace_id, title, parent_conversation_id, parent_run_id,
                         selected_agent_id, selected_model, selected_reasoning,
-                        selected_mode, created_at, updated_at
+                        selected_mode, selected_backup_agent_id,
+                        selected_backup_model, selected_backup_reasoning,
+                        created_at, updated_at
                    FROM conversations
                   WHERE parent_conversation_id = ?1
                   ORDER BY created_at ASC",
@@ -311,6 +336,89 @@ impl Store {
             )
             .map_err(|e| ArgoError::Store(format!("set mode: {e}")))?;
         Ok(())
+    }
+
+    /// Records the standby used when the selected agent exhausts its plan.
+    ///
+    /// Clearing the agent clears its routing too: a model or effort left behind
+    /// from a previous standby would be applied to whatever is chosen next, and
+    /// model ids do not transfer between CLIs.
+    pub fn set_backup_agent(
+        &self,
+        id: &ConversationId,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        let (model, reasoning) = match agent_id {
+            Some(_) => (model, reasoning),
+            None => (None, None),
+        };
+        self.conn
+            .execute(
+                "UPDATE conversations
+                    SET selected_backup_agent_id = ?2,
+                        selected_backup_model = ?3,
+                        selected_backup_reasoning = ?4,
+                        updated_at = ?5
+                  WHERE id = ?1",
+                rusqlite::params![id.as_str(), agent_id, model, reasoning, now_millis()],
+            )
+            .map_err(|e| ArgoError::Store(format!("set backup agent: {e}")))?;
+        Ok(())
+    }
+
+    /// Promotes a successful standby and demotes the exhausted primary, but only
+    /// if the routing selection still matches the snapshot taken when the turn
+    /// started.
+    ///
+    /// The compare-and-swap covers both primary and standby fields. A user may
+    /// change either while an agent is running; in that case their newer choice
+    /// wins and this returns `false`. All six fields move in one SQLite update,
+    /// so observers can never see a half-swapped routing configuration.
+    pub fn promote_failover_if_unchanged(
+        &self,
+        expected: &Conversation,
+        promoted: FailoverRoute<'_>,
+        demoted: FailoverRoute<'_>,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE conversations
+                    SET selected_agent_id = ?2,
+                        selected_model = ?3,
+                        selected_reasoning = ?4,
+                        selected_backup_agent_id = ?5,
+                        selected_backup_model = ?6,
+                        selected_backup_reasoning = ?7,
+                        updated_at = ?8
+                  WHERE id = ?1
+                    AND selected_agent_id IS ?9
+                    AND selected_model IS ?10
+                    AND selected_reasoning IS ?11
+                    AND selected_backup_agent_id IS ?12
+                    AND selected_backup_model IS ?13
+                    AND selected_backup_reasoning IS ?14",
+                rusqlite::params![
+                    expected.id.as_str(),
+                    promoted.agent_id.as_str(),
+                    promoted.model,
+                    promoted.reasoning,
+                    demoted.agent_id.as_str(),
+                    demoted.model,
+                    demoted.reasoning,
+                    now_millis(),
+                    expected.selected_agent_id,
+                    expected.selected_model,
+                    expected.selected_reasoning,
+                    expected.selected_backup_agent_id,
+                    expected.selected_backup_model,
+                    expected.selected_backup_reasoning,
+                ],
+            )
+            .map_err(|e| ArgoError::Store(format!("promote failover selection: {e}")))?;
+        Ok(changed == 1)
     }
 
     /// Sets a conversation title.
@@ -403,8 +511,11 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
         selected_model: row.get(6)?,
         selected_reasoning: row.get(7)?,
         selected_mode: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        selected_backup_agent_id: row.get(9)?,
+        selected_backup_model: row.get(10)?,
+        selected_backup_reasoning: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -468,6 +579,137 @@ mod tests {
             .expect("load")
             .selected_mode
             .is_none());
+    }
+
+    #[test]
+    fn the_backup_agent_persists_independently_of_the_selected_agent() {
+        let s = store();
+        let ws = s.ensure_workspace(std::env::temp_dir()).expect("ws");
+        let id = s.create_conversation(&ws, None).expect("create");
+        assert!(s
+            .get_conversation(&id)
+            .expect("load")
+            .selected_backup_agent_id
+            .is_none());
+
+        s.set_backup_agent(&id, Some("codex"), Some("gpt-5.6-sol"), Some("high"))
+            .expect("set");
+        // Changing the primary selection must leave the standby alone, otherwise a
+        // routine /agent switch would silently disable failover.
+        s.update_selection(
+            &id,
+            &SelectionChange {
+                agent_id: Some(AgentId::new("claude")),
+                ..Default::default()
+            },
+        )
+        .expect("select");
+        let after = s.get_conversation(&id).expect("load");
+        assert_eq!(after.selected_agent_id.as_deref(), Some("claude"));
+        assert_eq!(after.selected_backup_agent_id.as_deref(), Some("codex"));
+        // The standby carries its own routing; model ids do not transfer.
+        assert_eq!(after.selected_backup_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(after.selected_backup_reasoning.as_deref(), Some("high"));
+
+        // Clearing the agent must clear its routing too, or a later standby
+        // would inherit a model belonging to a different CLI.
+        s.set_backup_agent(&id, None, None, None).expect("clear");
+        let cleared = s.get_conversation(&id).expect("load");
+        assert!(cleared.selected_backup_agent_id.is_none());
+        assert!(cleared.selected_backup_model.is_none());
+        assert!(cleared.selected_backup_reasoning.is_none());
+    }
+
+    #[test]
+    fn failover_promotion_atomically_swaps_complete_routing() {
+        let s = store();
+        let ws = s.ensure_workspace(std::env::temp_dir()).expect("ws");
+        let id = s.create_conversation(&ws, None).expect("create");
+        s.update_selection(
+            &id,
+            &SelectionChange {
+                agent_id: Some(AgentId::new("claude")),
+                model: Some("sonnet".into()),
+                reasoning: Some("high".into()),
+            },
+        )
+        .expect("primary");
+        s.set_backup_agent(&id, Some("codex"), Some("gpt-5"), Some("medium"))
+            .expect("backup");
+        let expected = s.get_conversation(&id).expect("snapshot");
+
+        assert!(s
+            .promote_failover_if_unchanged(
+                &expected,
+                FailoverRoute {
+                    agent_id: &AgentId::new("codex"),
+                    model: Some("gpt-5"),
+                    reasoning: Some("medium"),
+                },
+                FailoverRoute {
+                    agent_id: &AgentId::new("claude"),
+                    model: Some("sonnet"),
+                    reasoning: Some("high"),
+                },
+            )
+            .expect("promote"));
+
+        let promoted = s.get_conversation(&id).expect("conversation");
+        assert_eq!(promoted.selected_agent_id.as_deref(), Some("codex"));
+        assert_eq!(promoted.selected_model.as_deref(), Some("gpt-5"));
+        assert_eq!(promoted.selected_reasoning.as_deref(), Some("medium"));
+        assert_eq!(promoted.selected_backup_agent_id.as_deref(), Some("claude"));
+        assert_eq!(promoted.selected_backup_model.as_deref(), Some("sonnet"));
+        assert_eq!(promoted.selected_backup_reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn failover_promotion_does_not_overwrite_newer_routing() {
+        let s = store();
+        let ws = s.ensure_workspace(std::env::temp_dir()).expect("ws");
+        let id = s.create_conversation(&ws, None).expect("create");
+        s.update_selection(
+            &id,
+            &SelectionChange {
+                agent_id: Some(AgentId::new("claude")),
+                model: Some("sonnet".into()),
+                reasoning: Some("high".into()),
+            },
+        )
+        .expect("primary");
+        s.set_backup_agent(&id, Some("codex"), Some("gpt-5"), None)
+            .expect("backup");
+        let stale = s.get_conversation(&id).expect("snapshot");
+
+        s.update_selection(
+            &id,
+            &SelectionChange {
+                agent_id: Some(AgentId::new("kiro")),
+                model: Some("auto".into()),
+                reasoning: None,
+            },
+        )
+        .expect("newer selection");
+        assert!(!s
+            .promote_failover_if_unchanged(
+                &stale,
+                FailoverRoute {
+                    agent_id: &AgentId::new("codex"),
+                    model: Some("gpt-5"),
+                    reasoning: None,
+                },
+                FailoverRoute {
+                    agent_id: &AgentId::new("claude"),
+                    model: Some("sonnet"),
+                    reasoning: Some("high"),
+                },
+            )
+            .expect("compare and swap"));
+
+        let current = s.get_conversation(&id).expect("conversation");
+        assert_eq!(current.selected_agent_id.as_deref(), Some("kiro"));
+        assert_eq!(current.selected_model.as_deref(), Some("auto"));
+        assert_eq!(current.selected_backup_agent_id.as_deref(), Some("codex"));
     }
 
     #[test]

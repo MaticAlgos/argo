@@ -9,7 +9,7 @@ use argo_core::error::{ArgoError, Result};
 use rusqlite::Connection;
 
 /// Schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Ordered migration statements. Index + 1 is the resulting schema version.
 const MIGRATIONS: &[&str] = &[
@@ -89,15 +89,6 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (conversation_id, agent_id)
     );
 
-    CREATE TABLE IF NOT EXISTS context_epochs (
-        id               TEXT PRIMARY KEY,
-        conversation_id  TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        summary          TEXT,
-        compacted_upto   INTEGER NOT NULL DEFAULT 0,
-        reason           TEXT NOT NULL,
-        created_at       INTEGER NOT NULL
-    );
-
     CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq
         ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS idx_messages_run
@@ -112,12 +103,38 @@ const MIGRATIONS: &[&str] = &[
         ON conversations (workspace_id, updated_at);
     CREATE INDEX IF NOT EXISTS idx_conversations_parent
         ON conversations (parent_conversation_id);
-    CREATE INDEX IF NOT EXISTS idx_epochs_conversation
-        ON context_epochs (conversation_id, created_at);
     "#,
     // v2: execution mode, selected per conversation and applied at the next turn.
     r#"
     ALTER TABLE conversations ADD COLUMN selected_mode TEXT;
+    "#,
+    // v3: standby agent this conversation fails over to when the selected agent
+    // exhausts its plan mid-conversation.
+    r#"
+    ALTER TABLE conversations ADD COLUMN selected_backup_agent_id TEXT;
+    "#,
+    // v4: the standby's own routing. A model id is not portable between CLIs, so
+    // the backup cannot borrow the primary's and must record its own.
+    r#"
+    ALTER TABLE conversations ADD COLUMN selected_backup_model TEXT;
+    ALTER TABLE conversations ADD COLUMN selected_backup_reasoning TEXT;
+    "#,
+    // v5: explicit `/compact` boundaries. This must be its own step rather than a
+    // line in the v1 script: released builds already stamped v2, so migration 1
+    // never runs again for them and the table would only ever appear on databases
+    // created fresh by this build.
+    r#"
+    CREATE TABLE IF NOT EXISTS context_epochs (
+        id               TEXT PRIMARY KEY,
+        conversation_id  TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        summary          TEXT,
+        compacted_upto   INTEGER NOT NULL DEFAULT 0,
+        reason           TEXT NOT NULL,
+        created_at       INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_epochs_conversation
+        ON context_epochs (conversation_id, created_at);
     "#,
 ];
 
@@ -246,8 +263,9 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_v1_database_gains_the_mode_column() {
-        // Upgrading must not require the user to discard their history.
+    fn an_existing_v1_database_gains_the_later_conversation_columns() {
+        // Upgrading must not require the user to discard their history, and every
+        // migration after v1 must still apply to a database created before it.
         let mut conn = mem();
         conn.execute_batch(MIGRATIONS[0]).expect("v1 schema");
         conn.execute(
@@ -261,16 +279,57 @@ mod tests {
         )
         .expect("record v1");
 
-        migrate(&mut conn).expect("migrate to v2");
-        assert_eq!(current_version(&conn).expect("version"), 2);
-        let columns: i64 = conn
+        migrate(&mut conn).expect("migrate from v1");
+        assert_eq!(current_version(&conn).expect("version"), SCHEMA_VERSION);
+        for column in [
+            "selected_mode",
+            "selected_backup_agent_id",
+            "selected_backup_model",
+            "selected_backup_reasoning",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('conversations') WHERE name = ?1",
+                    [column],
+                    |row| row.get(0),
+                )
+                .expect("query");
+            assert_eq!(present, 1, "missing column {column}");
+        }
+    }
+
+    #[test]
+    fn a_database_left_at_v2_still_gains_the_context_epoch_table() {
+        // Every released build stamped v2, so this is the schema real users
+        // upgrade from. A table added to the v1 script would never reach them:
+        // migration 1 is skipped, and `/compact` — plus every fresh-session turn,
+        // which reads the latest epoch — would fail on a missing table.
+        let mut conn = mem();
+        conn.execute_batch(MIGRATIONS[0]).expect("v1 schema");
+        conn.execute_batch(MIGRATIONS[1]).expect("v2 schema");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .expect("meta");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '2')",
+            [],
+        )
+        .expect("stamp v2");
+
+        migrate(&mut conn).expect("migrate from v2");
+        let present: i64 = conn
             .query_row(
-                "SELECT count(*) FROM pragma_table_info('conversations') WHERE name = 'selected_mode'",
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='context_epochs'",
                 [],
                 |row| row.get(0),
             )
             .expect("query");
-        assert_eq!(columns, 1);
+        assert_eq!(
+            present, 1,
+            "an upgraded database has no context_epochs table"
+        );
     }
 
     #[test]

@@ -255,20 +255,26 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
 
     let mut rendered: Vec<TextLine<'_>> = Vec::new();
-    let mut collapsed_thinking = false;
+    // Where each prompt block starts, so the pinned row can name the turn the
+    // viewport is currently inside.
+    let mut prompt_starts: Vec<(usize, &str)> = Vec::new();
+    let mut collapsed_detail = false;
     for line in &app.lines {
-        if !app.thinking_visible && line.kind == LineKind::Thinking {
-            if !collapsed_thinking {
+        // Thinking and tool activity collapse together under one toggle: they are
+        // the same kind of "how it got there" detail, and hiding reasoning while
+        // leaving a wall of tool calls behind defeats the point of hiding it.
+        if !app.thinking_visible && matches!(line.kind, LineKind::Thinking | LineKind::Activity) {
+            if !collapsed_detail {
                 let marker = crate::app::Line {
                     kind: LineKind::Activity,
-                    text: "◌ thinking hidden · Ctrl+T or /thinking show".into(),
+                    text: "◌ thinking and tool activity hidden · Ctrl+T or /thinking show".into(),
                 };
                 rendered.extend(render_line(&marker, inner_width));
             }
-            collapsed_thinking = true;
+            collapsed_detail = true;
             continue;
         }
-        collapsed_thinking = false;
+        collapsed_detail = false;
         // A prompt begins a new conversational beat. The shaded row does the
         // role separation; one quiet row above it keeps long answers from running
         // directly into the next request.
@@ -277,6 +283,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
             && rendered.last().is_some_and(|row| !row.spans.is_empty())
         {
             rendered.push(TextLine::from(""));
+        }
+        if line.kind == LineKind::User {
+            prompt_starts.push((rendered.len(), line.text.as_str()));
         }
         rendered.extend(render_line(line, inner_width));
     }
@@ -334,6 +343,14 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // exactly one row on screen. Letting the widget wrap instead would make the
     // count disagree with what is drawn, and any under-count scrolls the newest
     // text — normally the agent's reply — off the bottom of the pane.
+    //
+    // Once the conversation has a prompt in it, the top row of the pane is
+    // reserved for the pinned prompt. Reserving it on "are there any prompts"
+    // rather than "is the pin currently filled" keeps the usable height — and so
+    // the scroll limit — independent of where the user has scrolled to; deciding
+    // it from the offset would let the two feed back into each other and jitter.
+    let pinned = !prompt_starts.is_empty();
+    let height = height.saturating_sub(usize::from(pinned));
     let total = rendered.len();
     let max_scroll = total.saturating_sub(height);
     app.set_scroll_limit(max_scroll);
@@ -353,11 +370,19 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Slice to the visible rows instead of passing a potentially overflowing
     // usize through Paragraph's u16 scroll offset. This also avoids asking the
     // widget to walk a huge off-screen transcript on every animation frame.
-    let visible = rendered
-        .into_iter()
-        .skip(offset)
-        .take(height)
-        .collect::<Vec<_>>();
+    let mut visible = Vec::with_capacity(height + usize::from(pinned));
+    if pinned {
+        // The prompt that owns the topmost visible row. While it is still on
+        // screen the pin stays blank rather than repeating the row directly
+        // below it; it fills in as soon as the prompt scrolls out of view.
+        let current = prompt_starts
+            .iter()
+            .rev()
+            .find(|(start, _)| *start < offset)
+            .map(|(_, text)| *text);
+        visible.push(pinned_prompt(current, inner_width));
+    }
+    visible.extend(rendered.into_iter().skip(offset).take(height));
     let paragraph = Paragraph::new(visible).block(panel(title, false));
     frame.render_widget(paragraph, area);
 }
@@ -520,6 +545,53 @@ fn render_user_message(text: &str, inner_width: usize) -> Vec<TextLine<'static>>
     out
 }
 
+/// Builds the row pinned to the top of the transcript, naming the prompt the
+/// viewport is currently inside.
+///
+/// A long request scrolls away within a few seconds of a reply starting, and
+/// with it the only reminder of what was actually asked. The pin is a single row
+/// on purpose: it is a label for the turn, not a second copy of it, so the text
+/// is flattened to one line and elided rather than wrapped. `None` renders the
+/// blank reserved row.
+fn pinned_prompt(text: Option<&str>, inner_width: usize) -> TextLine<'static> {
+    let prefix = "› ";
+    let prefix_width = prefix.chars().count();
+    let Some(text) = text else {
+        return TextLine::from(Span::styled(
+            " ".repeat(inner_width),
+            Style::default().bg(USER_BG),
+        ));
+    };
+
+    // Newlines and runs of spaces would otherwise leave gaps that read as the
+    // end of the prompt.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text_width = inner_width.saturating_sub(prefix_width);
+    let body = if flat.chars().count() > text_width {
+        let kept = text_width.saturating_sub(1);
+        let mut body = flat.chars().take(kept).collect::<String>();
+        if kept > 0 {
+            body.push('…');
+        }
+        body
+    } else {
+        flat
+    };
+
+    let padding = " ".repeat(inner_width.saturating_sub(prefix_width + body.chars().count()));
+    TextLine::from(vec![
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(ACCENT)
+                .bg(USER_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(body, Style::default().fg(USER_FG).bg(USER_BG)),
+        Span::styled(padding, Style::default().bg(USER_BG)),
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_welcome_picker(
     frame: &mut Frame<'_>,
@@ -638,6 +710,10 @@ fn draw_picker(
                 action: PickerAction::Agents,
                 ..
             } => "Enter switch · Space set default · Del clear · type to filter",
+            Overlay::Picker {
+                action: PickerAction::QueuedMessage,
+                ..
+            } => "Del or Ctrl+D removes · Esc closes",
             _ => "type to filter, Enter, Esc",
         };
         format!(" {title} — {} items · {controls} ", matches.len())
@@ -904,6 +980,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // Standing by, not running. Tinted like the agent it names so the pairing is
+    // readable at a glance, but dimmer than the active target so it cannot be
+    // mistaken for what is answering right now.
+    if let Some(backup) = app.backup_label() {
+        let agent = backup.split('/').next().unwrap_or(&backup).to_string();
+        spans.push(Span::styled(
+            format!("⇄ {backup} "),
+            Style::default().fg(agent_color(&agent)),
+        ));
+    }
+
     spans.push(Span::styled("│", Style::default().fg(MUTED)));
     spans.push(Span::styled(
         format!(" {} ", app.context_label()),
@@ -912,8 +999,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if let Some(usage) = &app.last_usage {
         if let (Some(input), Some(output)) = (usage.input, usage.output) {
+            let source = app
+                .last_usage_source
+                .as_deref()
+                .map(|source| format!(" {source}"))
+                .unwrap_or_default();
             spans.push(Span::styled(
-                format!("· last {input}→{output} "),
+                format!("· last{source} {input}→{output} "),
                 Style::default().fg(MUTED),
             ));
         }
@@ -1412,6 +1504,9 @@ mod tests {
             selected_model: None,
             selected_reasoning: None,
             selected_mode: None,
+            selected_backup_agent_id: None,
+            selected_backup_model: None,
+            selected_backup_reasoning: None,
             message_count: 4,
             agents_with_sessions: vec!["claude".into(), "codex".into()],
             parent_conversation_id: None,
@@ -1451,6 +1546,34 @@ mod tests {
         let top = render(&app, 36, 12);
         assert!(top.contains("FIRST_MARKER"), "{top}");
         assert!(top.contains("scrolled back"), "{top}");
+    }
+
+    #[test]
+    fn the_prompt_stays_pinned_once_its_reply_scrolls_past_it() {
+        let mut app = App::new("/repo");
+        app.push(
+            LineKind::User,
+            "PROMPT_MARKER explain how the scheduler decides what runs TAIL_MARKER",
+        );
+        app.push(
+            LineKind::Assistant,
+            format!("{} LAST_MARKER", "wrapped content ".repeat(80)),
+        );
+
+        // The reply has pushed the prompt off the top, so the pin carries it —
+        // as one elided row, not a second copy of the whole request.
+        let bottom = render(&app, 44, 12);
+        assert!(bottom.contains("LAST_MARKER"), "{bottom}");
+        assert!(bottom.contains("› PROMPT_MARKER explain"), "{bottom}");
+        assert!(!bottom.contains("TAIL_MARKER"), "{bottom}");
+        assert!(bottom.contains('…'), "{bottom}");
+
+        // Scrolled back to the prompt itself, the pin does not repeat it.
+        app.scroll_up(10_000);
+        let top = render(&app, 44, 12);
+        assert_eq!(top.matches("PROMPT_MARKER").count(), 1, "{top}");
+        assert!(top.contains("TAIL_MARKER"), "{top}");
+        assert!(!top.contains('…'), "{top}");
     }
 
     #[test]
@@ -1780,6 +1903,9 @@ mod tests {
             selected_model: Some("gpt-5.6".into()),
             selected_reasoning: None,
             selected_mode: None,
+            selected_backup_agent_id: None,
+            selected_backup_model: None,
+            selected_backup_reasoning: None,
             message_count: 2,
             agents_with_sessions: vec!["claude".into()],
             parent_conversation_id: None,
@@ -1799,13 +1925,46 @@ mod tests {
         app.set_thinking_visible(false);
         let output = render(&app, 70, 12);
         assert!(!output.contains("private-visible-reasoning"));
-        assert!(output.contains("thinking hidden"));
+        assert!(output.contains("thinking and tool activity hidden"));
         assert!(output.contains("final answer"));
         assert!(app.lines.iter().any(|line| line.kind == LineKind::Thinking));
 
         app.set_thinking_visible(true);
         let shown = render(&app, 70, 12);
         assert!(shown.contains("private-visible-reasoning"));
-        assert!(!shown.contains("thinking hidden"));
+        assert!(!shown.contains("thinking and tool activity hidden"));
+    }
+
+    #[test]
+    fn hiding_thinking_also_collapses_tool_activity() {
+        // One toggle, one class of detail: leaving tool calls visible while
+        // reasoning is hidden would still bury the answer.
+        let mut app = App::new("/repo");
+        app.push(LineKind::Thinking, "weighing-options");
+        app.push(LineKind::Activity, "↳ calling fs_read — src/main.rs");
+        app.push(LineKind::Activity, "✎ wrote src/main.rs");
+        app.push(LineKind::Assistant, "final answer");
+        app.set_thinking_visible(false);
+
+        let hidden = render(&app, 70, 14);
+        assert!(!hidden.contains("weighing-options"));
+        assert!(!hidden.contains("calling fs_read"));
+        assert!(!hidden.contains("wrote src/main.rs"));
+        assert!(hidden.contains("final answer"));
+        // A single marker stands in for the whole collapsed run.
+        assert_eq!(
+            hidden.matches("thinking and tool activity hidden").count(),
+            1
+        );
+        // Nothing was deleted; only the projection changed.
+        assert_eq!(app.lines.len(), 4);
+
+        let shown = render(&app, 70, 14);
+        assert!(!shown.contains("calling fs_read"));
+        app.set_thinking_visible(true);
+        let revealed = render(&app, 70, 14);
+        assert!(revealed.contains("calling fs_read"));
+        assert!(revealed.contains("wrote src/main.rs"));
+        assert!(revealed.contains("weighing-options"));
     }
 }

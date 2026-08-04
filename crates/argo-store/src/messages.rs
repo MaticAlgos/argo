@@ -148,6 +148,31 @@ impl Store {
         Ok(())
     }
 
+    /// Reassigns the author of an existing message.
+    ///
+    /// A pinned assistant placeholder records the agent that was going to answer.
+    /// When failover hands the turn to the standby CLI, the message must be
+    /// re-attributed or the transcript credits the reply to the agent that
+    /// actually ran out of quota.
+    pub fn set_message_agent(
+        &self,
+        id: &MessageId,
+        agent_id: &AgentId,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET agent_id = ?2, model = ?3 WHERE id = ?1",
+                rusqlite::params![id.as_str(), agent_id.as_str(), model],
+            )
+            .map_err(|e| ArgoError::Store(format!("update message agent: {e}")))?;
+        if changed == 0 {
+            return Err(ArgoError::not_found("message", id.as_str()));
+        }
+        Ok(())
+    }
+
     /// Next dense sequence number for a conversation.
     fn next_message_seq(&self, conversation_id: &ConversationId) -> Result<i64> {
         let current: Option<i64> = self

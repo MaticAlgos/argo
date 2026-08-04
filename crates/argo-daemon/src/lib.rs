@@ -11,6 +11,7 @@ pub mod lock;
 pub mod mcp;
 pub mod protocol;
 pub mod server;
+pub mod telegram;
 
 pub use engine::{run_turn, TurnOutcome, TurnRequest, STABLE_INSTRUCTIONS};
 pub use lifecycle::{mismatched_daemon_protocol, stop_older_daemon};

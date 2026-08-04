@@ -7,12 +7,13 @@ members = [
     "crates/argo-runtime",
     "crates/argo-daemon",
     "crates/argo-resources",
+    "crates/argo-telegram",
     "crates/argo-tui",
     "crates/argo-cli",
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
@@ -25,6 +26,7 @@ argo-store = { path = "crates/argo-store" }
 argo-context = { path = "crates/argo-context" }
 argo-runtime = { path = "crates/argo-runtime" }
 argo-resources = { path = "crates/argo-resources" }
+argo-telegram = { path = "crates/argo-telegram" }
 argo-daemon = { path = "crates/argo-daemon" }
 argo-tui = { path = "crates/argo-tui" }
 
@@ -56,6 +58,7 @@ sha2 = "0.10"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 pulldown-cmark = "=0.12.2"
+qrcode = { version = "0.14", default-features = false }
 anyhow = "1.0"
 libc = "0.2"
 tempfile = "3.12"

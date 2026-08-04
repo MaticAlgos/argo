@@ -35,7 +35,11 @@ pub use title::{conversation_description, conversation_title};
 /// The daemon refuses connections from clients advertising a different major
 /// version so that an upgraded binary can never be driven by a stale TUI that
 /// would misinterpret the event stream.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+///
+/// Bumped to 3 for the Telegram bridge and `/compact` requests: a v2 daemon has
+/// no variant for either, so it would fail to decode them rather than being
+/// recognized as stale and replaced.
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
 /// Name of the per-project directory Argo owns inside a user workspace.
 pub const ARGO_WORKSPACE_DIR: &str = ".argo";
